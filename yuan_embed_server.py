@@ -47,7 +47,6 @@ def load_model():
     global _model, _tokenizer
     if _model is not None:
         return
-    print("Loading Yuan-EB 2.0-zh (fp16, from modelscope)...")
     _log("Loading Yuan-EB 2.0-zh (fp16, from modelscope)...")
     import os
     os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
@@ -85,7 +84,6 @@ def _auto_unloader():
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            print("Yuan-EB: model unloaded (idle > 10min)")
             _log("Yuan-EB: model unloaded (idle > 10min)")
 
 threading.Thread(target=_auto_unloader, daemon=True).start()
@@ -136,6 +134,5 @@ def health():
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 11435
-    print(f"Yuan-EB Embed Server starting on port {port}")
     _log(f"Yuan-EB Embed Server starting on port {port}")
     app.run(host="127.0.0.1", port=port, threaded=True)
