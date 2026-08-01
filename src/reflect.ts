@@ -1,0 +1,612 @@
+/**
+ * 记忆反思接口 — 供大模型（如 DeepSeek/GPT）调用
+ *
+ * 大模型拿到所有记忆，做反思式重构：
+ *   - 合并重复记忆
+ *   - 拆分过长的记忆
+ *   - 建立关联（edges）
+ *   - 降级/升级 importance
+ *   - 重新分类
+ *
+ * HTTP 接口：
+ *   GET  /memory/reflect/list    — 获取所有记忆（供大模型分析）
+ *   POST /memory/reflect/apply   — 应用大模型的重构指令
+ */
+
+import { DatabaseManager } from './db.js';
+import { getEmbeddingCached } from './ollama.js';
+import { saveFacts, saveMemory, reEmbedMemory, batchEmbedPending } from './store.js';
+
+export interface ReflectMemory {
+  id: string;
+  text: string;
+  type: string;
+  category: string;
+  tags: string[];
+  importance: number;
+  emotionalImpact: number;
+  subject: string;
+  source: string;
+  tier: string;
+  expiresAt: string | null;
+  createdAt: string;
+  lastAccessedAt: string;
+  accessedCount: number;
+  referenceCount: number;
+}
+
+export interface ReflectAction {
+  action: 'merge' | 'split' | 'relate' | 'reclassify' | 'delete' | 'boost' | 'decay' | 'extract';
+  // merge: 把多个记忆合并成一个
+  sourceIds?: string[];
+  newText?: string;
+  newType?: string;
+  newCategory?: string;
+  newTags?: string[];
+  newImportance?: number;
+  // split: 把一个记忆拆成多个
+  targetId?: string;
+  fragments?: { text: string; type?: string; category?: string; tags?: string[]; importance?: number }[];
+  // relate: 建立关联
+  sourceId?: string;
+  targetIdRelate?: string;
+  relationType?: string;
+  // reclassify: 重新分类
+  newTypeSingle?: string;
+  newCategorySingle?: string;
+  // extract: 从源记忆中提取新记忆（不删除源）
+  // 使用 sourceId + newText/newType/newCategory/newTags/newImportance/tier
+  tier?: string;
+  // delete: 软删除
+  // boost/decay: 调整 importance
+  delta?: number;
+}
+
+/**
+ * 获取所有记忆（供大模型分析）
+ */
+export function listAllMemories(characterId: string = 'airi', limit: number = 200): ReflectMemory[] {
+  const db = DatabaseManager.getInstance();
+  const rows = db.prepare(`
+    SELECT id, text, type, category, tags, importance, emotional_impact,
+           subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked
+    FROM memory
+    WHERE is_active = 1 AND character_id = ?
+    ORDER BY importance DESC, created_at DESC
+    LIMIT ?
+  `).all(characterId, limit) as any[];
+
+  return rows.map(r => {
+    let tags: string[] = [];
+    try {
+      const parsed = JSON.parse(r.tags || '[]');
+      tags = Array.isArray(parsed) ? parsed : [];
+    } catch { tags = []; }
+
+    return {
+    id: r.id,
+    text: r.text,
+    type: r.type,
+    category: r.category,
+    tags,
+    importance: r.importance,
+    emotionalImpact: r.emotional_impact,
+    subject: r.subject,
+    source: r.source,
+    tier: r.tier || 'standard',
+    expiresAt: r.expires_at,
+    createdAt: r.created_at,
+    lastAccessedAt: r.last_accessed_at,
+    accessedCount: r.accessed_count,
+    referenceCount: r.reference_count || 0,
+    locked: r.locked || 0,
+  };
+  });}
+
+/**
+ * 应用大模型的重构指令
+ */
+// ═════════════════════════════════════════════════
+// 护栏：拒绝明显无效的值，防止大模型幻觉污染数据库
+// ═════════════════════════════════════════════════
+const VALID_TYPES = new Set(['episodic', 'semantic', 'entity', 'preference']);
+const VALID_CATEGORIES = new Set(['conversation', 'emotional', 'milestone', 'identity', 'relationship', 'knowledge', 'preference', 'general', 'mood_snapshot']);
+const VALID_RELATIONS = new Set(['caused_by', 'part_of', 'follows', 'related_to', 'same_subject', 'causes', 'leads_to', 'sequence']);
+
+function safeTags(raw: any): string[] | null {
+  if (!raw) return null;
+  if (!Array.isArray(raw)) return null;
+  const filtered = raw.filter(t => typeof t === 'string' && t.length > 0 && t.length < 50);
+  return filtered.length > 0 ? filtered : null;
+}
+
+export async function applyReflectActions(actions: ReflectAction[]): Promise<{
+  applied: number;
+  errors: string[];
+  details: string[];
+}> {
+  const db = DatabaseManager.getInstance();
+  const result = { applied: 0, errors: [] as string[], details: [] as string[] };
+
+  for (const action of actions) {
+    try {
+      switch (action.action) {
+        case 'merge': {
+          // 合并多个记忆为一个
+          if (!action.sourceIds || action.sourceIds.length < 2 || !action.newText) {
+            result.errors.push('merge: need sourceIds and newText');
+            continue;
+          }
+          const tx = db.transaction(() => {
+            // 旧记忆全部软删除 + 删向量
+            // v5.1: LLM 可能返回短ID前缀，用 LIKE 匹配
+            for (const id of action.sourceIds!) {
+              db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ?').run(id + '%');
+              try {
+                db.prepare('DELETE FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id LIKE ?)').run(id + '%');
+              } catch {}
+            }
+          });
+          tx();
+
+          // saveMemory 是 async，在 transaction 外调
+          // v5.0: reflect 阶段正常 embed（不 skip）
+          const { saveMemory } = await import('./store.js');
+          await saveMemory({
+            text: action.newText,
+            type: (action.newType || 'semantic') as any,
+            category: action.newCategory || 'general',
+            tags: action.newTags || [],
+            importance: action.newImportance || 0.7,
+            characterId: 'airi',
+            source: 'reflect_merge',
+          });
+          result.applied++;
+          result.details.push(`merge: ${action.sourceIds.length} → 1`);
+          break;
+        }
+
+        case 'split': {
+          // 拆分一个记忆为多个
+          if (!action.targetId || !action.fragments) {
+            result.errors.push('split: need targetId and fragments');
+            continue;
+          }
+          // 软删除旧记忆（v5.1: LIKE 匹配短ID）
+          db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ?').run(action.targetId + '%');
+          // 插入碎片
+          const { saveMemory } = await import('./store.js');
+          for (const frag of action.fragments) {
+            await saveMemory({
+              text: frag.text,
+              type: (frag.type as any) || 'episodic',
+              category: frag.category || 'conversation',
+              tags: frag.tags || [],
+              importance: frag.importance || 0.5,
+              characterId: 'airi',
+              source: 'reflect_split',
+            });
+          }
+          result.applied++;
+          result.details.push(`split: 1 → ${action.fragments.length}`);
+          break;
+        }
+
+        case 'relate': {
+          if (!action.sourceId || !action.targetIdRelate || !action.relationType) {
+            result.errors.push('relate: need sourceId, targetIdRelate, relationType');
+            continue;
+          }
+          // 护栏：规范化 relation type
+          const relType = VALID_RELATIONS.has(action.relationType) ? action.relationType : 'related_to';
+          const edgeId = `edge_reflect_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
+          db.prepare('INSERT OR IGNORE INTO edges (id, source_id, target_id, relation_type) VALUES (?, ?, ?, ?)')
+            .run(edgeId, action.sourceId, action.targetIdRelate, relType);
+          result.applied++;
+          result.details.push(`relate: ${action.sourceId} → ${action.targetIdRelate} (${relType})`);
+          break;
+        }
+
+        case 'reclassify': {
+          // v5.1: 兼容 LLM 可能用的 sourceId 或 targetId
+          const tid = action.targetId || (action as any).sourceId;
+          if (!tid) {
+            result.errors.push('reclassify: need targetId or sourceId');
+            continue;
+          }
+          const updates: string[] = [];
+          const values: any[] = [];
+          // 护栏：拒绝无效 type/category
+          if (action.newTypeSingle) {
+            if (!VALID_TYPES.has(action.newTypeSingle)) {
+              result.errors.push(`reclassify: invalid type "${action.newTypeSingle}", skipped`);
+              continue;
+            }
+            updates.push('type = ?'); values.push(action.newTypeSingle);
+          }
+          if (action.newCategorySingle) {
+            if (!VALID_CATEGORIES.has(action.newCategorySingle)) {
+              result.errors.push(`reclassify: invalid category "${action.newCategorySingle}", skipped`);
+              continue;
+            }
+            updates.push('category = ?'); values.push(action.newCategorySingle);
+          }
+          if (action.newTags) {
+            const valid = safeTags(action.newTags);
+            if (!valid) {
+              result.errors.push('reclassify: invalid tags (must be string array), skipped');
+              continue;
+            }
+            updates.push('tags = ?'); values.push(JSON.stringify(valid));
+          }
+          if (updates.length > 0) {
+            values.push(tid + '%');
+            db.prepare(`UPDATE memory SET ${updates.join(', ')}, updated_at = ? WHERE id LIKE ?`)
+              .run(new Date().toISOString(), ...values);
+            result.applied++;
+            result.details.push(`reclassify: ${tid}`);
+          }
+          break;
+        }
+
+        case 'extract': {
+          // v5.0: 从源记忆中提取有效信息为新记忆（不删除源）
+          if (!action.sourceId || !action.newText) {
+            result.errors.push('extract: need sourceId and newText');
+            continue;
+          }
+          const validType = action.newType && VALID_TYPES.has(action.newType) ? action.newType : 'semantic';
+          const validCat = action.newCategory && VALID_CATEGORIES.has(action.newCategory) ? action.newCategory : 'general';
+          const validTags = safeTags(action.newTags) || [];
+          const importance = action.newImportance ?? 0.6;
+          const tier = (action.tier && ['temporary','standard','critical'].includes(action.tier))
+            ? action.tier as 'temporary'|'standard'|'critical' : 'standard';
+
+          const { saveMemory } = await import('./store.js');
+          await saveMemory({
+            text: action.newText,
+            type: validType as any,
+            category: validCat,
+            tags: validTags,
+            importance,
+            tier,
+            characterId: 'airi',
+            source: 'reflect_extract',
+          });
+
+          // 给源记忆 +reference_count（v5.1: LIKE 匹配短ID）
+          db.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id LIKE ?').run(action.sourceId + '%');
+
+          result.applied++;
+          result.details.push(`extract: from ${action.sourceId} → ${validType}/${validCat} (${tier})`);
+          break;
+        }
+
+        case 'delete': {
+          if (!action.targetId) {
+            result.errors.push('delete: need targetId');
+            continue;
+          }
+          db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ?').run(action.targetId + '%');
+          result.applied++;
+          result.details.push(`delete: ${action.targetId}`);
+          break;
+        }
+
+        case 'boost': {
+          if (!action.targetId || action.delta === undefined) {
+            result.errors.push('boost: need targetId and delta');
+            continue;
+          }
+          db.prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance + ?)) WHERE id LIKE ?')
+            .run(action.delta, action.targetId + '%');
+          result.applied++;
+          result.details.push(`boost: ${action.targetId} += ${action.delta}`);
+          break;
+        }
+
+        case 'decay': {
+          if (!action.targetId || action.delta === undefined) {
+            result.errors.push('decay: need targetId and delta');
+            continue;
+          }
+          db.prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance - ?)) WHERE id LIKE ?')
+            .run(action.delta, action.targetId + '%');
+          result.applied++;
+          result.details.push(`decay: ${action.targetId} -= ${action.delta}`);
+          break;
+        }
+
+        default:
+          result.errors.push(`unknown action: ${action.action}`);
+      }
+    } catch (e: any) {
+      result.errors.push(`${action.action}: ${e.message}`);
+    }
+  }
+
+  // ═══ v5.0: 批量向量化 digest 阶段跳过的记忆 ═══
+  try {
+    const batchResult = await batchEmbedPending('airi');
+    if (batchResult.embedded > 0) {
+      result.details.push(`batch embedded ${batchResult.embedded} pending memories`);
+    }
+    if (batchResult.errors.length > 0) {
+      result.errors.push(...batchResult.errors);
+    }
+  } catch (e: any) {
+    result.errors.push(`batch embed: ${e.message}`);
+  }
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════
+// 导出别名 — 供 proxy.py / _memory_engine.mjs 调用
+// ═══════════════════════════════════════════════════════════
+
+/** 获取所有记忆（别名，供外部调用） */
+export function getAllMemories(characterId: string = 'airi', limit: number = 200): ReflectMemory[] {
+  return listAllMemories(characterId, limit);
+}
+
+/** 获取记忆关联图 */
+export function getMemoryGraph(characterId: string = 'airi'): { nodes: any[]; edges: any[] } {
+  const db = DatabaseManager.getInstance();
+  const nodes = listAllMemories(characterId, 500);
+  const edgeRows = db.prepare(`
+    SELECT e.id, e.source_id, e.target_id, e.relation_type,
+           m1.text as source_text, m2.text as target_text
+    FROM edges e
+    LEFT JOIN memory m1 ON e.source_id = m1.id
+    LEFT JOIN memory m2 ON e.target_id = m2.id
+  `).all() as any[];
+
+  const edges = edgeRows.map(r => ({
+    id: r.id,
+    sourceId: r.source_id,
+    targetId: r.target_id,
+    relationType: r.relation_type,
+    sourceText: r.source_text?.substring(0, 60),
+    targetText: r.target_text?.substring(0, 60),
+  }));
+
+  return { nodes, edges };
+}
+
+/** 编排函数 — 供 proxy.py 通过 _memory_engine.mjs 调用 */
+
+// ═══════════════════════════════════════════════════════════════════
+// 统一反思接口 — 大模型一次性输出 summary + facts + insights + actions
+// ═══════════════════════════════════════════════════════════════════
+
+export const REFLECT_SYSTEM_PROMPT = `你是记忆反思引擎。你的任务是对 AI 和用户的对话进行深度总结，提取结构化事实，并给出记忆整理建议。
+
+输入：最近 N 轮未分析的对话原文
+输出：严格JSON，格式如下：
+
+{
+  "summary": "自然语言总结（2-4句话）：概括这段时间用户做了什么、聊了什么、情绪状态如何",
+  "highlights": ["关键事件1", "关键事件2"],
+  "facts": [
+    {"subject": "user", "predicate": "姓名", "object": "示例用户", "confidence": 0.95},
+    {"subject": "user", "predicate": "职业", "object": "程序员", "confidence": 0.9}
+  ],
+  "insights": ["关于用户性格/沟通风格/潜在需求的深层观察"],
+  "actions": [
+    {"action": "boost", "targetId": "mem_xxx", "delta": 0.2},
+    {"action": "merge", "sourceIds": ["id1","id2"], "newText": "合并后的内容", "newImportance": 0.8}
+  ]
+}
+
+【facts 提取规则】
+- subject: "user"（关于用户）/ "airi"（关于AI角色）/ "environment"（关于环境）
+- predicate: 使用这些预定义关系或自定义短语：
+  姓名 / 年龄 / 职业 / 喜好 / 厌恶 / 技能 / 居住地 / 工作单位 / 项目 / 技术栈 / 习惯 / 目标 / 关系
+- object: 事实的值
+- confidence: 0(推测)~1.0(明确陈述)
+- 如果用户修正了之前提到的事实，标记 "action": "update"
+- 不提取情绪/临时状态
+- 最多15条
+
+【actions 规则】
+- 仅当确实需要整理已有记忆时才产生 actions
+- "boost" 用于升级重要记忆
+- "merge" 用于合并重复记忆
+- 不需要操作时 actions 为空数组 []`;
+
+/**
+ * 获取待反思的未分析对话
+ */
+export function getUnanalyzedConversations(
+  characterId: string = 'airi',
+  since?: string,  // ISO datetime，不传则取上次 reflect 之后
+  limit: number = 30,
+): { id: string; text: string; createdAt: string }[] {
+  const db = DatabaseManager.getInstance();
+
+  // 找到上次反思时间（最近一次 source='reflect_summary' 的创建时间）
+  if (!since) {
+    const lastReflect = db.prepare(`
+      SELECT created_at FROM memory
+      WHERE source = 'reflect_summary' AND character_id = ?
+      ORDER BY created_at DESC LIMIT 1
+    `).get(characterId) as any;
+    since = lastReflect?.created_at || new Date(0).toISOString();
+  }
+
+  return db.prepare(`
+    SELECT id, text, created_at
+    FROM memory
+    WHERE is_active = 1
+      AND source = 'conversation_log'
+      AND character_id = ?
+      AND created_at > ?
+    ORDER BY created_at ASC
+    LIMIT ?
+  `).all(characterId, since, limit) as any[];
+}
+
+export interface ReflectResult {
+  summary: string;
+  highlights: string[];
+  facts: { subject: string; predicate: string; object: string; confidence: number }[];
+  insights: string[];
+  actions?: ReflectAction[];
+}
+
+/**
+ * 应用大模型反思结果
+ *
+ * 一次性处理：
+ *   1. summary → 存入 memory（source='reflect_summary'）
+ *   2. facts → 调用 saveFacts() 写入 facts 表（自动去重）
+ *   3. insights → 存入 memory（source='reflect_insight'）
+ *   4. actions → 调用 applyReflectActions()
+ */
+export async function applyReflectResult(
+  result: ReflectResult,
+  characterId: string = 'airi',
+): Promise<{
+  summaryId: string | null;
+  factsInserted: number;
+  factsUpdated: number;
+  insightsCount: number;
+  actionsApplied: number;
+  errors: string[];
+}> {
+  const out = {
+    summaryId: null as string | null,
+    factsInserted: 0,
+    factsUpdated: 0,
+    insightsCount: 0,
+    actionsApplied: 0,
+    applied: 0,
+    errors: [] as string[],
+  };
+
+  // 1. 存 summary
+  if (result.summary) {
+    try {
+      const mem = await saveMemory({
+        text: result.summary,
+        type: 'semantic',
+        category: 'knowledge',
+        tags: result.highlights || [],
+        importance: 0.7,
+        characterId,
+        source: 'reflect_summary',
+        subject: 'user',
+      });
+      out.summaryId = mem.id;
+    } catch (e: any) {
+      out.errors.push(`summary: ${e.message}`);
+    }
+  }
+
+  // 2. 存 facts（自动去重，confidence 取 MAX）
+  if (result.facts && result.facts.length > 0) {
+    try {
+      const fr = await saveFacts(result.facts, out.summaryId, characterId);
+      out.factsInserted = fr.inserted;
+      out.factsUpdated = fr.updated;
+    } catch (e: any) {
+      out.errors.push(`facts: ${e.message}`);
+    }
+  }
+
+  // 3. 存 insights
+  if (result.insights && result.insights.length > 0) {
+    for (const insight of result.insights) {
+      try {
+        await saveMemory({
+          text: insight,
+          type: 'semantic',
+          category: 'knowledge',
+          importance: 0.6,
+          characterId,
+          source: 'reflect_insight',
+          subject: 'user',
+        });
+        out.insightsCount++;
+      } catch (e: any) {
+        out.errors.push(`insight: ${e.message}`);
+      }
+    }
+  }
+
+  // 4. 应用记忆整理 actions
+  if (result.actions && result.actions.length > 0) {
+    try {
+      const ar = await applyReflectActions(result.actions);
+      out.actionsApplied = ar.applied;
+      out.errors.push(...ar.errors);
+    } catch (e: any) {
+      out.errors.push(`actions: ${e.message}`);
+    }
+  }
+
+  return out;
+}
+
+/** 编排函数 — 供 proxy.py 通过 _memory_engine.mjs 调用 */
+export async function reflect(action: string, params: Record<string, any> = {}): Promise<any> {
+  switch (action) {
+    case 'list':
+      return listAllMemories(params.characterId || 'airi', params.limit || 200);
+
+    case 'unanalyzed': {
+      // 获取待反思的未分析对话 + prompt
+      const conversations = getUnanalyzedConversations(
+        params.characterId || 'airi',
+        params.since,
+        params.limit || 30,
+      );
+      const prompt = conversations.map(c => c.text).join('\n---\n');
+      return {
+        conversationCount: conversations.length,
+        systemPrompt: REFLECT_SYSTEM_PROMPT,
+        userPrompt: `请分析以下对话，输出反思JSON：\n\n${prompt.substring(0, 30000)}`,
+        conversationIds: conversations.map(c => c.id),
+      };
+    }
+
+    case 'apply': {
+      if (!params.actions || params.actions.length === 0) {
+        return { applied: 0, errors: ['no actions to apply'] };
+      }
+      return applyReflectResult(params as ReflectResult, params.characterId || 'airi');
+    }
+
+    case 'merge':
+    case 'split':
+    case 'relate':
+    case 'reclassify':
+    case 'delete':
+    case 'boost':
+    case 'decay':
+      return applyReflectActions([{ action, ...params } as ReflectAction]);
+
+    case 'batch':
+      if (!Array.isArray(params.actions)) {
+        return { error: 'batch action requires "actions" array' };
+      }
+      return applyReflectActions(params.actions as ReflectAction[]);
+
+    case 'auto': {
+      const allMemories = listAllMemories(params.characterId || 'airi', params.limit || 200);
+      const graph = getMemoryGraph(params.characterId || 'airi');
+      return {
+        ready: true,
+        memoryCount: allMemories.length,
+        edgeCount: graph.edges.length,
+        memories: allMemories,
+        edges: graph.edges,
+        hint: 'Use "batch" action with an "actions" array to apply changes',
+      };
+    }
+
+    default:
+      return { error: `unknown reflect action: "${action}". Valid: list, unanalyzed, apply, merge, split, relate, reclassify, delete, boost, decay, batch, auto` };
+  }
+}
