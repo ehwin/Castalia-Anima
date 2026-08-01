@@ -12,6 +12,12 @@ import numpy as np
 import torch
 from flask import Flask, request, jsonify
 
+# pythonw 无控制台运行时 stdout/stderr 为 None，重定向到 DEVNULL 防崩
+if sys.stdout is None:
+    sys.stdout = open(__import__('os').devnull, 'w', encoding='utf-8')
+if sys.stderr is None:
+    sys.stderr = open(__import__('os').devnull, 'w', encoding='utf-8')
+
 app = Flask(__name__)
 
 # 延迟加载，避免启动阻塞
