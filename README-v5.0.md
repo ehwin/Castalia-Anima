@@ -1,7 +1,7 @@
 # AIRI 记忆系统 · v5.0 完整技术文档
 
 > 更新：2026-07-05 凌晨  
-> 代码路径：`D:\system\AIRI\airi-memory-fused` + `D:\system\AIRI\airi-unified-proxy`
+> 代码路径：`D:\system\AIRI\memory\memory-fused` + `D:\system\AIRI\memory\unified-proxy`
 
 ---
 

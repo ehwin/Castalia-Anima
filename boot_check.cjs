@@ -1,13 +1,13 @@
 // AIRI Memory MCP boot self-check
-// Called by 启动AIRI.bat — verifies the memory MCP server starts correctly
+// Called by start-airi.bat — verifies the memory MCP server starts correctly
 const { spawn } = require('child_process');
 
-const cwd = 'D:\\system\\AIRI\\airi-memory-fused';
+const cwd = 'D:\\system\\AIRI\\memory\\memory-fused';
 const env = {
   ...process.env,
-  OLLAMA_URL: 'http://127.0.0.1:11434',
-  EMBEDDING_MODEL: 'qwen3-embedding:8b',
-  MEMORY_DB_PATH: 'D:\\system\\AIRI\\airi-memory-fused\\memory.sqlite',
+  OLLAMA_URL: 'http://127.0.0.1:11435',
+  EMBEDDING_MODEL: 'yuan-embedding-2.0-zh',
+  MEMORY_DB_PATH: 'D:\\system\\AIRI\\memory\\memory-fused\\memory.sqlite',
 };
 
 const child = spawn('node', ['dist/index.js'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });

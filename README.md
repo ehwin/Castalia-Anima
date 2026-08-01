@@ -24,7 +24,7 @@
 ## 快速开始
 
 ```bash
-cd D:\system\AIRI\airi-memory-fused
+cd D:\system\AIRI\memory\memory-fused
 npm install
 cd node_modules\better-sqlite3 && npx --yes node-gyp rebuild && cd ..\..
 npx tsc
@@ -38,11 +38,11 @@ node dist/index.js
   "mcpServers": {
     "airi-memory": {
       "command": "node",
-      "args": ["D:\\system\\AIRI\\airi-memory-fused\\dist\\index.js"],
+      "args": ["D:\\system\\AIRI\\memory\\memory-fused\\dist\\index.js"],
       "env": {
         "OLLAMA_URL": "http://127.0.0.1:11434",
         "EMBEDDING_MODEL": "qwen3-embedding:8b",
-        "MEMORY_DB_PATH": "D:\\system\\AIRI\\airi-memory-fused\\memory.sqlite",
+        "MEMORY_DB_PATH": "D:\\system\\AIRI\\memory\\memory-fused\\memory.sqlite",
         "WEIGHT_SIMILARITY": "1.2",
         "WEIGHT_TIME_DECAY": "0.3",
         "WEIGHT_EMOTION": "0.1",
@@ -168,7 +168,7 @@ node dist/index.js
 ## 文件结构
 
 ```
-airi-memory-fused/
+memory/memory-fused/
 ├ src/
 │   index.ts         — MCP 服务器入口（22 个工具）
 │   db.ts            — SQLite 数据库管理

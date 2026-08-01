@@ -14,10 +14,10 @@ curl -s http://127.0.0.1:5050/health
 
 # 2. MemoryEngine 活着吗？
 # 看 health 里的 memory_engine 字段，或查日志:
-type D:\system\AIRI\airi-unified-proxy\unified-proxy.log | findstr "ERROR\|WARNING\|SyntaxError"
+type D:\system\AIRI\memory\unified-proxy\unified-proxy.log | findstr "ERROR\|WARNING\|SyntaxError"
 
 # 3. reflect.py 能导入吗？
-cd D:\system\AIRI\airi-unified-proxy
+cd D:\system\AIRI\memory\unified-proxy
 python -c "import reflect; print('OK')"
 ```
 
@@ -33,7 +33,7 @@ python -c "import reflect; print('OK')"
 
 **诊断**：
 ```bash
-cd D:\system\AIRI\airi-unified-proxy
+cd D:\system\AIRI\memory\unified-proxy
 python -c "import reflect; print('OK')"
 ```
 
@@ -52,7 +52,7 @@ python -c "import reflect; print('OK')"
 
 **修复**：
 ```bash
-cd D:\system\AIRI\airi-memory-fused
+cd D:\system\AIRI\memory\memory-fused
 rmdir /s /q dist
 npx tsc
 ```
@@ -135,11 +135,11 @@ const tid = action.targetId || (action as any).sourceId;
 taskkill /F /IM python.exe
 
 # 启动 Yuan 嵌入服务（等 10 秒模型加载）
-cd D:\system\AIRI\airi-memory-fused
+cd D:\system\AIRI\memory\memory-fused
 start /B python yuan_embed_server.py 11435
 
 # 启动代理
-cd D:\system\AIRI\airi-unified-proxy
+cd D:\system\AIRI\memory\unified-proxy
 start /B python proxy.py
 
 # 验证
@@ -151,7 +151,7 @@ curl -s http://127.0.0.1:5050/health
 ## 四、手动修复数据库
 
 ```bash
-cd D:\system\AIRI\airi-memory-fused
+cd D:\system\AIRI\memory\memory-fused
 # 创建 .mjs 文件，内容：
 import Database from 'better-sqlite3';
 const db = new Database('./memory.sqlite');
@@ -171,7 +171,7 @@ db.prepare("UPDATE memory SET is_active=0 WHERE id LIKE ?").run('id前缀%')
 ## 五、TypeScript 编译
 
 ```bash
-cd D:\system\AIRI\airi-memory-fused
+cd D:\system\AIRI\memory\memory-fused
 rmdir /s /q dist       # 出问题时先清
 npx tsc                 # 编译
 ```
