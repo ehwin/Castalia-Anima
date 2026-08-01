@@ -18,6 +18,24 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(__import__('os').devnull, 'w', encoding='utf-8')
 
+# ── 文件日志（pythonw 无窗口时也能排障）──
+import logging
+import os as _os
+_SCRIPT_DIR = _os.path.dirname(_os.path.abspath(__file__))
+logging.basicConfig(
+    filename=_os.path.join(_SCRIPT_DIR, "embed-server.log"),
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    encoding="utf-8",
+)
+logger = logging.getLogger("yuan_embed")
+_console = print
+
+def _log(msg):
+    logger.info(msg)
+    try: _console(msg)
+    except Exception: pass
+
 app = Flask(__name__)
 
 # 延迟加载，避免启动阻塞
@@ -30,6 +48,7 @@ def load_model():
     if _model is not None:
         return
     print("Loading Yuan-EB 2.0-zh (fp16, from modelscope)...")
+    _log("Loading Yuan-EB 2.0-zh (fp16, from modelscope)...")
     import os
     os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
     from transformers import AutoTokenizer, AutoModel
@@ -50,7 +69,7 @@ def load_model():
             trust_remote_code=True,
             torch_dtype=torch.float16,
         )
-    print("Yuan-EB 2.0-zh loaded (fp16).")
+    _log("Yuan-EB 2.0-zh loaded (fp16).")
 
 # 空闲 10 分钟后自动卸载模型，释放内存
 UNLOAD_IDLE_SEC = 600
@@ -67,6 +86,7 @@ def _auto_unloader():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             print("Yuan-EB: model unloaded (idle > 10min)")
+            _log("Yuan-EB: model unloaded (idle > 10min)")
 
 threading.Thread(target=_auto_unloader, daemon=True).start()
 
@@ -117,4 +137,5 @@ def health():
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 11435
     print(f"Yuan-EB Embed Server starting on port {port}")
+    _log(f"Yuan-EB Embed Server starting on port {port}")
     app.run(host="127.0.0.1", port=port, threaded=True)
