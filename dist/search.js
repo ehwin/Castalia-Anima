@@ -18,9 +18,11 @@ const WEIGHT_CONSISTENCY = parseFloat(process.env.WEIGHT_CONSISTENCY || '0.30');
 const WEIGHT_EMOTION = parseFloat(process.env.WEIGHT_EMOTION || '0.45'); // 情感强度 — 主锚
 const WEIGHT_TIME = parseFloat(process.env.WEIGHT_TIME || '0.15'); // 自适应时间衰减
 const WEIGHT_DEVIATION = parseFloat(process.env.WEIGHT_DEVIATION || '0.10'); // "不像她"的珍贵瞬间
+// minScore 阈值可配:纯框架场景下无情绪记忆的向量分通常 ~0.2,
+// AIRI 人格化默认 0.3 会误杀;harness 可用 SEARCH_MIN_SCORE 覆盖
 const SEARCH_PROFILES = {
     quick: { topK: 3, minScore: 0.6 },
-    balanced: { topK: 5, minScore: 0.3 },
+    balanced: { topK: 5, minScore: parseFloat(process.env.SEARCH_MIN_SCORE || '0.15') },
     deep: { topK: 10, minScore: 0.1 },
 };
 /**

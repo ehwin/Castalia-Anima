@@ -21,8 +21,9 @@ import { getAgentState } from './agentState.js';
 import { runDigest, getRecentConversations, maybeDigest } from './digest.js';
 import { reflect, getAllMemories, getMemoryGraph, REFLECT_SYSTEM_PROMPT, getUnanalyzedConversations } from './reflect.js';
 import { autoProcess } from './autoProcessor.js';
+import { CHAR_ID, SERVER_NAME, SERVER_VERSION } from './env.js';
 console.log = console.error;
-const server = new McpServer({ name: 'airi-memory', version: '5.0.0' });
+const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 function ok(data) {
     return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
 }
@@ -38,7 +39,7 @@ server.tool('memory_search', 'Search past memories using tag-first then vector K
     category: z.string().optional().describe('Filter by category'),
 }, async (args) => {
     try {
-        const r = await searchMemory({ query: args.query, topK: args.topK ?? 5, profile: 'balanced', category: args.category });
+        const r = await searchMemory({ query: args.query, topK: args.topK ?? 5, profile: 'balanced', category: args.category, characterId: CHAR_ID });
         return ok({ count: r.length, results: r.map(m => ({ text: m.text, type: m.type, category: m.category, subject: m.subject, importance: m.importance, score: m.score, createdAt: m.createdAt })) });
     }
     catch (e) {
@@ -74,7 +75,7 @@ server.tool('memory_save', 'Store a new memory or update existing one by exact t
     skipEmbed: z.boolean().optional().default(false),
 }, async (args) => {
     try {
-        const r = await saveMemory({ text: args.text, type: args.type, category: args.category, tags: args.tags, emotionalImpact: args.emotionalImpact, importance: args.importance, tier: args.tier, source: args.source, subject: args.subject, characterId: 'airi', skipEmbed: args.skipEmbed });
+        const r = await saveMemory({ text: args.text, type: args.type, category: args.category, tags: args.tags, emotionalImpact: args.emotionalImpact, importance: args.importance, tier: args.tier, source: args.source, subject: args.subject, characterId: CHAR_ID, skipEmbed: args.skipEmbed });
         return ok({ id: r.id, text: r.text.substring(0, 100), type: r.type, category: r.category });
     }
     catch (e) {
@@ -111,9 +112,9 @@ server.tool('auto_process', '[Internal] Process a conversation turn: save to log
     moodReason: z.string().optional(),
 }, async (args) => {
     try {
-        const r = await autoProcess({ userMessage: args.userMessage, assistantMessage: args.assistantMessage, characterId: 'airi', moodValue: args.moodValue, moodReason: args.moodReason });
+        const r = await autoProcess({ userMessage: args.userMessage, assistantMessage: args.assistantMessage, characterId: CHAR_ID, moodValue: args.moodValue, moodReason: args.moodReason });
         // Trigger event-driven digest
-        maybeDigest('airi')?.catch(() => { });
+        maybeDigest(CHAR_ID)?.catch(() => { });
         return ok(r);
     }
     catch (e) {
@@ -122,7 +123,7 @@ server.tool('auto_process', '[Internal] Process a conversation turn: save to log
 });
 server.tool('digest_run', '[Internal] Run the digest cycle: flush VAD queue, cleanup expired memories, restore lost critical memories.', {}, async () => {
     try {
-        const r = await runDigest('airi');
+        const r = await runDigest(CHAR_ID);
         return ok(r);
     }
     catch (e) {
@@ -136,7 +137,7 @@ server.tool('conversation_save', '[Internal] Save a raw conversation turn to the
     moodReason: z.string().optional(),
 }, async (args) => {
     try {
-        const r = await saveConversationTurn(args.userMessage, args.assistantMessage, 'airi', args.moodValue, args.moodReason);
+        const r = await saveConversationTurn(args.userMessage, args.assistantMessage, CHAR_ID, args.moodValue, args.moodReason);
         return ok(r);
     }
     catch (e) {
@@ -148,9 +149,9 @@ server.tool('conversation_save', '[Internal] Save a raw conversation turn to the
 // ═══════════════════════════════════════════════════════════════════
 server.tool('context_get', 'Get current agent state (mood/energy/desire), bias layer, and user profile for prompt injection.', {}, async () => {
     try {
-        const state = getAgentState('airi');
-        const bias = getBiasPrompt('airi');
-        const profile = getUserProfilePrompt('airi', 'default');
+        const state = getAgentState(CHAR_ID);
+        const bias = getBiasPrompt(CHAR_ID);
+        const profile = getUserProfilePrompt(CHAR_ID, 'default');
         return ok({ state: state.toPromptString(), bias, profile });
     }
     catch (e) {
@@ -172,7 +173,7 @@ server.tool('stats_get', 'Get memory system statistics: total count, by category
     }
 });
 server.tool('user_observe', '[Internal] Observe a user message for communication pattern learning.', { message: z.string() }, async (args) => {
-    observeUserMessage('airi', 'default', args.message);
+    observeUserMessage(CHAR_ID, 'default', args.message);
     return ok({ ok: true });
 });
 server.tool('mood_journal', 'Get mood history for the past N days.', { days: z.number().optional().default(7) }, async (args) => {
@@ -197,7 +198,7 @@ server.tool('memory_list', 'List all active memories, optionally filtered.', {
     source: z.string().optional(),
 }, async (args) => {
     try {
-        const memories = getAllMemories('airi', args.limit);
+        const memories = getAllMemories(CHAR_ID, args.limit);
         let filtered = memories;
         if (args.category)
             filtered = filtered.filter((m) => m.category === args.category);
@@ -211,7 +212,7 @@ server.tool('memory_list', 'List all active memories, optionally filtered.', {
 });
 server.tool('memory_graph', 'Get the memory relationship graph.', {}, async () => {
     try {
-        return ok(getMemoryGraph('airi'));
+        return ok(getMemoryGraph(CHAR_ID));
     }
     catch (e) {
         return err(e.message);
@@ -222,7 +223,7 @@ server.tool('memory_recent', 'Get recent important memories (no vector search, j
     hoursBack: z.number().optional().default(24),
 }, async (args) => {
     try {
-        const r = getRecentMemories('airi', args.limit, args.hoursBack);
+        const r = getRecentMemories(CHAR_ID, args.limit, args.hoursBack);
         return ok({ count: r.length, results: r });
     }
     catch (e) {
@@ -234,7 +235,7 @@ server.tool('recent_conversations', 'Get recent conversation log entries.', {
     limit: z.number().optional().default(50),
 }, async (args) => {
     try {
-        const r = getRecentConversations('airi', args.hoursBack, args.limit);
+        const r = getRecentConversations(CHAR_ID, args.hoursBack, args.limit);
         return ok({ count: r.length, results: r });
     }
     catch (e) {
@@ -246,7 +247,7 @@ server.tool('recent_conversations', 'Get recent conversation log entries.', {
 // ═══════════════════════════════════════════════════════════════════
 server.tool('reflect_analyze', 'Get unanalyzed conversations bundled with system prompt for a big LLM to perform reflection.', { limit: z.number().optional().default(30) }, async (args) => {
     try {
-        const conversations = getUnanalyzedConversations('airi', undefined, args.limit ?? 30);
+        const conversations = getUnanalyzedConversations(CHAR_ID, undefined, args.limit ?? 30);
         const prompt = conversations.map((c) => c.text).join('\n---\n');
         return ok({
             conversationCount: conversations.length,
@@ -281,7 +282,7 @@ server.tool('reflect_apply', 'Apply reflection results (merge, extract, reclassi
 });
 server.tool('reflect_batch_embed', '[Internal] Batch embed all pending (un-embedded) memories. Called after reflect.', {}, async () => {
     try {
-        const r = await batchEmbedPending('airi');
+        const r = await batchEmbedPending(CHAR_ID);
         return ok(r);
     }
     catch (e) {
@@ -307,14 +308,14 @@ server.tool('daily_summary_data', 'Get conversation and auto-process data for th
 // STARTUP
 // ═══════════════════════════════════════════════════════════════════
 async function main() {
-    loadBiasesFromDb('airi');
-    loadUserProfilesFromDb('airi');
+    loadBiasesFromDb(CHAR_ID);
+    loadUserProfilesFromDb(CHAR_ID);
     // Agent state: nothing to flush (in-memory only)
     // Consolidate every 24 hours
     setInterval(() => { consolidate().catch(() => { }); }, 24 * 60 * 60 * 1000);
     // Event-driven digest check every 1 minute
     setInterval(() => {
-        maybeDigest('airi')?.catch((e) => console.error('digest error:', e));
+        maybeDigest(CHAR_ID)?.catch((e) => console.error('digest error:', e));
     }, 60 * 1000);
     // WAL checkpoint every 30 minutes
     setInterval(() => {

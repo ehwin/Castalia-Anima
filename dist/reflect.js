@@ -73,7 +73,7 @@ function safeTags(raw) {
     const filtered = raw.filter(t => typeof t === 'string' && t.length > 0 && t.length < 50);
     return filtered.length > 0 ? filtered : null;
 }
-export async function applyReflectActions(actions) {
+export async function applyReflectActions(actions, characterId = 'airi') {
     const db = DatabaseManager.getInstance();
     const result = { applied: 0, errors: [], details: [] };
     for (const action of actions) {
@@ -106,7 +106,7 @@ export async function applyReflectActions(actions) {
                         category: action.newCategory || 'general',
                         tags: action.newTags || [],
                         importance: action.newImportance || 0.7,
-                        characterId: 'airi',
+                        characterId,
                         source: 'reflect_merge',
                     });
                     result.applied++;
@@ -130,7 +130,7 @@ export async function applyReflectActions(actions) {
                             category: frag.category || 'conversation',
                             tags: frag.tags || [],
                             importance: frag.importance || 0.5,
-                            characterId: 'airi',
+                            characterId,
                             source: 'reflect_split',
                         });
                     }
@@ -216,7 +216,7 @@ export async function applyReflectActions(actions) {
                         tags: validTags,
                         importance,
                         tier,
-                        characterId: 'airi',
+                        characterId,
                         source: 'reflect_extract',
                     });
                     // 给源记忆 +reference_count（v5.1: LIKE 匹配短ID）
@@ -267,7 +267,7 @@ export async function applyReflectActions(actions) {
     }
     // ═══ v5.0: 批量向量化 digest 阶段跳过的记忆 ═══
     try {
-        const batchResult = await batchEmbedPending('airi');
+        const batchResult = await batchEmbedPending(characterId);
         if (batchResult.embedded > 0) {
             result.details.push(`batch embedded ${batchResult.embedded} pending memories`);
         }
@@ -444,7 +444,7 @@ export async function applyReflectResult(result, characterId = 'airi') {
     // 4. 应用记忆整理 actions
     if (result.actions && result.actions.length > 0) {
         try {
-            const ar = await applyReflectActions(result.actions);
+            const ar = await applyReflectActions(result.actions, characterId);
             out.actionsApplied = ar.applied;
             out.errors.push(...ar.errors);
         }

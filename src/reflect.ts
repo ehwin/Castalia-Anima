@@ -120,7 +120,7 @@ function safeTags(raw: any): string[] | null {
   return filtered.length > 0 ? filtered : null;
 }
 
-export async function applyReflectActions(actions: ReflectAction[]): Promise<{
+export async function applyReflectActions(actions: ReflectAction[], characterId: string = 'airi'): Promise<{
   applied: number;
   errors: string[];
   details: string[];
@@ -158,7 +158,7 @@ export async function applyReflectActions(actions: ReflectAction[]): Promise<{
             category: action.newCategory || 'general',
             tags: action.newTags || [],
             importance: action.newImportance || 0.7,
-            characterId: 'airi',
+            characterId,
             source: 'reflect_merge',
           });
           result.applied++;
@@ -183,7 +183,7 @@ export async function applyReflectActions(actions: ReflectAction[]): Promise<{
               category: frag.category || 'conversation',
               tags: frag.tags || [],
               importance: frag.importance || 0.5,
-              characterId: 'airi',
+              characterId,
               source: 'reflect_split',
             });
           }
@@ -270,7 +270,7 @@ export async function applyReflectActions(actions: ReflectAction[]): Promise<{
             tags: validTags,
             importance,
             tier,
-            characterId: 'airi',
+            characterId,
             source: 'reflect_extract',
           });
 
@@ -327,7 +327,7 @@ export async function applyReflectActions(actions: ReflectAction[]): Promise<{
 
   // ═══ v5.0: 批量向量化 digest 阶段跳过的记忆 ═══
   try {
-    const batchResult = await batchEmbedPending('airi');
+    const batchResult = await batchEmbedPending(characterId);
     if (batchResult.embedded > 0) {
       result.details.push(`batch embedded ${batchResult.embedded} pending memories`);
     }
@@ -538,7 +538,7 @@ export async function applyReflectResult(
   // 4. 应用记忆整理 actions
   if (result.actions && result.actions.length > 0) {
     try {
-      const ar = await applyReflectActions(result.actions);
+      const ar = await applyReflectActions(result.actions, characterId);
       out.actionsApplied = ar.applied;
       out.errors.push(...ar.errors);
     } catch (e: any) {
