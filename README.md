@@ -95,9 +95,11 @@ python scripts/vec_test.py     # 嵌入 + 向量语义搜索完整链路(需嵌�
 - WAL 模式;每 30 分钟自动 checkpoint;临时记忆 30 分钟清理;24 小时自动整合
 - 数据库文件可整体拷贝迁移(停服状态下)
 
-## 与 AIRI 的关系
+## 项目定位:独立分支
 
-这是从 `D:\system\AIRI\memory\memory-fused` 剥离的独立演进版本:
+本项目是 AIRI 记忆系统(memory-fused)的**独立分支**——保留 AIRI 血统,同时独立演进:
+- 独立 git 仓库、独立版本号,代码自由演进,不受 AIRI 主系统约束
+- 主系统(`D:\system\AIRI`)继续日常优化使用,两边改进可互相吸收(主系统侧已吸收 CHAR_ID 分区等改造)
 - 已改造:`CHAR_ID`/`MCP_SERVER_NAME` 环境变量化,多实例数据分区
 - 已修复:`memory_search` 默认阈值适配通用检索(0.15),不再被情绪锚定评分误杀
 - 未包含:unified-proxy(LLM 转发/TTS)、viz(星图)、AIRI 托盘与启动器
