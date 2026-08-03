@@ -21,6 +21,7 @@ import { getAgentState } from './agentState.js';
 import { runDigest, getRecentConversations, maybeDigest } from './digest.js';
 import { reflect, getAllMemories, getMemoryGraph, REFLECT_SYSTEM_PROMPT, getUnanalyzedConversations } from './reflect.js';
 import { autoProcess } from './autoProcessor.js';
+import { runAutoReflect, runDeepReflect } from './reflectDriver.js';
 import { CHAR_ID, SERVER_NAME, SERVER_VERSION } from './env.js';
 console.log = console.error;
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
@@ -289,6 +290,24 @@ server.tool('reflect_batch_embed', '[Internal] Batch embed all pending (un-embed
         return err(e.message);
     }
 });
+server.tool('reflect_auto', 'Run automatic reflection: feed unanalyzed conversations to the configured LLM, apply extracted memories/digest. Requires REFLECT_LLM_API_KEY.', { limit: z.number().optional().default(30) }, async (args) => {
+    try {
+        const r = await runAutoReflect(CHAR_ID, args.limit ?? 30);
+        return ok(r);
+    }
+    catch (e) {
+        return err(e.message);
+    }
+});
+server.tool('reflect_deep', 'Run deep calibration: feed ALL memories to the configured LLM for dedup/profile/graph actions. Requires REFLECT_LLM_API_KEY.', { limit: z.number().optional().default(500) }, async (args) => {
+    try {
+        const r = await runDeepReflect(CHAR_ID, args.limit ?? 500);
+        return ok(r);
+    }
+    catch (e) {
+        return err(e.message);
+    }
+});
 // ═══════════════════════════════════════════════════════════════════
 // 每日摘要工具
 // ═══════════════════════════════════════════════════════════════════
@@ -332,6 +351,19 @@ async function main() {
         if (cleaned > 0)
             console.error(`[airi-memory] cleaned ${cleaned} expired temporary memories`);
     }, 30 * 60 * 1000);
+    // Auto-reflect every N hours (REFLECT_INTERVAL_HOURS > 0 enables)
+    const reflectIntervalHours = parseFloat(process.env.REFLECT_INTERVAL_HOURS || '0');
+    if (reflectIntervalHours > 0) {
+        const runOnce = () => {
+            runAutoReflect(CHAR_ID).then(r => {
+                if (r.skipped)
+                    return;
+                console.error(`[reflect-auto] applied ${r.applied}/${r.actions} actions, errors: ${r.errors.length}`);
+            }).catch((e) => console.error('[reflect-auto] error:', e.message));
+        };
+        setInterval(runOnce, reflectIntervalHours * 3600 * 1000);
+        console.error(`[airi-memory] auto-reflect every ${reflectIntervalHours}h`);
+    }
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error('[airi-memory] v5.0.0 started — unified MCP server (proxy + LLM tools)');
