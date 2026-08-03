@@ -49,8 +49,12 @@ scripts\start-embed.bat
 | `WEIGHT_EMOTION` | `0.45` | 检索评分:情绪强度权重(无情绪记忆可调低) |
 | `WEIGHT_TIME` | `0.15` | 检索评分:时间衰减权重 |
 | `WEIGHT_DEVIATION` | `0.10` | 检索评分:偏离加成权重 |
+| `REFLECT_LLM_URL` | `https://api.deepseek.com/v1` | 反思 LLM 地址(OpenAI 兼容) |
+| `REFLECT_LLM_API_KEY` | *(未设)* | 反思 LLM 密钥;未设时反思自动跳过 |
+| `REFLECT_LLM_MODEL` | `deepseek-chat` | 反思 LLM 模型 |
+| `REFLECT_INTERVAL_HOURS` | `0` | 自动反思间隔(小时),0=仅手动 |
 
-## 工具列表(20 个)
+## 工具列表(22 个)
 
 **搜索**(LLM 直接调用)
 - `memory_search` — 标签优先 → 向量 KNN 回退,按评分排序
@@ -76,9 +80,11 @@ scripts\start-embed.bat
 - `user_observe` — 观察用户消息(沟通模式学习)
 - `mood_journal` — 情绪历史
 
-**反思**(需要外部大模型配合)
+**反思**(大模型驱动,已打包进 server)
 - `reflect_analyze` — 取未分析对话 + 反思系统提示词
 - `reflect_apply` — 应用反思结果(合并/拆分/提取/重分类/删除)
+- `reflect_auto` — **一键自动反思**:未分析对话 → 配置的 LLM → 应用(需 `REFLECT_LLM_API_KEY`)
+- `reflect_deep` — **深度校准**:全部记忆 → 去重/画像/图谱 → 应用(需 `REFLECT_LLM_API_KEY`)
 - `reflect_batch_embed` — 批量向量化未嵌入记忆
 
 ## 测试
