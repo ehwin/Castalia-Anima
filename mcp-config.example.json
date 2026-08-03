@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "ai-memory": {
+      "command": "node",
+      "args": ["D:\\AI\\AI memory\\dist\\index.js"],
+      "env": {
+        "OLLAMA_URL": "http://127.0.0.1:11436",
+        "EMBEDDING_MODEL": "yuan-embedding-2.0-zh",
+        "MEMORY_DB_PATH": "D:\\AI\\AI memory\\memory.sqlite",
+        "CHAR_ID": "default",
+        "SEARCH_MIN_SCORE": "0.15"
+      }
+    }
+  }
+}
