@@ -14,6 +14,8 @@
  */
 import { DatabaseManager } from './db.js';
 import { saveFacts, saveMemory, batchEmbedPending } from './store.js';
+import fs from 'node:fs';
+import path from 'node:path';
 /**
  * 获取所有记忆（供大模型分析）
  */
@@ -75,8 +77,15 @@ function safeTags(raw) {
 }
 export async function applyReflectActions(actions, characterId = 'airi') {
     const db = DatabaseManager.getInstance();
-    const result = { applied: 0, errors: [], details: [] };
+    const result = { applied: 0, errors: [], details: [], receipts: [] };
     for (const action of actions) {
+        const receipt = {
+            action: action.action,
+            status: 'applied',
+            targetId: action.targetId || action.sourceId || null,
+            reason: '',
+            rowsAffected: 0,
+        };
         try {
             switch (action.action) {
                 case 'merge': {
@@ -89,6 +98,13 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                         // 旧记忆全部软删除 + 删向量
                         // v5.1: LLM 可能返回短ID前缀，用 LIKE 匹配
                         for (const id of action.sourceIds) {
+                            const src = db.prepare('SELECT id FROM memory WHERE id LIKE ?').get(id + '%');
+                            if (src)
+                                receipt.rowsAffected++;
+                            else {
+                                receipt.status = 'failed';
+                                receipt.reason = `source not found: ${id}`;
+                            }
                             db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ?').run(id + '%');
                             try {
                                 db.prepare('DELETE FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id LIKE ?)').run(id + '%');
@@ -109,7 +125,12 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                         characterId,
                         source: 'reflect_merge',
                     });
-                    result.applied++;
+                    if (receipt.status === 'failed') {
+                        result.errors.push(`merge: ${receipt.reason}`);
+                        continue;
+                    }
+                    if (receipt.status === 'applied')
+                        result.applied++;
                     result.details.push(`merge: ${action.sourceIds.length} → 1`);
                     break;
                 }
@@ -117,6 +138,8 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                     // 拆分一个记忆为多个
                     if (!action.targetId || !action.fragments) {
                         result.errors.push('split: need targetId and fragments');
+                        receipt.status = 'failed';
+                        receipt.reason = 'need targetId and fragments';
                         continue;
                     }
                     // 软删除旧记忆（v5.1: LIKE 匹配短ID）
@@ -134,13 +157,16 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                             source: 'reflect_split',
                         });
                     }
-                    result.applied++;
+                    if (receipt.status === 'applied')
+                        result.applied++;
                     result.details.push(`split: 1 → ${action.fragments.length}`);
                     break;
                 }
                 case 'relate': {
                     if (!action.sourceId || !action.targetIdRelate || !action.relationType) {
                         result.errors.push('relate: need sourceId, targetIdRelate, relationType');
+                        receipt.status = 'failed';
+                        receipt.reason = 'need sourceId, targetIdRelate, relationType';
                         continue;
                     }
                     // 护栏：规范化 relation type
@@ -148,7 +174,8 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                     const edgeId = `edge_reflect_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
                     db.prepare('INSERT OR IGNORE INTO edges (id, source_id, target_id, relation_type) VALUES (?, ?, ?, ?)')
                         .run(edgeId, action.sourceId, action.targetIdRelate, relType);
-                    result.applied++;
+                    if (receipt.status === 'applied')
+                        result.applied++;
                     result.details.push(`relate: ${action.sourceId} → ${action.targetIdRelate} (${relType})`);
                     break;
                 }
@@ -191,7 +218,8 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                         values.push(tid + '%');
                         db.prepare(`UPDATE memory SET ${updates.join(', ')}, updated_at = ? WHERE id LIKE ?`)
                             .run(new Date().toISOString(), ...values);
-                        result.applied++;
+                        if (receipt.status === 'applied')
+                            result.applied++;
                         result.details.push(`reclassify: ${tid}`);
                     }
                     break;
@@ -200,6 +228,8 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                     // v5.0: 从源记忆中提取有效信息为新记忆（不删除源）
                     if (!action.sourceId || !action.newText) {
                         result.errors.push('extract: need sourceId and newText');
+                        receipt.status = 'failed';
+                        receipt.reason = 'need sourceId and newText';
                         continue;
                     }
                     const validType = action.newType && VALID_TYPES.has(action.newType) ? action.newType : 'semantic';
@@ -221,49 +251,82 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                     });
                     // 给源记忆 +reference_count（v5.1: LIKE 匹配短ID）
                     db.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id LIKE ?').run(action.sourceId + '%');
-                    result.applied++;
+                    if (receipt.status === 'applied')
+                        result.applied++;
                     result.details.push(`extract: from ${action.sourceId} → ${validType}/${validCat} (${tier})`);
                     break;
                 }
                 case 'delete': {
                     if (!action.targetId) {
                         result.errors.push('delete: need targetId');
+                        receipt.status = 'failed';
+                        receipt.reason = 'need targetId';
                         continue;
                     }
-                    db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ?').run(action.targetId + '%');
-                    result.applied++;
+                    const _delR = db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ?').run(action.targetId + '%');
+                    receipt.rowsAffected = _delR.changes;
+                    if (_delR.changes === 0) {
+                        receipt.status = 'failed';
+                        receipt.reason = `target not found: ${action.targetId}`;
+                    }
+                    if (receipt.status === 'applied')
+                        result.applied++;
                     result.details.push(`delete: ${action.targetId}`);
                     break;
                 }
                 case 'boost': {
                     if (!action.targetId || action.delta === undefined) {
                         result.errors.push('boost: need targetId and delta');
+                        receipt.status = 'failed';
+                        receipt.reason = 'need targetId and delta';
                         continue;
                     }
-                    db.prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance + ?)) WHERE id LIKE ?')
+                    const _boR = db.prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance + ?)) WHERE id LIKE ?')
                         .run(action.delta, action.targetId + '%');
-                    result.applied++;
+                    receipt.rowsAffected = _boR.changes;
+                    if (_boR.changes === 0) {
+                        receipt.status = 'failed';
+                        receipt.reason = `target not found: ${action.targetId}`;
+                    }
+                    if (receipt.status === 'applied')
+                        result.applied++;
                     result.details.push(`boost: ${action.targetId} += ${action.delta}`);
                     break;
                 }
                 case 'decay': {
                     if (!action.targetId || action.delta === undefined) {
                         result.errors.push('decay: need targetId and delta');
+                        receipt.status = 'failed';
+                        receipt.reason = 'need targetId and delta';
                         continue;
                     }
-                    db.prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance - ?)) WHERE id LIKE ?')
+                    const _deR = db.prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance - ?)) WHERE id LIKE ?')
                         .run(action.delta, action.targetId + '%');
-                    result.applied++;
+                    receipt.rowsAffected = _deR.changes;
+                    if (_deR.changes === 0) {
+                        receipt.status = 'failed';
+                        receipt.reason = `target not found: ${action.targetId}`;
+                    }
+                    if (receipt.status === 'applied')
+                        result.applied++;
                     result.details.push(`decay: ${action.targetId} -= ${action.delta}`);
                     break;
                 }
                 default:
                     result.errors.push(`unknown action: ${action.action}`);
+                    receipt.status = 'skipped';
+                    receipt.reason = `unknown action: ${action.action}`;
             }
         }
         catch (e) {
             result.errors.push(`${action.action}: ${e.message}`);
+            receipt.status = 'failed';
+            receipt.reason = e.message;
         }
+        if (receipt.status === 'failed' && receipt.reason && !result.errors.some(e => e.includes(receipt.reason))) {
+            result.errors.push(`${receipt.action}: ${receipt.reason}`);
+        }
+        result.receipts.push(receipt);
     }
     // ═══ v5.0: 批量向量化 digest 阶段跳过的记忆 ═══
     try {
@@ -390,6 +453,7 @@ export async function applyReflectResult(result, characterId = 'airi') {
         actionsApplied: 0,
         applied: 0,
         errors: [],
+        receipts: [],
     };
     // 1. 存 summary
     if (result.summary) {
@@ -447,6 +511,18 @@ export async function applyReflectResult(result, characterId = 'airi') {
             const ar = await applyReflectActions(result.actions, characterId);
             out.actionsApplied = ar.applied;
             out.errors.push(...ar.errors);
+            out.receipts = ar.receipts;
+            try {
+                const dir = process.env.REFLECT_RECEIPT_DIR || path.join(process.cwd(), 'reflect-receipts');
+                fs.mkdirSync(dir, { recursive: true });
+                const ts = new Date().toISOString().replace(/[:.]/g, '-');
+                fs.writeFileSync(path.join(dir, `reflect-receipt-${ts}.json`), JSON.stringify({ ts: new Date().toISOString(), characterId, actionCount: result.actions.length,
+                    applied: ar.applied, failed: ar.receipts.filter(r => r.status !== 'applied').length,
+                    actions: result.actions, receipts: ar.receipts, errors: ar.errors }, null, 2), 'utf-8');
+            }
+            catch (e) {
+                out.errors.push(`receipt write: ${e.message}`);
+            }
         }
         catch (e) {
             out.errors.push(`actions: ${e.message}`);

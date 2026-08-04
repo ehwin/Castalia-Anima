@@ -260,9 +260,25 @@ export async function saveConversationTurn(
  * 清理过期的临时记忆 (tier='temporary', expires_at < now)
  * 返回清理数量
  */
+// ═══ v1.3: 热度升格 — 常被访问的记忆自动变强(UPSP 热度思想) ═══
+const HEAT_PROMOTE_THRESHOLD = parseInt(process.env.HEAT_PROMOTE_THRESHOLD || '5', 10);
+
+export function promoteByAccess(): number {
+  const db = DatabaseManager.getInstance();
+  const now = new Date().toISOString();
+  const r = db.prepare(`
+    UPDATE memory SET tier = 'standard', updated_at = ?
+    WHERE tier = 'temporary' AND accessed_count >= ? AND is_active = 1
+  `).run(now, HEAT_PROMOTE_THRESHOLD);
+  if (r.changes > 0) console.error(`[memory] heat promote: ${r.changes} temporary → standard`);
+  return r.changes;
+}
+
 export function cleanupExpiredMemories(): number {
   const db = DatabaseManager.getInstance();
   const now = new Date().toISOString();
+  // 先升格再清理:被反复访问的 temporary 不该被清
+  promoteByAccess();
   const result = db.prepare(`
     UPDATE memory SET is_active = 0, updated_at = ?
     WHERE tier = 'temporary' AND expires_at IS NOT NULL AND expires_at < ? AND is_active = 1

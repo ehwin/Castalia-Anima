@@ -185,6 +185,7 @@ export async function runAutoReflect(charId, limit = 30) {
         return {
             ok: true, mode: 'auto', conversationCount: conversations.length,
             actions: actions.length, applied: r.actionsApplied, errors: r.errors,
+            receipts: r.receipts,
         };
     }
     catch (e) {
@@ -222,6 +223,7 @@ export async function runDeepReflect(charId, limit = 500) {
         return {
             ok: true, mode: 'deep', memoryCount: memories.length,
             actions: actions.length, applied: r.actionsApplied, errors: r.errors,
+            receipts: r.receipts,
         };
     }
     catch (e) {

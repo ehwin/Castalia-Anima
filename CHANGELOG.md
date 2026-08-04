@@ -3,6 +3,16 @@
 > 本文件记录每次功能/架构变更,供 AIRI 主系统(`D:\system\AIRI\memory`)吸收改进时快速对账。
 > 与公共版(`/path\ai-memory`,CHANGELOG 见其仓库)同步演进,两边改动互相吸收。
 
+## [v1.3] — 2026-08-04 热度升格 + reflect 回执(与公共版同步)
+
+### Added
+- **热度升格**:accessed_count ≥ `HEAT_PROMOTE_THRESHOLD`(默认 5)的 temporary 自动升 standard;清理前先升格
+- **reflect 逐动作回执**:receipts[] {action, status, targetId, reason, rowsAffected};幻觉 id 不再静默算成功
+- **回执落盘**:`reflect-receipts/reflect-receipt-<ts>.json`(动作原文 + 每条回执,可人工修正)
+
+### Fixed
+- reflect 幻觉 id 动作误计 applied 的问题
+
 ## [Unreleased] — 2026-08-04 工具分级与暴露面矫正
 
 ### Added
