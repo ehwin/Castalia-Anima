@@ -281,15 +281,6 @@ server.tool('reflect_apply', 'Apply reflection results (merge, extract, reclassi
         return err(e.message);
     }
 });
-server.tool('reflect_batch_embed', '[Internal] Batch embed all pending (un-embedded) memories. Called after reflect.', {}, async () => {
-    try {
-        const r = await batchEmbedPending(CHAR_ID);
-        return ok(r);
-    }
-    catch (e) {
-        return err(e.message);
-    }
-});
 server.tool('reflect_auto', 'Run automatic reflection: feed unanalyzed conversations to the configured LLM, apply extracted memories/digest. Requires REFLECT_LLM_API_KEY.', { limit: z.number().optional().default(30) }, async (args) => {
     try {
         const r = await runAutoReflect(CHAR_ID, args.limit ?? 30);
@@ -302,6 +293,15 @@ server.tool('reflect_auto', 'Run automatic reflection: feed unanalyzed conversat
 server.tool('reflect_deep', 'Run deep calibration: feed ALL memories to the configured LLM for dedup/profile/graph actions. Requires REFLECT_LLM_API_KEY.', { limit: z.number().optional().default(500) }, async (args) => {
     try {
         const r = await runDeepReflect(CHAR_ID, args.limit ?? 500);
+        return ok(r);
+    }
+    catch (e) {
+        return err(e.message);
+    }
+});
+server.tool('reflect_batch_embed', '[Internal] Batch embed all pending (un-embedded) memories. Called after reflect.', {}, async () => {
+    try {
+        const r = await batchEmbedPending(CHAR_ID);
         return ok(r);
     }
     catch (e) {

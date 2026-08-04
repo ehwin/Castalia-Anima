@@ -350,18 +350,6 @@ server.tool(
 );
 
 server.tool(
-  'reflect_batch_embed',
-  '[Internal] Batch embed all pending (un-embedded) memories. Called after reflect.',
-  {},
-  async () => {
-    try {
-      const r = await batchEmbedPending(CHAR_ID);
-      return ok(r);
-    } catch (e: any) { return err(e.message); }
-  }
-);
-
-server.tool(
   'reflect_auto',
   'Run automatic reflection: feed unanalyzed conversations to the configured LLM, apply extracted memories/digest. Requires REFLECT_LLM_API_KEY.',
   { limit: z.number().optional().default(30) },
@@ -380,6 +368,18 @@ server.tool(
   async (args) => {
     try {
       const r = await runDeepReflect(CHAR_ID, args.limit ?? 500);
+      return ok(r);
+    } catch (e: any) { return err(e.message); }
+  }
+);
+
+server.tool(
+  'reflect_batch_embed',
+  '[Internal] Batch embed all pending (un-embedded) memories. Called after reflect.',
+  {},
+  async () => {
+    try {
+      const r = await batchEmbedPending(CHAR_ID);
       return ok(r);
     } catch (e: any) { return err(e.message); }
   }
