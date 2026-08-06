@@ -1,8 +1,8 @@
 {
-  "name": "airi-memory-fused",
+  "name": "castalia-anima",
   "version": "1.0.0",
   "license": "Apache-2.0",
-  "description": "AI Memory MCP Server — standalone memory framework for agent harnesses (cognitive-memory base + AIRI scoring + character layer)",
+  "description": "Castalia Anima — 情感人格化记忆 MCP server (from AIRI memory-fused, keep emotion layer)",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -12,12 +12,14 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "better-sqlite3": "^11.10.0",
+    "picomatch": "^4.0.5",
     "sqlite-vec": "^0.1.9",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
+    "@types/picomatch": "^4.0.3",
     "typescript": "^5.8.0"
   }
 }

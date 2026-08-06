@@ -14,21 +14,24 @@
  */
 import { DatabaseManager } from './db.js';
 import { saveFacts, saveMemory, batchEmbedPending } from './store.js';
+import { normalizeProject } from './env.js';
+import { isMemType, MEM_TYPES } from './memType.js';
 import fs from 'node:fs';
 import path from 'node:path';
 /**
  * 获取所有记忆（供大模型分析）
  */
-export function listAllMemories(characterId = 'airi', limit = 200) {
-    const db = DatabaseManager.getInstance();
+export function listAllMemories(characterId = 'airi', limit = 200, project) {
+    const db = DatabaseManager.getInstance(project);
+    const proj = normalizeProject(project);
     const rows = db.prepare(`
-    SELECT id, text, type, category, tags, importance, emotional_impact,
+    SELECT id, text, type, mem_type, category, tags, importance, emotional_impact,
            subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked
     FROM memory
-    WHERE is_active = 1 AND character_id = ?
+    WHERE is_active = 1 AND character_id = ? AND project = ?
     ORDER BY importance DESC, created_at DESC
     LIMIT ?
-  `).all(characterId, limit);
+  `).all(characterId, proj, limit);
     return rows.map(r => {
         let tags = [];
         try {
@@ -42,10 +45,11 @@ export function listAllMemories(characterId = 'airi', limit = 200) {
             id: r.id,
             text: r.text,
             type: r.type,
+            memType: r.mem_type || 'general',
             category: r.category,
             tags,
             importance: r.importance,
-            emotionalImpact: r.emotional_impact,
+            emotionalImpact: r.emotional_impact ?? 0,
             subject: r.subject,
             source: r.source,
             tier: r.tier || 'standard',
@@ -65,6 +69,7 @@ export function listAllMemories(characterId = 'airi', limit = 200) {
 // 护栏：拒绝明显无效的值，防止大模型幻觉污染数据库
 // ═════════════════════════════════════════════════
 const VALID_TYPES = new Set(['episodic', 'semantic', 'entity', 'preference']);
+const VALID_MEM_TYPES = new Set(MEM_TYPES); // v1.8: 4 种封闭类型 + general
 const VALID_CATEGORIES = new Set(['conversation', 'emotional', 'milestone', 'identity', 'relationship', 'knowledge', 'preference', 'general', 'mood_snapshot']);
 const VALID_RELATIONS = new Set(['caused_by', 'part_of', 'follows', 'related_to', 'same_subject', 'causes', 'leads_to', 'sequence']);
 function safeTags(raw) {
@@ -75,8 +80,8 @@ function safeTags(raw) {
     const filtered = raw.filter(t => typeof t === 'string' && t.length > 0 && t.length < 50);
     return filtered.length > 0 ? filtered : null;
 }
-export async function applyReflectActions(actions, characterId = 'airi') {
-    const db = DatabaseManager.getInstance();
+export async function applyReflectActions(actions, characterId = 'airi', project) {
+    const db = DatabaseManager.getInstance(project);
     const result = { applied: 0, errors: [], details: [], receipts: [] };
     for (const action of actions) {
         const receipt = {
@@ -92,6 +97,8 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                     // 合并多个记忆为一个
                     if (!action.sourceIds || action.sourceIds.length < 2 || !action.newText) {
                         result.errors.push('merge: need sourceIds and newText');
+                        receipt.status = 'failed';
+                        receipt.reason = 'need sourceIds and newText';
                         continue;
                     }
                     const tx = db.transaction(() => {
@@ -119,10 +126,13 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                     await saveMemory({
                         text: action.newText,
                         type: (action.newType || 'semantic'),
+                        // v1.10: merge 支持 newMemType — 记忆整合输出保持 4 种封闭类型之一
+                        memType: isMemType(action.newMemType) ? action.newMemType : undefined,
                         category: action.newCategory || 'general',
                         tags: action.newTags || [],
                         importance: action.newImportance || 0.7,
                         characterId,
+                        project,
                         source: 'reflect_merge',
                     });
                     if (receipt.status === 'failed') {
@@ -143,6 +153,11 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                         continue;
                     }
                     // 软删除旧记忆（v5.1: LIKE 匹配短ID）
+                    const _splitSrc = db.prepare('SELECT id FROM memory WHERE id LIKE ?').get(action.targetId + '%');
+                    if (!_splitSrc) {
+                        receipt.status = 'failed';
+                        receipt.reason = `target not found: ${action.targetId}`;
+                    }
                     db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ?').run(action.targetId + '%');
                     // 插入碎片
                     const { saveMemory } = await import('./store.js');
@@ -154,6 +169,7 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                             tags: frag.tags || [],
                             importance: frag.importance || 0.5,
                             characterId,
+                            project,
                             source: 'reflect_split',
                         });
                     }
@@ -172,8 +188,13 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                     // 护栏：规范化 relation type
                     const relType = VALID_RELATIONS.has(action.relationType) ? action.relationType : 'related_to';
                     const edgeId = `edge_reflect_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
-                    db.prepare('INSERT OR IGNORE INTO edges (id, source_id, target_id, relation_type) VALUES (?, ?, ?, ?)')
+                    const _relR = db.prepare('INSERT OR IGNORE INTO edges (id, source_id, target_id, relation_type) VALUES (?, ?, ?, ?)')
                         .run(edgeId, action.sourceId, action.targetIdRelate, relType);
+                    receipt.rowsAffected = _relR.changes;
+                    if (_relR.changes === 0) {
+                        receipt.status = 'failed';
+                        receipt.reason = `edge exists or node missing: ${action.sourceId}→${action.targetIdRelate}`;
+                    }
                     if (receipt.status === 'applied')
                         result.applied++;
                     result.details.push(`relate: ${action.sourceId} → ${action.targetIdRelate} (${relType})`);
@@ -184,6 +205,8 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                     const tid = action.targetId || action.sourceId;
                     if (!tid) {
                         result.errors.push('reclassify: need targetId or sourceId');
+                        receipt.status = 'failed';
+                        receipt.reason = 'need targetId or sourceId';
                         continue;
                     }
                     const updates = [];
@@ -192,6 +215,8 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                     if (action.newTypeSingle) {
                         if (!VALID_TYPES.has(action.newTypeSingle)) {
                             result.errors.push(`reclassify: invalid type "${action.newTypeSingle}", skipped`);
+                            receipt.status = 'failed';
+                            receipt.reason = `invalid type "${action.newTypeSingle}"`;
                             continue;
                         }
                         updates.push('type = ?');
@@ -200,6 +225,8 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                     if (action.newCategorySingle) {
                         if (!VALID_CATEGORIES.has(action.newCategorySingle)) {
                             result.errors.push(`reclassify: invalid category "${action.newCategorySingle}", skipped`);
+                            receipt.status = 'failed';
+                            receipt.reason = `invalid category "${action.newCategorySingle}"`;
                             continue;
                         }
                         updates.push('category = ?');
@@ -209,6 +236,8 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                         const valid = safeTags(action.newTags);
                         if (!valid) {
                             result.errors.push('reclassify: invalid tags (must be string array), skipped');
+                            receipt.status = 'failed';
+                            receipt.reason = 'invalid tags';
                             continue;
                         }
                         updates.push('tags = ?');
@@ -216,8 +245,13 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                     }
                     if (updates.length > 0) {
                         values.push(tid + '%');
-                        db.prepare(`UPDATE memory SET ${updates.join(', ')}, updated_at = ? WHERE id LIKE ?`)
+                        const _recR = db.prepare(`UPDATE memory SET ${updates.join(', ')}, updated_at = ? WHERE id LIKE ?`)
                             .run(new Date().toISOString(), ...values);
+                        receipt.rowsAffected = _recR.changes;
+                        if (_recR.changes === 0) {
+                            receipt.status = 'failed';
+                            receipt.reason = `target not found: ${tid}`;
+                        }
                         if (receipt.status === 'applied')
                             result.applied++;
                         result.details.push(`reclassify: ${tid}`);
@@ -234,6 +268,7 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                     }
                     const validType = action.newType && VALID_TYPES.has(action.newType) ? action.newType : 'semantic';
                     const validCat = action.newCategory && VALID_CATEGORIES.has(action.newCategory) ? action.newCategory : 'general';
+                    const validMemType = isMemType(action.newMemType) ? action.newMemType : undefined;
                     const validTags = safeTags(action.newTags) || [];
                     const importance = action.newImportance ?? 0.6;
                     const tier = (action.tier && ['temporary', 'standard', 'critical'].includes(action.tier))
@@ -242,11 +277,13 @@ export async function applyReflectActions(actions, characterId = 'airi') {
                     await saveMemory({
                         text: action.newText,
                         type: validType,
+                        memType: validMemType,
                         category: validCat,
                         tags: validTags,
                         importance,
                         tier,
                         characterId,
+                        project,
                         source: 'reflect_extract',
                     });
                     // 给源记忆 +reference_count（v5.1: LIKE 匹配短ID）
@@ -328,9 +365,9 @@ export async function applyReflectActions(actions, characterId = 'airi') {
         }
         result.receipts.push(receipt);
     }
-    // ═══ v5.0: 批量向量化 digest 阶段跳过的记忆 ═══
+    // ═══ v5.0: 批量向量化 digest 阶段跳过的记忆(按项目隔离) ═══
     try {
-        const batchResult = await batchEmbedPending(characterId);
+        const batchResult = await batchEmbedPending(characterId, project);
         if (batchResult.embedded > 0) {
             result.details.push(`batch embedded ${batchResult.embedded} pending memories`);
         }
@@ -347,20 +384,26 @@ export async function applyReflectActions(actions, characterId = 'airi') {
 // 导出别名 — 供 proxy.py / _memory_engine.mjs 调用
 // ═══════════════════════════════════════════════════════════
 /** 获取所有记忆（别名，供外部调用） */
-export function getAllMemories(characterId = 'airi', limit = 200) {
-    return listAllMemories(characterId, limit);
+export function getAllMemories(characterId = 'airi', limit = 200, project) {
+    return listAllMemories(characterId, limit, project);
 }
 /** 获取记忆关联图 */
-export function getMemoryGraph(characterId = 'airi') {
-    const db = DatabaseManager.getInstance();
-    const nodes = listAllMemories(characterId, 500);
-    const edgeRows = db.prepare(`
-    SELECT e.id, e.source_id, e.target_id, e.relation_type,
-           m1.text as source_text, m2.text as target_text
-    FROM edges e
-    LEFT JOIN memory m1 ON e.source_id = m1.id
-    LEFT JOIN memory m2 ON e.target_id = m2.id
-  `).all();
+export function getMemoryGraph(characterId = 'airi', project) {
+    const db = DatabaseManager.getInstance(project);
+    const proj = normalizeProject(project);
+    const nodes = listAllMemories(characterId, 500, proj);
+    const nodeIds = new Set(nodes.map((n) => n.id));
+    let edgeRows = [];
+    if (nodeIds.size > 0) {
+        edgeRows = db.prepare(`
+      SELECT e.id, e.source_id, e.target_id, e.relation_type,
+             m1.text as source_text, m2.text as target_text
+      FROM edges e
+      LEFT JOIN memory m1 ON e.source_id = m1.id
+      LEFT JOIN memory m2 ON e.target_id = m2.id
+      WHERE e.source_id IN (${[...nodeIds].map(() => '?').join(',')})
+    `).all(...nodeIds);
+    }
     const edges = edgeRows.map(r => ({
         id: r.id,
         sourceId: r.source_id,
@@ -395,7 +438,7 @@ export const REFLECT_SYSTEM_PROMPT = `你是记忆反思引擎。你的任务是
 }
 
 【facts 提取规则】
-- subject: "user"（关于用户）/ "airi"（关于AI角色）/ "environment"（关于环境）
+- subject: "user"（关于用户）/ "agent"（关于AI角色）/ "environment"（关于环境）
 - predicate: 使用这些预定义关系或自定义短语：
   姓名 / 年龄 / 职业 / 喜好 / 厌恶 / 技能 / 居住地 / 工作单位 / 项目 / 技术栈 / 习惯 / 目标 / 关系
 - object: 事实的值
@@ -413,15 +456,16 @@ export const REFLECT_SYSTEM_PROMPT = `你是记忆反思引擎。你的任务是
  * 获取待反思的未分析对话
  */
 export function getUnanalyzedConversations(characterId = 'airi', since, // ISO datetime，不传则取上次 reflect 之后
-limit = 30) {
-    const db = DatabaseManager.getInstance();
+limit = 30, project) {
+    const db = DatabaseManager.getInstance(project);
+    const proj = normalizeProject(project);
     // 找到上次反思时间（最近一次 source='reflect_summary' 的创建时间）
     if (!since) {
         const lastReflect = db.prepare(`
       SELECT created_at FROM memory
-      WHERE source = 'reflect_summary' AND character_id = ?
+      WHERE source = 'reflect_summary' AND character_id = ? AND project = ?
       ORDER BY created_at DESC LIMIT 1
-    `).get(characterId);
+    `).get(characterId, proj);
         since = lastReflect?.created_at || new Date(0).toISOString();
     }
     return db.prepare(`
@@ -430,10 +474,11 @@ limit = 30) {
     WHERE is_active = 1
       AND source = 'conversation_log'
       AND character_id = ?
+      AND project = ?
       AND created_at > ?
     ORDER BY created_at ASC
     LIMIT ?
-  `).all(characterId, since, limit);
+  `).all(characterId, proj, since, limit);
 }
 /**
  * 应用大模型反思结果
@@ -444,7 +489,7 @@ limit = 30) {
  *   3. insights → 存入 memory（source='reflect_insight'）
  *   4. actions → 调用 applyReflectActions()
  */
-export async function applyReflectResult(result, characterId = 'airi') {
+export async function applyReflectResult(result, characterId = 'airi', project) {
     const out = {
         summaryId: null,
         factsInserted: 0,
@@ -465,6 +510,7 @@ export async function applyReflectResult(result, characterId = 'airi') {
                 tags: result.highlights || [],
                 importance: 0.7,
                 characterId,
+                project,
                 source: 'reflect_summary',
                 subject: 'user',
             });
@@ -477,7 +523,7 @@ export async function applyReflectResult(result, characterId = 'airi') {
     // 2. 存 facts（自动去重，confidence 取 MAX）
     if (result.facts && result.facts.length > 0) {
         try {
-            const fr = await saveFacts(result.facts, out.summaryId, characterId);
+            const fr = await saveFacts(result.facts, out.summaryId, characterId, project);
             out.factsInserted = fr.inserted;
             out.factsUpdated = fr.updated;
         }
@@ -495,6 +541,7 @@ export async function applyReflectResult(result, characterId = 'airi') {
                     category: 'knowledge',
                     importance: 0.6,
                     characterId,
+                    project,
                     source: 'reflect_insight',
                     subject: 'user',
                 });
@@ -505,20 +552,28 @@ export async function applyReflectResult(result, characterId = 'airi') {
             }
         }
     }
-    // 4. 应用记忆整理 actions
+    // 4. 应用记忆整理 actions + 逐动作回执落盘
     if (result.actions && result.actions.length > 0) {
         try {
-            const ar = await applyReflectActions(result.actions, characterId);
+            const ar = await applyReflectActions(result.actions, characterId, project);
             out.actionsApplied = ar.applied;
             out.errors.push(...ar.errors);
             out.receipts = ar.receipts;
+            // ═══ v1.3: 回执落盘 — 失败动作原文存档,事后可人工修正 ═══
             try {
-                const dir = process.env.REFLECT_RECEIPT_DIR || path.join(process.cwd(), 'reflect-receipts');
+                const dir = process.env.REFLECT_RECEIPT_DIR || path.join(process.cwd(), 'memory', 'receipts');
                 fs.mkdirSync(dir, { recursive: true });
                 const ts = new Date().toISOString().replace(/[:.]/g, '-');
-                fs.writeFileSync(path.join(dir, `reflect-receipt-${ts}.json`), JSON.stringify({ ts: new Date().toISOString(), characterId, actionCount: result.actions.length,
-                    applied: ar.applied, failed: ar.receipts.filter(r => r.status !== 'applied').length,
-                    actions: result.actions, receipts: ar.receipts, errors: ar.errors }, null, 2), 'utf-8');
+                fs.writeFileSync(path.join(dir, `reflect-receipt-${ts}.json`), JSON.stringify({
+                    ts: new Date().toISOString(),
+                    characterId,
+                    actionCount: result.actions.length,
+                    applied: ar.applied,
+                    failed: ar.receipts.filter(r => r.status !== 'applied').length,
+                    actions: result.actions,
+                    receipts: ar.receipts,
+                    errors: ar.errors,
+                }, null, 2), 'utf-8');
             }
             catch (e) {
                 out.errors.push(`receipt write: ${e.message}`);
@@ -534,10 +589,10 @@ export async function applyReflectResult(result, characterId = 'airi') {
 export async function reflect(action, params = {}) {
     switch (action) {
         case 'list':
-            return listAllMemories(params.characterId || 'airi', params.limit || 200);
+            return listAllMemories(params.characterId || 'airi', params.limit || 200, params.project);
         case 'unanalyzed': {
             // 获取待反思的未分析对话 + prompt
-            const conversations = getUnanalyzedConversations(params.characterId || 'airi', params.since, params.limit || 30);
+            const conversations = getUnanalyzedConversations(params.characterId || 'airi', params.since, params.limit || 30, params.project);
             const prompt = conversations.map(c => c.text).join('\n---\n');
             return {
                 conversationCount: conversations.length,
@@ -550,7 +605,7 @@ export async function reflect(action, params = {}) {
             if (!params.actions || params.actions.length === 0) {
                 return { applied: 0, errors: ['no actions to apply'] };
             }
-            return applyReflectResult(params, params.characterId || 'airi');
+            return applyReflectResult(params, params.characterId || 'airi', params.project);
         }
         case 'merge':
         case 'split':
@@ -559,12 +614,12 @@ export async function reflect(action, params = {}) {
         case 'delete':
         case 'boost':
         case 'decay':
-            return applyReflectActions([{ action, ...params }]);
+            return applyReflectActions([{ action, ...params }], params.characterId || 'airi', params.project);
         case 'batch':
             if (!Array.isArray(params.actions)) {
                 return { error: 'batch action requires "actions" array' };
             }
-            return applyReflectActions(params.actions);
+            return applyReflectActions(params.actions, params.characterId || 'airi', params.project);
         case 'auto': {
             const allMemories = listAllMemories(params.characterId || 'airi', params.limit || 200);
             const graph = getMemoryGraph(params.characterId || 'airi');

@@ -1,7 +1,46 @@
-# Changelog — AI memory(AIRI 分支,自用版)
+# Changelog — Castalia Anima(情感版,公共库)
 
-> 本文件记录每次功能/架构变更,供 AIRI 主系统(`D:\system\AIRI\memory`)吸收改进时快速对账。
-> 与公共版(`/path\ai-memory`,CHANGELOG 见其仓库)同步演进,两边改动互相吸收。
+> 本文件记录每次功能/架构变更。**Castalia Anima = 保留 AIRI 情感血统的情感人格化版**,定位为推 GitHub 的公共库;AIRI 主系统(`D:\system\AIRI\memory`)自用,吸收架构但不分库。
+> 与通用版(`/path\ai-memory`,无情感 Castalia)同源演进;本版 = 通用版 v1.11 架构 + Anima 情感层。
+
+## [v2.0] — 2026-08-07 通用版 v1.11 全架构吸收(保留全部情感层)
+
+> 用户决策:Anima 作为情感版公共库,完整吸收通用版架构(含项目分库);AIRI 主系统后续同步(不分库)。
+
+### Added(从通用版吸收)
+- **项目分库**:`DatabaseManager.getInstance(project)`、`memory/global.sqlite`(指令+项目注册)+ `project-<name>.sqlite`(业务表)、`listProjectNames`、跨项目去重隔离
+- **session_id 会话级记忆**(v6.0 列正式启用):`memory_save`/`auto_process` 加 sessionId 参数
+- **渐进式临时反思**:`buffer.ts` SessionMemoryBuffer(N 轮攒批默认 5)+ `triage.ts` 增量反思 + 晋升链(`upsertSessionMemory`/`promoteToProject`/`deleteSessionFragments`)+ TTL 7 天孤儿清扫
+- **triage 三通道**:`makeLlmChannel(prefix)` + `callLlm(system, user, channel?)`;`TRIAGE_LLM_*` 入站分拣,缺省回退 REFLECT_* 通道
+- **memType 四封闭类型**(`memType.ts`):user/feedback/project/reference + Markdown 规范化包装
+- **三层指令**(`instructions.ts`):global/user/project/rule + glob 路由 + `ensureSeedInstructions`
+- **configLoader**(`configLoader.ts`):config.json 持久化嵌入/反思/triage/整合配置(必须 index.ts 第一个 import)
+- **新工具 22→31**:memory_get / memory_index / memory_log / memory_context / consolidate_deep / project_list / instruction_save / instruction_list / instruction_delete
+- **记忆整合**(`consolidate.ts` + `runConsolidate`):向量预筛相似对 + LLM 矛盾消解/去重/剪枝,`shouldAutoConsolidate` 启动检查
+- **Memory Snapshot Warning**:≥24h 旧记忆注入时追加快照警告
+- **启动自动反思**:`shouldAutoReflect`(≥24h 未反思 + 未分析对话 >5)下次启动自动执行
+- **嵌入升级**:`embed(text, project?)` 按项目隔离缓存 + `EMBEDDING_API_KEY` OpenAI 兼容 /embeddings 模式 + `EMBED_MODE=none` 禁用
+- **回执落盘**:`memory/receipts` 目录(v1.3 迁移)
+
+### Changed
+- MCP_TOOLS 默认 `all`(31 工具全注册;AIRI 主系统 proxy 依赖 harness/admin 组)
+- `context_get` 融合为 agent 情感态(state/bias/profile)+ 记忆上下文
+- server 名 `castalia-anima`;CHAR_ID 默认 `airi`
+- smoke_test.py / vec_test.py 同步通用版(分库 + 动态路径)
+
+### 保留(Anima 情感层,不裁剪)
+- `emotion.ts`(VAD 情感分析 + 情绪锚定)/ `agentState.ts` / `bias.ts`(recordTopics/computeBiasBoost)/ `userLearning.ts` 全部保留
+- 情感评分公式:**一致性 0.30 + 情感 0.45 + 时间 0.15 + 偏差 0.10**(情绪主锚 + "不像她"珍贵瞬间)
+- memory 表情感列:`emotional_impact`/`vad_valence`/`vad_arousal`/`vad_dominance`/`tsundere_level`/`agent_mood`/`agent_desire`
+- 工具 `mood_journal`(admin)+ `user_observe`(harness)
+- 分类种子 `emotional`/`mood_snapshot`;`auto_process` 保留 VAD 队列/mood/observeUserMessage
+
+### Verified(独立复验,非自报)
+- npm run build EXIT=0(全文件零错误)
+- smoke_test.py 全 PASS(31 工具、项目隔离、跨项目去重)
+- 4 个融合轮次 smoke(数据层 27 项/嵌入+反思 19 项/reflect 层/工具注册)全 PASS
+- tools/list 实测 31 工具,mood_journal/user_observe/memory_context/consolidate_deep/instruction_save 均在
+- 禁改文件(emotion/agentState/bias/userLearning/memType/buffer/triage/instructions/configLoader/category)零改动
 
 ## [v1.3] — 2026-08-04 热度升格 + reflect 回执(与公共版同步)
 

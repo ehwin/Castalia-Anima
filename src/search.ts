@@ -1,28 +1,34 @@
 /**
- * AIRI Memory Search — v5.2 情感锚定评分
+ * AIRI Memory Search — v5.2 情感锚定评分(融合通用版分库检索)
  *
- * 哲学：情绪是记忆的锚，一致性是参考。
- * "像她"不是目标，"是她"才是——包括不像她的瞬间。
+ * 哲学:情绪是记忆的锚,一致性是参考。
+ * "像她"不是目标,"是她"才是——包括不像她的瞬间。
  *
- * 策略：
- *   1. 标签搜索（0 向量调用）→ 不够回退向量 KNN
- *   2. 评分：情绪强度为主（45%），一致性为辅（30%），时间衰减（15%），偏离加成（10%）
- *   3. 高情绪记忆（|ei|≥7）自动升级候选 + 衰减减半
+ * 策略:
+ *   1. 标签搜索(0 向量调用)→ 不够回退向量 KNN
+ *   2. 评分:情绪强度为主(45%),一致性为辅(30%),时间衰减(15%),偏离加成(10%)
+ *   3. 高情绪记忆(baseIntensity≥0.7)自动升级候选 + 衰减减半
+ *
+ * 保留通用版能力:按项目分库隔离(project 过滤)、memType 用途过滤、向量/文本回退。
  */
 import { DatabaseManager } from './db.js';
 import { embed } from './ollama.js';
+import { normalizeProject, isEmbedEnabled } from './env.js';
+import { MemType } from './memType.js';
 import { computeBiasBoost } from './bias.js';
 import { computeDecay, computeBaseIntensity, computeRecency, isNightTime } from './emotion.js';
 
-// v5.2: 情绪锚定权重
+// v5.2: 情绪锚定权重(可经环境变量调整)
 const WEIGHT_CONSISTENCY = parseFloat(process.env.WEIGHT_CONSISTENCY || '0.30');  // 标签/语义匹配
 const WEIGHT_EMOTION     = parseFloat(process.env.WEIGHT_EMOTION || '0.45');      // 情感强度 — 主锚
-const WEIGHT_TIME        = parseFloat(process.env.WEIGHT_TIME || '0.15');         // 自适应时间衰减
+const WEIGHT_TIME        = parseFloat(process.env.WEIGHT_TIME || '0.15');         // 时间衰减
 const WEIGHT_DEVIATION   = parseFloat(process.env.WEIGHT_DEVIATION || '0.10');    // "不像她"的珍贵瞬间
 
 export interface SearchOptions {
   query: string;
+  project?: string;  // v1.5: 项目隔离 — 默认 PROJECT_ID
   type?: string;
+  memType?: MemType;  // v1.8: 用途维度过滤(user/feedback/project/reference/general)
   category?: string;
   tags?: string[];
   characterId?: string;
@@ -32,8 +38,7 @@ export interface SearchOptions {
   profile?: 'quick' | 'balanced' | 'deep';
 }
 
-// minScore 阈值可配:纯框架场景下无情绪记忆的向量分通常 ~0.2,
-// AIRI 人格化默认 0.3 会误杀;harness 可用 SEARCH_MIN_SCORE 覆盖
+// minScore 阈值可配;harness 可用 SEARCH_MIN_SCORE 覆盖
 const SEARCH_PROFILES: Record<string, { topK: number; minScore: number }> = {
   quick: { topK: 3, minScore: 0.6 },
   balanced: { topK: 5, minScore: parseFloat(process.env.SEARCH_MIN_SCORE || '0.15') },
@@ -43,7 +48,9 @@ const SEARCH_PROFILES: Record<string, { topK: number; minScore: number }> = {
 export interface SearchResult {
   id: string;
   text: string;
+  project: string;
   type: string;
+  memType: string;
   category: string;
   subcategory: string | null;
   tags: string[];
@@ -64,33 +71,77 @@ export interface SearchResult {
 }
 
 /**
- * v5.0: 标签优先搜索 → 不足时回退向量 KNN
+ * 情感强度 — 用 vad_valence/emotional_impact 计算
+ * 优先 VAD 三维(经 computeDecay 衰减后的综合强度),无 VAD 回退 emotional_impact 标量。
+ * baseIntensity 是事件本身的情绪烈度(永不变),isHighEmotion 判定"不像她"珍贵瞬间。
+ */
+function computeEmotionalIntensity(row: any): { emotionalIntensity: number; baseIntensity: number; isHighEmotion: boolean } {
+  const hasVAD = row.vad_valence != null;
+  const storedVAD = hasVAD
+    ? { valence: row.vad_valence, arousal: row.vad_arousal, dominance: row.vad_dominance }
+    : null;
+  const tsundereLvl = row.tsundere_level || 0;
+  const hoursSinceCreated = (Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60);
+  const decayed = computeDecay(storedVAD, hoursSinceCreated, tsundereLvl, isNightTime());
+  const baseIntensity = storedVAD ? computeBaseIntensity(storedVAD) : Math.abs(row.emotional_impact || 0) / 10;
+  const emotionalIntensity = storedVAD ? decayed.intensity : baseIntensity;
+  return { emotionalIntensity, baseIntensity, isHighEmotion: baseIntensity >= 0.7 };
+}
+
+/** 统一评分:一致性 + 情感强度(主锚) + 时间衰减 + 偏离加成,乘 bias/importance/tier/access */
+function computeScore(row: any, similarity: number): { score: number; biasBoost: number } {
+  const hoursSinceCreated = (Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60);
+  const { emotionalIntensity, isHighEmotion } = computeEmotionalIntensity(row);
+  const consistency = Math.min(Math.max(similarity, 0), 0.7);  // 上限 0.7,避免过度拟合人设
+  const timeDecay = computeRecency(hoursSinceCreated);
+  const deviationBonus = (similarity < 0.3 && isHighEmotion) ? 0.8 : 0;  // 低一致性+高情绪=珍贵"不像她"瞬间
+  const tierBoost = row.tier === 'critical' ? 3.0 : (row.tier === 'temporary' ? 0.5 : 1.0);
+  const importanceMult = 0.5 + (row.importance || 0.5);
+  const accessBoost = 1 + Math.min(0.5, Math.log2(1 + (row.accessed_count || 0)) * 0.1);
+  const memTags = Array.isArray(row.tags) ? row.tags : JSON.parse(row.tags || '[]');
+  const biasBoost = computeBiasBoost(row.character_id || '', memTags);
+
+  const rawScore = WEIGHT_CONSISTENCY * consistency
+                 + WEIGHT_EMOTION * emotionalIntensity
+                 + WEIGHT_TIME * timeDecay
+                 + WEIGHT_DEVIATION * deviationBonus;
+  const score = Math.round(rawScore * importanceMult * biasBoost * tierBoost * accessBoost * 1000) / 1000;
+  return { score, biasBoost };
+}
+
+/**
+ * 标签优先搜索 → 不足时回退向量 KNN
  */
 export async function searchMemory(options: SearchOptions): Promise<SearchResult[]> {
-  const db = DatabaseManager.getInstance();
+  const db = DatabaseManager.getInstance(options.project);
   const profile = options.profile ? SEARCH_PROFILES[options.profile] : null;
   const topK = options.topK ?? profile?.topK ?? 10;
   const minScore = options.minScore ?? profile?.minScore ?? 0;
 
-  // ═══ Phase 1: 标签搜索（0 次向量调用） ═══
+  // ═══ Phase 1: 标签搜索(0 次向量调用) ═══
   const tagResults = tagSearch(db, options);
 
-  // 标签结果足够好 → 直接返回，不调向量模型
+  // 标签结果足够好 → 直接返回
   if (tagResults.length >= topK && tagResults[0].score >= 0.5) {
     updateAccessed(db, tagResults.slice(0, topK));
     return tagResults.slice(0, topK);
   }
 
-  // ═══ Phase 2: 标签不够 → 向量 KNN 补充 ═══
+  // ═══ Phase 2: 标签不够 → 向量 KNN 补充(EMBED_MODE=none 时跳过,纯文本回退) ═══
   const existingIds = new Set(tagResults.map(r => r.id));
   let vectorResults: SearchResult[] = [];
 
-  try {
-    const queryVector = await embed(options.query);
-    const floatQuery = new Float32Array(queryVector);
-    vectorResults = vectorKnnSearch(db, options, floatQuery, existingIds, topK, minScore);
-  } catch {
-    // 向量搜索失败，尝试文本回退
+  if (isEmbedEnabled()) {
+    try {
+      const queryVector = await embed(options.query, options.project);
+      const floatQuery = new Float32Array(queryVector);
+      vectorResults = vectorKnnSearch(db, options, floatQuery, existingIds, topK, minScore);
+    } catch {
+      // 向量搜索失败 → 文本回退
+      vectorResults = textFallbackSearch(db, options, existingIds, topK, minScore);
+    }
+  } else {
+    // 纯本地模式:标签结果不足时直接文本回退
     vectorResults = textFallbackSearch(db, options, existingIds, topK, minScore);
   }
 
@@ -98,7 +149,6 @@ export async function searchMemory(options: SearchOptions): Promise<SearchResult
   const merged = [...tagResults, ...vectorResults];
   merged.sort((a, b) => b.score - a.score);
 
-  // 去重（保留高分）
   const seen = new Set<string>();
   const unique: SearchResult[] = [];
   for (const r of merged) {
@@ -111,16 +161,15 @@ export async function searchMemory(options: SearchOptions): Promise<SearchResult
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// v5.0 标签搜索 — 从 query 提取关键词，SQL tag LIKE 匹配
+// 标签搜索 — 从 query 提取关键词，SQL tag LIKE 匹配
 // ═══════════════════════════════════════════════════════════════════
 
 /** 从中文/英文 query 中提取关键词 */
 function extractKeywords(query: string): string[] {
-  // 按空格、标点切分，过滤短词和停用词
   const stopWords = new Set(['的', '了', '是', '我', '你', '他', '她', '吗', '呢', '吧', '啊',
     'the', 'a', 'an', 'is', 'are', 'was', 'were', 'in', 'on', 'at', 'to', 'of', 'and', 'or',
     '有', '在', '不', '要', '会', '能', '就', '都', '也', '还', '和', '与', '这', '那', '什么', '怎么']);
-  const tokens = query.split(/[\s,，。！？、；：""''（）\(\)\[\]【】\-\/\\|]+/);
+  const tokens = query.split(/[\s,，。！？、；：""''（）()\[\]【】\-\/\\|]+/);
   return [...new Set(tokens.filter(t => t.length >= 2 && !stopWords.has(t.toLowerCase())))];
 }
 
@@ -131,33 +180,27 @@ function tagSearch(db: any, options: SearchOptions): SearchResult[] {
 
   const profile = options.profile ? SEARCH_PROFILES[options.profile] : null;
   const topK = options.topK ?? profile?.topK ?? 10;
+  const project = normalizeProject(options.project);
 
-  // 构建 LIKE 条件：每个关键词匹配 tags 列
-  const likeConditions = keywords.map(() => `m.tags LIKE ?`).join(' OR ');
-  const likeParams = keywords.flatMap(k => [`%${k}%`, `%${k}%`]); // 需要与 conditions 数量匹配; 简化: 一个 condition 一个 param
-
-  // 修正: 每个 condition 带一个 param
   const tagCond = keywords.map(() => `m.tags LIKE ?`).join(' OR ');
-  const tagParams = keywords.map(k => `%"${k}"%`); // 精确匹配 JSON 数组中的字符串
-
-  // 同时做宽松匹配（不带引号）
+  const tagParams = keywords.map(k => `%"${k}"%`);
   const looseCond = keywords.map(() => `m.tags LIKE ?`).join(' OR ');
   const looseParams = keywords.map(k => `%${k}%`);
 
-  const conditions: string[] = ['m.is_active = 1'];
-  const params: any[] = [];
+  const conditions: string[] = ['m.is_active = 1', 'm.project = ?'];
+  const params: any[] = [project];
 
-  // 标签条件
   conditions.push(`((${tagCond}) OR (${looseCond}))`);
   params.push(...tagParams, ...looseParams);
 
   if (options.type) { conditions.push('m.type = ?'); params.push(options.type); }
+  if (options.memType) { conditions.push('m.mem_type = ?'); params.push(options.memType); }
   if (options.category) { conditions.push('m.category = ?'); params.push(options.category); }
   if (options.characterId) { conditions.push('m.character_id = ?'); params.push(options.characterId); }
   if (options.subject) { conditions.push('m.subject = ?'); params.push(options.subject); }
 
   const rows = db.prepare(`
-    SELECT m.id, m.text, m.type, m.category, m.subcategory, m.tags,
+    SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
       m.emotional_impact, m.importance, m.character_id, m.source,
       m.subject, m.agent_mood, m.agent_desire, m.tier,
       m.created_at, m.last_accessed_at, m.accessed_count,
@@ -170,64 +213,36 @@ function tagSearch(db: any, options: SearchOptions): SearchResult[] {
 
   return rows.map(row => {
     const memTags = JSON.parse(row.tags || '[]');
-    // 标签匹配数越多分数越高
     const matchedTags = keywords.filter(k =>
       memTags.some((t: string) => t.toLowerCase().includes(k.toLowerCase()))
     ).length;
     const tagScore = Math.min(1.0, matchedTags / Math.max(1, keywords.length));
-
-    // v6.1: 拆三维 — baseIntensity / decayedIntensity / recency 各司其职
-    const hasVAD = row.vad_valence != null;
-    const storedVAD = hasVAD
-      ? { valence: row.vad_valence, arousal: row.vad_arousal, dominance: row.vad_dominance }
-      : null;
-    const tsundereLvl = row.tsundere_level || 0;
-    // recency 用 created_at（事件发生时间），访问频率用 accessBoost
-    const hoursSinceCreated = (Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60);
-    const decayed = computeDecay(storedVAD, hoursSinceCreated, tsundereLvl, isNightTime());
-    // baseIntensity: 事件本身的情绪烈度（永不变）
-    const baseIntensity = storedVAD ? computeBaseIntensity(storedVAD) : Math.abs(row.emotional_impact || 0) / 10;
-    // decayedIntensity: 现在还记得多强烈
-    const emotionalIntensity = storedVAD ? decayed.intensity : baseIntensity;
-    // recency: 纯时间新鲜度
-    const recency = computeRecency(hoursSinceCreated);
-    const timeDecay = recency;
-    const isHighEmotion = baseIntensity >= 0.7;
-    // accessBoost: 被检索越多次越靠前
-    const accessBoost = 1 + Math.min(0.5, Math.log2(1 + (row.accessed_count || 0)) * 0.1);
-    // 一致性有上限：超过 0.7 不再加分（避免过度拟合人设）
-    const consistency = Math.min(tagScore, 0.7);
-    // 偏离加成：低一致性 + 高情绪 = 可能是珍贵的"不像她"瞬间
-    const deviationBonus = (tagScore < 0.3 && isHighEmotion) ? 0.8 : 0;
-    const tierBoost = row.tier === 'critical' ? 3.0 : (row.tier === 'temporary' ? 0.5 : 1.0);
-    const importanceMult = 0.5 + (row.importance || 0.5);
-    const biasBoost = computeBiasBoost(row.character_id || '', memTags);
-
-    const rawScore = WEIGHT_CONSISTENCY * consistency
-                   + WEIGHT_EMOTION * emotionalIntensity
-                   + WEIGHT_TIME * timeDecay
-                   + WEIGHT_DEVIATION * deviationBonus;
-    const finalScore = Math.round(rawScore * importanceMult * biasBoost * tierBoost * accessBoost * 1000) / 1000;
+    const { score, biasBoost } = computeScore(row, tagScore);
 
     return {
-      id: row.id, text: row.text, type: row.type, category: row.category,
+      id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
       subcategory: row.subcategory, tags: memTags,
-      emotionalImpact: row.emotional_impact, importance: row.importance,
+      emotionalImpact: row.emotional_impact ?? 0,
+      importance: row.importance,
       characterId: row.character_id, source: row.source,
       subject: row.subject || 'user', agentMood: row.agent_mood, agentDesire: row.agent_desire,
-      score: finalScore, similarity: tagScore, tier: row.tier || 'standard',
+      tier: row.tier || 'standard',
+      score, similarity: Math.round(tagScore * 1000) / 1000,
       createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
       accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
     };
   });
 }
 
-/** 向量 KNN 搜索（原有逻辑，抽取为独立函数） */
+/** 向量 KNN 搜索 */
 function vectorKnnSearch(
   db: any, options: SearchOptions, floatQuery: Float32Array,
   excludeIds: Set<string>, topK: number, minScore: number
 ): SearchResult[] {
-  const knnLimit = Math.min(topK * 3, 30);
+  // v1.5: vec0 虚拟表禁止 JOIN(KNN 必须在 vec0 上 LIMIT),项目过滤放在第二段 memory 查询
+  // 候选集放大(全库 KNN)保证单项目召回;隔离语义由 memory 查询的 project=? 保证
+  const knnLimit = Math.min(topK * 8, 60);
+  const project = normalizeProject(options.project);
   let knnRows: any[];
 
   try {
@@ -246,15 +261,16 @@ function vectorKnnSearch(
 
   const rowidPlaceholders = knnRows.map(() => '?').join(',');
   const rowidParams = knnRows.map(r => Number(r.rowid));
-  const conditions: string[] = [`m.rowid IN (${rowidPlaceholders})`, 'm.is_active = 1'];
-  const params: any[] = [...rowidParams];
+  const conditions: string[] = [`m.rowid IN (${rowidPlaceholders})`, 'm.is_active = 1', 'm.project = ?'];
+  const params: any[] = [...rowidParams, project];
 
   if (options.type) { conditions.push('m.type = ?'); params.push(options.type); }
+  if (options.memType) { conditions.push('m.mem_type = ?'); params.push(options.memType); }
   if (options.category) { conditions.push('m.category = ?'); params.push(options.category); }
   if (options.characterId) { conditions.push('m.character_id = ?'); params.push(options.characterId); }
 
   const rows = db.prepare(`
-    SELECT m.id, m.text, m.type, m.category, m.subcategory, m.tags,
+    SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
       m.emotional_impact, m.importance, m.character_id, m.source,
       m.subject, m.agent_mood, m.agent_desire, m.tier,
       m.created_at, m.last_accessed_at, m.accessed_count, m.rowid,
@@ -267,92 +283,67 @@ function vectorKnnSearch(
     if (excludeIds.has(row.id)) continue;
     const dist = rowidMap.get(row.rowid) ?? 1.0;
     const similarity = Math.max(0, 1.0 - dist);
-    // v6.1: 拆三维
-    const hasVAD = row.vad_valence != null;
-    const storedVAD = hasVAD
-      ? { valence: row.vad_valence, arousal: row.vad_arousal, dominance: row.vad_dominance }
-      : null;
-    const tsundereLvl = row.tsundere_level || 0;
-    const hoursSinceCreated = (Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60);
-    const decayed = computeDecay(storedVAD, hoursSinceCreated, tsundereLvl, isNightTime());
-    const baseIntensity = storedVAD ? computeBaseIntensity(storedVAD) : Math.abs(row.emotional_impact || 0) / 10;
-    const emotionalIntensity = storedVAD ? decayed.intensity : baseIntensity;
-    const recency = computeRecency(hoursSinceCreated);
-    const timeDecay = recency;
-    const isHighEmotion = baseIntensity >= 0.7;
-    const daysSince = hoursSinceCreated / 24;
-    const consistency = Math.min(similarity, 0.7);
-    const deviationBonus = (similarity < 0.3 && isHighEmotion) ? 0.8 : 0;
-    const tierBoost = row.tier === 'critical' ? 3.0 : (row.tier === 'temporary' ? 0.5 : 1.0);
-    const importanceMult = 0.5 + row.importance;
-    const accessBoost = 1 + Math.min(0.5, Math.log2(1 + row.accessed_count) * 0.1);
-    const memTags = JSON.parse(row.tags || '[]');
-    const biasBoost = computeBiasBoost(row.character_id || '', memTags);
-    const rawScore = WEIGHT_CONSISTENCY * consistency
-                   + WEIGHT_EMOTION * emotionalIntensity
-                   + WEIGHT_TIME * timeDecay
-                   + WEIGHT_DEVIATION * deviationBonus;
-    const finalScore = Math.round(rawScore * importanceMult * accessBoost * biasBoost * tierBoost * 1000) / 1000;
-
-    if (finalScore >= minScore) {
+    const { score, biasBoost } = computeScore(row, similarity);
+    if (score >= minScore) {
       results.push({
-        id: row.id, text: row.text, type: row.type, category: row.category,
-        subcategory: row.subcategory, tags: memTags,
-        emotionalImpact: row.emotional_impact, importance: row.importance,
+        id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
+        subcategory: row.subcategory, tags: JSON.parse(row.tags || '[]'),
+        emotionalImpact: row.emotional_impact ?? 0,
+        importance: row.importance,
         characterId: row.character_id, source: row.source,
         subject: row.subject || 'user', agentMood: row.agent_mood, agentDesire: row.agent_desire,
-        score: finalScore, similarity: Math.round(similarity * 1000) / 1000,
-        tier: row.tier || 'standard', createdAt: row.created_at,
-        lastAccessedAt: row.last_accessed_at, accessedCount: row.accessed_count,
-        biasBoost: Math.round(biasBoost * 1000) / 1000,
+        tier: row.tier || 'standard',
+        score, similarity: Math.round(similarity * 1000) / 1000,
+        createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
+        accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
       });
     }
   }
   return results;
 }
 
-/** 文本回退搜索（向量不可用时） */
+/** 文本回退搜索(向量不可用时) */
 function textFallbackSearch(
   db: any, options: SearchOptions, excludeIds: Set<string>,
   topK: number, minScore: number
 ): SearchResult[] {
   const terms = options.query.split(/\s+/).filter(t => t.length > 0);
   if (terms.length === 0) return [];
+  const project = normalizeProject(options.project);
 
   const likeConditions = terms.map(() => 'm.text LIKE ?').join(' OR ');
   const likeParams = terms.map(t => `%${t}%`);
 
+  const conds: string[] = [`m.is_active = 1`, `m.project = ?`, `(${likeConditions})`];
+  const params: any[] = [project, ...likeParams];
+  if (options.memType) { conds.push('m.mem_type = ?'); params.push(options.memType); }
+
   const rows = db.prepare(`
-    SELECT m.id, m.text, m.type, m.category, m.subcategory, m.tags,
+    SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
       m.emotional_impact, m.importance, m.character_id, m.source,
       m.subject, m.agent_mood, m.agent_desire, m.tier,
-      m.created_at, m.last_accessed_at, m.accessed_count
+      m.created_at, m.last_accessed_at, m.accessed_count,
+      m.vad_valence, m.vad_arousal, m.vad_dominance, m.tsundere_level
     FROM memory m
-    WHERE m.is_active = 1 AND (${likeConditions})
+    WHERE ${conds.join(' AND ')}
     ORDER BY m.created_at DESC LIMIT ?
-  `).all(...likeParams, topK * 2) as any[];
+  `).all(...params, topK * 2) as any[];
 
   return rows
     .filter(row => !excludeIds.has(row.id))
     .map(row => {
-      const memTags = JSON.parse(row.tags || '[]');
-      const emotionalIntensity = Math.abs(row.emotional_impact || 0) / 10;
-      const isHighEmotion = Math.abs(row.emotional_impact || 0) >= 7;
-      const emotionHalfLife = isHighEmotion ? 180 : 90;
-      const daysSince = (Date.now() - new Date(row.last_accessed_at).getTime()) / (1000 * 60 * 60 * 24);
-      const timeDecay = 1.0 / (1.0 + Math.exp(0.04 * (daysSince - emotionHalfLife)));
-      const tierBoost = row.tier === 'critical' ? 3.0 : (row.tier === 'temporary' ? 0.5 : 1.0);
-      const rawScore = WEIGHT_EMOTION * emotionalIntensity + WEIGHT_TIME * timeDecay;
-      const finalScore = Math.round(rawScore * (0.5 + row.importance) * tierBoost * 1000) / 1000;
+      const { score, biasBoost } = computeScore(row, 0.3);
       return {
-        id: row.id, text: row.text, type: row.type, category: row.category,
-        subcategory: row.subcategory, tags: memTags,
-        emotionalImpact: row.emotional_impact, importance: row.importance,
+        id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
+        subcategory: row.subcategory, tags: JSON.parse(row.tags || '[]'),
+        emotionalImpact: row.emotional_impact ?? 0,
+        importance: row.importance,
         characterId: row.character_id, source: row.source,
         subject: row.subject || 'user', agentMood: row.agent_mood, agentDesire: row.agent_desire,
-        score: finalScore, similarity: 0.3, tier: row.tier || 'standard',
+        tier: row.tier || 'standard',
+        score, similarity: 0.3,
         createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
-        accessedCount: row.accessed_count, biasBoost: 1.0,
+        accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
       };
     });
 }
@@ -369,27 +360,34 @@ function updateAccessed(db: any, results: SearchResult[]) {
 }
 
 /**
- * 快速获取近期重要记忆（用于请求前注入，<5ms）
+ * 快速获取近期重要记忆(用于请求前注入，<5ms)
  * 不做向量搜索，直接按时间+importance 捞
  */
-export function getRecentMemories(characterId: string, limit: number = 5, hoursBack: number = 24): SearchResult[] {
-  const db = DatabaseManager.getInstance();
+export function getRecentMemories(characterId: string, limit: number = 5, hoursBack: number = 24, project?: string, memType?: MemType): SearchResult[] {
+  const db = DatabaseManager.getInstance(project);
   const since = new Date(Date.now() - hoursBack * 3600000).toISOString();
+  const proj = normalizeProject(project);
+
+  const conds: string[] = ['is_active = 1', 'character_id = ?', 'project = ?', 'created_at > ?'];
+  const params: any[] = [characterId, proj, since];
+  if (memType) { conds.push('mem_type = ?'); params.push(memType); }
+  params.push(limit);
 
   const rows = db.prepare(`
-    SELECT id, text, type, category, subcategory, tags,
-           emotional_impact, importance, character_id, source, subject, tier,
-           agent_mood, agent_desire, created_at, last_accessed_at, accessed_count
+    SELECT id, text, project, type, mem_type, category, subcategory, tags,
+           emotional_impact, importance, character_id, source, subject, agent_mood, agent_desire, tier,
+           created_at, last_accessed_at, accessed_count
     FROM memory
-    WHERE is_active = 1 AND character_id = ? AND created_at > ?
+    WHERE ${conds.join(' AND ')}
     ORDER BY importance DESC, created_at DESC
     LIMIT ?
-  `).all(characterId, since, limit) as any[];
+  `).all(...params) as any[];
 
   return rows.map(row => ({
-    id: row.id, text: row.text, type: row.type, category: row.category,
+    id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
     subcategory: row.subcategory, tags: JSON.parse(row.tags || '[]'),
-    emotionalImpact: row.emotional_impact, importance: row.importance,
+    emotionalImpact: row.emotional_impact ?? 0,
+    importance: row.importance,
     characterId: row.character_id, source: row.source, subject: row.subject || 'user',
     agentMood: row.agent_mood, agentDesire: row.agent_desire,
     tier: row.tier || 'standard',
@@ -417,26 +415,30 @@ export interface FactSearchResult {
 
 /**
  * 语义搜索事实
- *
  * 将查询文本做 embedding，在 vec_facts 中 KNN 搜索。
- * 返回最相关的事实三元组，按 similarity × confidence 排序。
  */
 export async function searchFacts(
   query: string,
   options: {
+    project?: string;
     subject?: string;
     topK?: number;
     minConfidence?: number;
   } = {},
 ): Promise<FactSearchResult[]> {
-  const db = DatabaseManager.getInstance();
+  const db = DatabaseManager.getInstance(options.project);
   const topK = options.topK ?? 10;
   const minConfidence = options.minConfidence ?? 0.3;
+  const proj = normalizeProject(options.project);
 
-  const queryVector = await embed(query);
+  if (!isEmbedEnabled()) {
+    return []; // 纯本地模式:facts 无向量可查
+  }
+
+  const queryVector = await embed(query, options.project);
   const floatQuery = new Float32Array(queryVector);
 
-  const knnLimit = Math.min(topK * 3, 50);
+  const knnLimit = Math.min(topK * 8, 60);
 
   let knnRows: any[];
   try {
@@ -448,7 +450,7 @@ export async function searchFacts(
       LIMIT ?
     `).all(floatQuery, knnLimit) as any[];
   } catch {
-    return []; // vec_facts 不可用
+    return [];
   }
 
   if (knnRows.length === 0) return [];
@@ -458,8 +460,8 @@ export async function searchFacts(
     rowidMap.set(Number(r.rowid), r.distance);
   }
 
-  const conditions = ['f.is_active = 1', `f.rowid IN (${knnRows.map(() => '?').join(',')})`];
-  const params: any[] = knnRows.map(r => Number(r.rowid));
+  const conditions = ['f.is_active = 1', 'f.project = ?', `f.rowid IN (${knnRows.map(() => '?').join(',')})`];
+  const params: any[] = [proj, ...knnRows.map(r => Number(r.rowid))];
   if (options.subject) { conditions.push('f.subject = ?'); params.push(options.subject); }
 
   const rows = db.prepare(`
@@ -500,11 +502,10 @@ export async function searchFacts(
     try {
       const now = new Date().toISOString();
       const update = db.prepare('UPDATE facts SET accessed_count = accessed_count + 1, updated_at = ? WHERE id = ?');
-      db.transaction(() => {
-        for (const r of results.slice(0, topK)) update.run(now, r.id);
-      })();
+      const tx = db.transaction((ids: string[]) => { for (const id of ids) update.run(now, id); });
+      tx(results.map(r => r.id));
     } catch {}
   }
 
-  return results.slice(0, topK);
+  return results;
 }

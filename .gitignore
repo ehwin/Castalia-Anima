@@ -6,3 +6,7 @@ node_modules/
 __pycache__/
 *.pyc
 reflect-receipts/
+
+# 融合参考目录(不入库)
+refs/
+old_ref/
