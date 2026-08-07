@@ -1,128 +1,149 @@
-# AI Memory — 纯记忆体框架(standalone MCP Server)
+# Castalia Anima — Emotional Memory MCP Server
 
-从 AIRI 记忆系统剥离的独立记忆体,标准 MCP stdio 协议,20 个工具。
-SQLite + sqlite-vec 本地向量存储,零 API 成本;嵌入模型走本机 Ollama 兼容接口。
+**Castalia Anima** is the personality-driven companion of [**Castalia**](https://github.com/ehwin/Castalia): a standalone MCP memory server with a full **emotion layer** on top of the neutral Castalia architecture. It inherits the entire Castalia v1.11 architecture (per-project DBs, 3-channel LLM pipeline, three-layer instructions, closed memory types, progressive session reflection, consolidation) and adds an emotional personality system — VAD 3D emotion analysis, tsundere detection, emotion-anchored retrieval, per-project personas.
 
-## 快速开始
+Forked from the AIRI memory system (the emotional bloodline). SQLite + sqlite-vec local vector storage, zero API cost for embeddings. Bring your own LLM for reflection/triage.
 
-### 1. 启动嵌入服务(首次约 30-60 秒加载模型)
+> **Relationship to Castalia**: Castalia is the neutral, general-purpose component (no personality). Castalia Anima is the emotional variant — same architecture, plus feelings. See [Credits & Upstream](#credits--upstream).
 
-```bat
-scripts\start-embed.bat
+## Feature Highlights
+
+- **Emotion engine** (`emotion.ts`)
+  - VAD 3D vectors (valence / arousal / dominance) analyzed by a local Ollama model
+  - Surface-vs-true emotion detection — **tsundere level** 0–10 (surface words contradicting true feelings)
+  - Differential half-life decay (Verduyn & Lavrijsen 2014): valence 24h / arousal 4h / dominance 36h
+  - Night-time regulation (22:00–06:00) + tsundere decay slowdown + personality-baseline regression (OU process)
+- **Emotion-anchored retrieval** — search scoring is emotion-first:
+  `0.30·consistency + 0.45·emotion + 0.15·recency + 0.10·deviation` × importance × tier × bias × access boost
+  "Unlike her" high-emotion moments get a deviation bonus — personality over fit.
+- **Persona per project** — each project namespace is an AI persona:
+  - `charFor(project)`: persona map (config.json `personas`) → project name → default `CHAR_ID`
+  - `[Role Declaration]` injected by `context_get` / `memory_context`; `persona` field in responses
+  - Agent state (mood/energy/desire), topic biases and user profile are partitioned per persona
+- **Full Castalia v1.11 architecture**
+  - Per-project DB files (`memory/global.sqlite` + `project-<name>.sqlite`), lazy-created; legacy `MEMORY_DB_PATH` single-file mode supported
+  - 3-channel LLM pipeline: LLM1 triage (inbound memType classification + incremental session reflection), vector model (embeddings), LLM2 reflect (daily reflection / deep calibration / consolidation)
+  - Three-layer instructions (global / user / project + reusable rule groups, glob path filtering)
+  - Closed memory types: user / feedback / project / reference (Markdown-normalized) + general fallback
+  - Progressive session reflection: rolling session memory + promote-to-project (promote-and-delete) + TTL sweep
+  - Memory consolidation: vector pre-screen similar pairs → LLM dedup / conflict resolution (never invent facts)
+  - Per-action reflection receipts, persisted to `memory/receipts/` for audit
+  - Snapshot warnings with exact dates for memories older than 24h
+- **31 MCP tools**, profile-gated (`MCP_TOOLS`): agent 6 (read) / harness 12 (write+pipe) / admin 13 (manage)
+
+## Quick Start
+
+### 1. Build + verify
+
+```bash
+npm install
+npm run build          # tsc, exit 0
+python scripts/smoke_test.py   # 31 tools + CRUD + per-project isolation
 ```
 
-嵌入服务监听 `http://127.0.0.1:11436`(Ollama 兼容 `/api/embed`,1024 维)。
-模型 `IEITYuan/Yuan-embedding-2.0-zh` 已缓存在本机 `~/.cache/huggingface/`,无需重新下载。
-> 若 harness 环境自带 Ollama/其他嵌入服务,只要输出 **1024 维** 且兼容 `/api/embed`,可直接指向它,
-> 通过环境变量 `OLLAMA_URL` + `EMBEDDING_MODEL` 配置,不必启动本服务。
+### 2. Start the embedding service (first load ~30-60s)
 
-### 2. 在 MCP 客户端中接入
+```bash
+scripts\start-embed.bat        # Ollama-compatible /api/embed on :11436, 1024-dim
+```
+
+Any Ollama-compatible `/api/embed` service outputting **1024-dim** vectors works — point `OLLAMA_URL` / `EMBEDDING_MODEL` at it, or use an OpenAI-compatible API with `EMBEDDING_API_KEY` (`EMBED_MODE=api`). `EMBED_MODE=none` disables embeddings entirely (tag/text fallback search).
+
+### 3. Configure LLM channels (optional but recommended)
+
+Via environment or `memory/config.json` (loaded at startup):
+
+```json
+{
+  "personas": {
+    "work":  { "charId": "airi-work", "name": "Airi", "persona": "专业高效, 简洁直接" }
+  },
+  "reflect": { "api_url": "https://api.deepseek.com/v1", "api_key": "sk-...", "model": "deepseek-chat" },
+  "triage":  { "api_url": "https://api.deepseek.com/v1", "api_key": "sk-...", "model": "deepseek-chat" }
+}
+```
+
+- `REFLECT_LLM_*` — daily reflection / deep calibration / consolidation
+- `TRIAGE_LLM_*` — inbound classification + incremental session reflection (falls back to `REFLECT_*`)
+
+### 4. Connect from your MCP client
 
 ```json
 {
   "mcpServers": {
-    "ai-memory": {
+    "castalia-anima": {
       "command": "node",
       "args": ["D:\\AI\\AI memory\\dist\\index.js"],
       "env": {
         "OLLAMA_URL": "http://127.0.0.1:11436",
         "EMBEDDING_MODEL": "yuan-embedding-2.0-zh",
-        "MEMORY_DB_PATH": "D:\\AI\\AI memory\\memory.sqlite",
-        "CHAR_ID": "default"
+        "MEMORY_DB_DIR": "D:\\AI\\AI memory\\memory",
+        "CHAR_ID": "airi",
+        "MCP_TOOLS": "all"
       }
     }
   }
 }
 ```
 
-## 环境变量
+## Tools (31, profile-gated)
 
-| 变量 | 默认 | 说明 |
-|------|------|------|
-| `OLLAMA_URL` | `http://127.0.0.1:11434` | 嵌入服务地址(本框架自带服务在 11436) |
-| `EMBEDDING_MODEL` | `yuan-embedding-2.0-zh` | 嵌入模型名,输出必须 1024 维 |
-| `MEMORY_DB_PATH` | `./memory.sqlite` | SQLite 数据库路径(首次启动自动建表) |
-| `CHAR_ID` | `airi` | 角色/数据分区 ID。同一库可跑多个实例互不串扰 |
-| `MCP_SERVER_NAME` | `airi-memory` | MCP server 自描述名 |
-| `SEARCH_MIN_SCORE` | `0.15` | 向量搜索最低分阈值(默认已适配通用检索;调高可减少噪声) |
-| `WEIGHT_CONSISTENCY` | `0.30` | 检索评分:语义一致性权重 |
-| `WEIGHT_EMOTION` | `0.45` | 检索评分:情绪强度权重(无情绪记忆可调低) |
-| `WEIGHT_TIME` | `0.15` | 检索评分:时间衰减权重 |
-| `WEIGHT_DEVIATION` | `0.10` | 检索评分:偏离加成权重 |
-| `REFLECT_LLM_URL` | `https://api.deepseek.com/v1` | 反思 LLM 地址(OpenAI 兼容) |
-| `REFLECT_LLM_API_KEY` | *(未设)* | 反思 LLM 密钥;未设时反思自动跳过 |
-| `REFLECT_LLM_MODEL` | `deepseek-chat` | 反思 LLM 模型 |
-| `REFLECT_INTERVAL_HOURS` | `0` | 自动反思间隔(小时),0=仅手动 |
+| Group | Tools |
+|---|---|
+| **agent** (6) | `memory_search` `memory_get` `memory_recent` `memory_index` `fact_search` `memory_graph` |
+| **harness** (12) | `auto_process` `conversation_save` `digest_run` `reflect_auto` `reflect_deep` `reflect_batch_embed` `memory_save` `memory_update` `memory_delete` `memory_log` `instruction_save` `user_observe` |
+| **admin** (13) | `memory_list` `stats_get` `recent_conversations` `daily_summary_data` `reflect_analyze` `reflect_apply` `memory_context` `context_get` `project_list` `instruction_list` `instruction_delete` `consolidate_deep` `mood_journal` |
 
-## 工具列表(22 个)
+## Environment Variables (key ones)
 
-**搜索**(LLM 直接调用)
-- `memory_search` — 标签优先 → 向量 KNN 回退,按评分排序
-- `fact_search` — 语义搜索事实三元组(subject-predicate-object)
+| Variable | Default | Meaning |
+|---|---|---|
+| `CHAR_ID` | `airi` | Default persona/character ID |
+| `CASTALIA_PROJECT` | `default` | Default project namespace |
+| `MEMORY_DB_DIR` | `<cwd>/memory` | Per-project DB directory (`global.sqlite` + `project-*.sqlite`); `MEMORY_DB_PATH` → legacy single-file mode |
+| `OLLAMA_URL` / `EMBEDDING_MODEL` | `:11434` / `yuan-embedding-2.0-zh` | Embedding service (1024-dim) |
+| `EMBED_MODE` | `ollama` | `ollama` / `api` (needs `EMBEDDING_API_KEY`) / `none` |
+| `REFLECT_LLM_*` | — | Reflection LLM (URL / API key / model) |
+| `TRIAGE_LLM_*` | → `REFLECT_*` | Triage LLM channel (falls back to reflect) |
+| `MCP_TOOLS` | `all` | `agent` / `harness` / `admin` / comma list / `all` |
+| `WEIGHT_*` | 0.30/0.45/0.15/0.10 | Emotion-anchored search weights |
+| `SEARCH_MIN_SCORE` | `0.15` | Vector search threshold |
+| `VAD_MODEL` | `qwen3.5:2b` | Ollama model for VAD emotion analysis |
+| `BUFFER_SIZE` / `SESSION_MEMORY_TTL_DAYS` | `5` / `7` | Session reflection buffer / TTL |
 
-**记忆 CRUD**
-- `memory_save` — 存入记忆(可选 skipEmbed 跳过向量化)
-- `memory_update` — 更新字段
-- `memory_delete` — 软删除
-- `memory_list` — 列出全部(可过滤 category/source)
-- `memory_recent` — 近期重要记忆(时间+importance,零向量调用)
-- `memory_graph` — 记忆关系图
+## Architecture Overview
 
-**对话自动化**(可配合 harness 的每轮对话调用)
-- `auto_process` — 处理一轮对话:存日志 + 观察用户 + 触发消化
-- `conversation_save` — 只存原始对话轮次
-- `digest_run` — 手动触发消化周期
-- `daily_summary_data` — 取最近 N 小时对话/处理数据
-
-**上下文/状态**
-- `context_get` — agent 状态 + 偏见层 + 用户画像(提示词注入用)
-- `stats_get` — 记忆统计
-- `user_observe` — 观察用户消息(沟通模式学习)
-- `mood_journal` — 情绪历史
-
-**反思**(大模型驱动,已打包进 server)
-- `reflect_analyze` — 取未分析对话 + 反思系统提示词
-- `reflect_apply` — 应用反思结果(合并/拆分/提取/重分类/删除)
-- `reflect_auto` — **一键自动反思**:未分析对话 → 配置的 LLM → 应用(需 `REFLECT_LLM_API_KEY`)
-- `reflect_deep` — **深度校准**:全部记忆 → 去重/画像/图谱 → 应用(需 `REFLECT_LLM_API_KEY`)
-- `reflect_batch_embed` — 批量向量化未嵌入记忆
-
-## 测试
-
-```bash
-python scripts/smoke_test.py   # 核心 CRUD 往返(不依赖嵌入服务)
-python scripts/vec_test.py     # 嵌入 + 向量语义搜索完整链路(需嵌入服务在 11436)
+```
+┌─ Exposure    MCP stdio · 31 tools · agent/harness/admin gating (MCP_TOOLS)
+├─ Cognition   reflect (LLM2) · triage (LLM1) · consolidate_deep
+├─ Emotion     VAD engine · agentState · bias · userLearning      ← Anima
+├─ Pipeline    auto_process → digest → session buffer → incremental reflection
+├─ Storage     DatabaseManager · per-project DBs · vec0 1024-dim · embedding_cache
+└─ Base        SQLite (WAL) · sqlite-vec · periodic tasks
 ```
 
-## 数据与存储
+- **Emotion-anchored scoring**: `rawScore = 0.30·consistency (cap 0.7) + 0.45·emotion + 0.15·recency + 0.10·deviationBonus`; multiplied by importance, tier (critical ×3), bias boost (1.0–1.5), access boost
+- **Memory lifecycle**: save (dedup exact + vector) → VAD queue (async batch) → digest (classify/tag/cleanup) → reflection (merge/extract/reclassify/relate/delete with per-action receipts) → consolidation (similar-pair pre-screen → LLM)
+- **Per-persona partitioning**: agent state / topic biases / user profile are keyed by resolved charId — switching project switches persona
 
-- 首次启动自动建表:memory / edges / categories / facts / embedding_cache / vec_memory / vec_facts
-- 向量固定 **1024 维**(schema 写死),换嵌入模型需同维或重建库
-- WAL 模式;每 30 分钟自动 checkpoint;临时记忆 30 分钟清理;24 小时自动整合
-- 数据库文件可整体拷贝迁移(停服状态下)
+## Credits & Upstream
 
-## 项目定位:独立分支
+Castalia Anima is an independent, emotion-focused evolution of the AIRI memory system. Design and storage patterns informed by:
 
-本项目是 AIRI 记忆系统(memory-fused)的**独立分支**——保留 AIRI 血统,同时独立演进:
-- 独立 git 仓库、独立版本号,代码自由演进,不受 AIRI 主系统约束
-- 主系统(`D:\system\AIRI`)继续日常优化使用,两边改进可互相吸收(主系统侧已吸收 CHAR_ID 分区等改造)
-- 已改造:`CHAR_ID`/`MCP_SERVER_NAME` 环境变量化,多实例数据分区
-- 已修复:`memory_search` 默认阈值适配通用检索(0.15),不再被情绪锚定评分误杀
-- 未包含:unified-proxy(LLM 转发/TTS)、viz(星图)、AIRI 托盘与启动器
+- **[Castalia](https://github.com/ehwin/Castalia)** — the neutral general-purpose variant; Anima inherits its full v1.11 architecture (per-project DBs, 3-channel pipeline, three-layer instructions, closed memTypes, session reflection, consolidation). Architectures cross-pollinate between the two repos.
+- **AIRI memory system** — the emotional bloodline: VAD emotion engine, tsundere layer, agent state, bias layer, user learning
+- **Claude Code** (Anthropic) — closed memory types (user/feedback/project/reference), MEMORY.md index, progressive session maintenance, consolidation sub-agent, snapshot warnings (patterns re-implemented in SQLite)
+- **engram** — profile-gated tool exposure, setup script
+- **memory-os / cognitive-memory** — local vector storage patterns
+- **AIRI Alaya scoring design** — emotion-weighted / time-decay retrieval formula ideas
+- **SynaBun** — hierarchical categories and smart-relevance weighting ideas
+- **千问 (Qwen) architecture suggestions** — agent self-state (mood/desire/energy) design inspiration
 
-## 致谢与上游
+License: MIT, see `LICENSE`.
 
-本项目是独立演进的记忆系统,设计思路与部分存储层实现受以下项目启发/继承:
+## Troubleshooting
 
-- **cognitive-memory**(Apache-2.0)— SQLite + sqlite-vec 本地向量存储的 schema 设计与向量 KNN 检索思路(概念继承,代码已大幅重写)
-- **AIRI Alaya 评分设计** — 情感权重/时间衰减的评分公式思路
-- **SynaBun** — 分层分类与 Smart Relevance 检索加权思路
-- **千问架构建议** — agent 自我状态(情绪/欲望/精力)的设计启发
-
-除 cognitive-memory 外均为设计思路参考,无代码复制。许可:Apache-2.0,见 `LICENSE`。
-
-## 排障
-
-- 嵌入服务没起:`memory_save` 会报 embed 失败;`curl http://127.0.0.1:11436/health`
-- 搜索返回空:看 `SEARCH_MIN_SCORE`(调低)与 `CHAR_ID`(是否与写入时一致)
-- 端口冲突:11436 被占时改 `start-embed.bat` 端口 + MCP 配置的 `OLLAMA_URL`
+- Embedding service down → `memory_save` reports embed failure; check `curl http://127.0.0.1:11436/health`
+- Empty search results → lower `SEARCH_MIN_SCORE`, or verify `CHAR_ID`/project match the writer
+- Persona not switching → check `memory/config.json` `personas` section (restart server after edit)
+- MCP tools not appearing → restart the client; ensure `command` is an absolute path to `node.exe` on Windows
