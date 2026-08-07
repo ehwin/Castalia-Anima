@@ -15,6 +15,7 @@
  */
 
 import { DatabaseManager } from './db.js';
+import { normalizeProject } from './env.js';
 import { flushVadQueue, regressToBaseline, isNightTime } from './emotion.js';
 import { cleanupExpiredMemories } from './store.js';
 import { getAgentState } from './agentState.js';
@@ -86,14 +87,15 @@ export function maybeDigest(characterId: string = 'airi'): Promise<DigestResult>
   return runDigest(characterId);
 }
 
-export function getRecentConversations(characterId: string, hoursBack: number = 24, limit: number = 50): any[] {
-  const db = DatabaseManager.getInstance();
+export function getRecentConversations(characterId: string, hoursBack: number = 24, limit: number = 50, project?: string): any[] {
+  const db = DatabaseManager.getInstance(project);
   const since = new Date(Date.now() - hoursBack * 3600000).toISOString();
+  const proj = normalizeProject(project);
   return db.prepare(`
     SELECT id, text, created_at, importance
     FROM memory WHERE is_active = 1
-      AND source = 'conversation_log' AND character_id = ?
+      AND source = 'conversation_log' AND character_id = ? AND project = ?
       AND created_at > ?
     ORDER BY created_at DESC LIMIT ?
-  `).all(characterId, since, limit) as any[];
+  `).all(characterId, proj, since, limit) as any[];
 }

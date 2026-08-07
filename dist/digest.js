@@ -14,6 +14,7 @@
  * 事件驱动：有新对话才跑，间隔 ≥ 1 分钟
  */
 import { DatabaseManager } from './db.js';
+import { normalizeProject } from './env.js';
 import { flushVadQueue } from './emotion.js';
 import { cleanupExpiredMemories } from './store.js';
 const MIN_DIGEST_GAP_MS = 60 * 1000;
@@ -67,14 +68,15 @@ export function maybeDigest(characterId = 'airi') {
     lastDigestTime = now;
     return runDigest(characterId);
 }
-export function getRecentConversations(characterId, hoursBack = 24, limit = 50) {
-    const db = DatabaseManager.getInstance();
+export function getRecentConversations(characterId, hoursBack = 24, limit = 50, project) {
+    const db = DatabaseManager.getInstance(project);
     const since = new Date(Date.now() - hoursBack * 3600000).toISOString();
+    const proj = normalizeProject(project);
     return db.prepare(`
     SELECT id, text, created_at, importance
     FROM memory WHERE is_active = 1
-      AND source = 'conversation_log' AND character_id = ?
+      AND source = 'conversation_log' AND character_id = ? AND project = ?
       AND created_at > ?
     ORDER BY created_at DESC LIMIT ?
-  `).all(characterId, since, limit);
+  `).all(characterId, proj, since, limit);
 }

@@ -6,7 +6,105 @@
  * - Phase 2: reference_count 升华 → 被反复引用的记忆重要性提升
  */
 import { DatabaseManager } from './db.js';
+import { cosineSimilarity } from './ollama.js';
+import { isEmbedEnabled, normalizeProject } from './env.js';
 const ACTIVATION_THRESHOLD = 0.15;
+// ═══ v1.10: 记忆整合候选预筛配置(env 可配;config.json 的 consolidate.similarity 会覆盖) ═══
+export const CONSOLIDATE_SIMILARITY = (() => {
+    const v = parseFloat(process.env.CONSOLIDATE_SIMILARITY || '0.88');
+    return Number.isFinite(v) && v > 0 ? v : 0.88;
+})();
+/** 候选对数上限,防止相似爆炸 */
+export const CONSOLIDATE_MAX_PAIRS = (() => {
+    const v = parseInt(process.env.CONSOLIDATE_MAX_PAIRS || '50', 10);
+    return Number.isFinite(v) && v > 0 ? v : 50;
+})();
+/**
+ * v1.10: 向量预筛相似记忆对(cos 相似度 > threshold)。
+ * - EMBED_MODE=none → 直接返回 [] (LLM 全量扫兜底)
+ * - vec0 虚拟表禁止 JOIN:先对每条记忆做 KNN 取候选 rowid,再二段过滤 project/locked
+ * - 每对去重(不重复 idA/idB、不反向),数量上限 limit 防爆炸
+ */
+export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIMILARITY, limit = CONSOLIDATE_MAX_PAIRS) {
+    if (!isEmbedEnabled())
+        return [];
+    const db = DatabaseManager.getInstance(project);
+    const proj = normalizeProject(project);
+    const mems = db.prepare(`
+    SELECT m.rowid, m.id FROM memory m
+    WHERE m.is_active = 1 AND m.project = ? AND (m.locked IS NULL OR m.locked = 0)
+    ORDER BY m.created_at DESC
+    LIMIT 500
+  `).all(proj);
+    if (mems.length < 2)
+        return [];
+    const rowidList = mems.map(m => Number(m.rowid));
+    let vecRows = [];
+    try {
+        vecRows = db.prepare(`
+      SELECT rowid, embedding FROM vec_memory WHERE rowid IN (${rowidList.map(() => '?').join(',')})
+    `).all(...rowidList);
+    }
+    catch {
+        return [];
+    }
+    if (vecRows.length < 2)
+        return [];
+    const memByRowid = new Map();
+    for (const m of mems)
+        memByRowid.set(Number(m.rowid), m.id);
+    const vecByRowid = new Map();
+    for (const r of vecRows) {
+        const b = r.embedding;
+        vecByRowid.set(Number(r.rowid), Array.from(new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4)));
+    }
+    if (vecByRowid.size < 2)
+        return [];
+    const scanK = Math.min(20, mems.length);
+    const seen = new Set();
+    const pairs = [];
+    for (const m of mems) {
+        const rowid = Number(m.rowid);
+        const vec = vecByRowid.get(rowid);
+        if (!vec)
+            continue;
+        let knn = [];
+        try {
+            knn = db.prepare(`
+        SELECT rowid, distance FROM vec_memory
+        WHERE embedding MATCH ? ORDER BY distance LIMIT ?
+      `).all(new Float32Array(vec), scanK);
+        }
+        catch {
+            continue;
+        }
+        for (const n of knn) {
+            const nRowid = Number(n.rowid);
+            if (nRowid === rowid)
+                continue;
+            // 二段过滤:只保留同项目 active 记忆(locked 已排除)的邻居
+            const otherId = memByRowid.get(nRowid);
+            if (!otherId)
+                continue;
+            const otherVec = vecByRowid.get(nRowid);
+            if (!otherVec)
+                continue;
+            const sim = cosineSimilarity(vec, otherVec);
+            if (sim < threshold)
+                continue;
+            const a = m.id;
+            const b = otherId;
+            const key = a < b ? `${a}|${b}` : `${b}|${a}`;
+            if (seen.has(key))
+                continue;
+            seen.add(key);
+            pairs.push({ idA: a, idB: b, similarity: Math.round(sim * 1000) / 1000 });
+            if (pairs.length >= limit)
+                return pairs;
+        }
+    }
+    return pairs;
+}
 export async function consolidate() {
     const db = DatabaseManager.getInstance();
     const now = Date.now();
