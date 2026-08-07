@@ -64,13 +64,13 @@ export interface ReflectAction {
   sourceId?: string;
   targetIdRelate?: string;
   relationType?: string;
-  // reclassify: 重新分类
+  // reclassify: 重新分类(可同时改 type/category/tags/memType)
   newTypeSingle?: string;
   newCategorySingle?: string;
   // extract: 从源记忆中提取新记忆（不删除源）
   // 使用 sourceId + newText/newType/newCategory/newTags/newImportance/tier/newMemType
   tier?: string;
-  newMemType?: string;  // v1.8: 提取时分类到 4 种封闭类型(user/feedback/project/reference)
+  newMemType?: string;  // v1.8: 提取/重分类时分类到 4 种封闭类型(user/feedback/project/reference)
   // delete: 软删除
   // boost/decay: 调整 importance
   delta?: number;
@@ -274,6 +274,14 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             }
             updates.push('category = ?'); values.push(action.newCategorySingle);
           }
+          if (action.newMemType) {
+            if (!isMemType(action.newMemType)) {
+              result.errors.push(`reclassify: invalid memType "${action.newMemType}", skipped`);
+              receipt.status = 'failed'; receipt.reason = `invalid memType "${action.newMemType}"`;
+              continue;
+            }
+            updates.push('mem_type = ?'); values.push(action.newMemType as MemType);
+          }
           if (action.newTags) {
             const valid = safeTags(action.newTags);
             if (!valid) {
@@ -286,7 +294,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           if (updates.length > 0) {
             values.push(tid + '%');
             const _recR = db.prepare(`UPDATE memory SET ${updates.join(', ')}, updated_at = ? WHERE id LIKE ?`)
-              .run(new Date().toISOString(), ...values);
+              .run(...values, new Date().toISOString());
             receipt.rowsAffected = _recR.changes;
             if (_recR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found: ${tid}`; }
             if (receipt.status === 'applied') result.applied++;

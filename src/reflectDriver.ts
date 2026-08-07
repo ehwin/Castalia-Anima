@@ -267,6 +267,15 @@ export function buildDeepReflectPrompt(factExtraction: string = FACT_EXTRACTION,
 每个画像以 extract 形式输出：
 {"action":"extract","sourceId":"代表性记忆id","newText":"用户画像描述","newType":"semantic","newCategory":"preference","newTags":["用户画像","性格"],"newImportance":0.9,"tier":"critical"}
 
+【任务：情感归位】
+找出 category=emotional 或内容明显是情感经历/情绪事件的记忆（如"第一次醒来""深夜的约定"这类 AI 自身的情感体验），对这类记忆执行 reclassify：
+{"action":"reclassify","targetId":"记忆id","newMemType":"project","newCategorySingle":"原category(如emotional)"}
+- 情感类记忆（情绪/情感经历/情绪快照/里程碑/关系）→ newMemType=project（情感分区），newCategorySingle 保留原 category（如 emotional）
+- 画像类记忆（关于用户偏好/身份/性格）→ newMemType=user
+- 外部链接类（URL/文档/ID）→ newMemType=reference
+- 纠正类（行为纠正/肯定）→ newMemType=feedback
+- 若记忆已带正确 memType 则不重复 reclassify；拿不准的省略（留 general）
+
 【任务3：知识图谱】
 - 找出可以建立关联的记忆 → relate
 - 相关事件组成序列 → relate (relationType: "sequence" 或 "follows")

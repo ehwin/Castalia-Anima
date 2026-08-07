@@ -232,6 +232,16 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         updates.push('category = ?');
                         values.push(action.newCategorySingle);
                     }
+                    if (action.newMemType) {
+                        if (!isMemType(action.newMemType)) {
+                            result.errors.push(`reclassify: invalid memType "${action.newMemType}", skipped`);
+                            receipt.status = 'failed';
+                            receipt.reason = `invalid memType "${action.newMemType}"`;
+                            continue;
+                        }
+                        updates.push('mem_type = ?');
+                        values.push(action.newMemType);
+                    }
                     if (action.newTags) {
                         const valid = safeTags(action.newTags);
                         if (!valid) {
@@ -246,7 +256,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                     if (updates.length > 0) {
                         values.push(tid + '%');
                         const _recR = db.prepare(`UPDATE memory SET ${updates.join(', ')}, updated_at = ? WHERE id LIKE ?`)
-                            .run(new Date().toISOString(), ...values);
+                            .run(...values, new Date().toISOString());
                         receipt.rowsAffected = _recR.changes;
                         if (_recR.changes === 0) {
                             receipt.status = 'failed';
