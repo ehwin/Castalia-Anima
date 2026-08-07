@@ -51,15 +51,28 @@ Any Ollama-compatible `/api/embed` service outputting **1024-dim** vectors works
 
 ### 3. Configure LLM channels (optional but recommended)
 
-Via environment or `memory/config.json` (loaded at startup):
+**API keys 请用加密存储(优先),不要再明文写进 `memory/config.json`:**
+
+```bash
+node scripts/keygen.js                                       # 交互式(回车 = 跳过保持原值)
+node scripts/keygen.js --reflect-api-key sk-xxx \
+                       --triage-api-key sk-xxx \
+                       --embedding-api-key sk-xxx            # 命令行传入,未传的参数保持 keys.enc 原值
+```
+
+- 生成 `memory/keys.key`(32 字节随机密钥)+ `memory/keys.enc`(AES-256-GCM 加密负载),均与代码分离、已被 `.gitignore` 排除
+- 启动时 `configLoader` 自动解密 `keys.enc` 注入环境变量(`REFLECT_LLM_API_KEY` / `TRIAGE_LLM_API_KEY` / `EMBEDDING_API_KEY`);优先级:显式环境变量 > keys.enc > config.json
+- `memory/config.json` 仍可存非密钥配置(URL / model / personas 等);`api_key` 字段保留兼容但不再建议使用
+
+非密钥配置放 `memory/config.json`(启动时加载):
 
 ```json
 {
   "personas": {
     "work":  { "charId": "airi-work", "name": "Airi", "persona": "专业高效, 简洁直接" }
   },
-  "reflect": { "api_url": "https://api.deepseek.com/v1", "api_key": "sk-...", "model": "deepseek-chat" },
-  "triage":  { "api_url": "https://api.deepseek.com/v1", "api_key": "sk-...", "model": "deepseek-chat" }
+  "reflect": { "api_url": "https://api.deepseek.com/v1", "model": "deepseek-chat" },
+  "triage":  { "api_url": "https://api.deepseek.com/v1", "model": "deepseek-chat" }
 }
 ```
 

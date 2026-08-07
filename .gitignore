@@ -10,3 +10,9 @@ reflect-receipts/
 # 融合参考目录(不入库)
 refs/
 old_ref/
+
+# API key 加密存储(密钥与加密负载都不入库,与代码分离)
+memory/keys.enc
+memory/keys.key
+keys.enc
+keys.key
