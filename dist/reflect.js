@@ -253,14 +253,33 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         updates.push('tags = ?');
                         values.push(JSON.stringify(valid));
                     }
+                    // v2.0: reclassify 支持 newText — 时间规范化检查把相对时间改写为绝对日期
+                    if (action.newText !== undefined && action.newText !== null) {
+                        if (typeof action.newText !== 'string' || action.newText.trim().length === 0) {
+                            result.errors.push('reclassify: newText must be a non-empty string, skipped');
+                            receipt.status = 'failed';
+                            receipt.reason = 'invalid newText';
+                            continue;
+                        }
+                        updates.push('text = ?');
+                        values.push(action.newText.trim());
+                    }
                     if (updates.length > 0) {
-                        values.push(tid + '%');
                         const _recR = db.prepare(`UPDATE memory SET ${updates.join(', ')}, updated_at = ? WHERE id LIKE ?`)
-                            .run(...values, new Date().toISOString());
+                            .run(...values, new Date().toISOString(), tid + '%');
                         receipt.rowsAffected = _recR.changes;
                         if (_recR.changes === 0) {
                             receipt.status = 'failed';
                             receipt.reason = `target not found: ${tid}`;
+                        }
+                        // 文本变更后旧向量失效:删向量,后续 reflect_batch_embed 重新向量化
+                        if (_recR.changes > 0 && updates.includes('text = ?')) {
+                            try {
+                                const info = db.prepare('SELECT rowid FROM memory WHERE id LIKE ? LIMIT 1').get(tid + '%');
+                                if (info)
+                                    db.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(BigInt(info.rowid));
+                            }
+                            catch { }
                         }
                         if (receipt.status === 'applied')
                             result.applied++;

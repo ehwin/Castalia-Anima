@@ -277,6 +277,13 @@ export function buildDeepReflectPrompt(factExtraction: string = FACT_EXTRACTION,
 - 纠正类（行为纠正/肯定）→ newMemType=feedback
 - 若记忆已带正确 memType 则不重复 reclassify；拿不准的省略（留 general）
 
+【任务：时间规范化检查】
+- 扫描所有记忆文本，找出含相对时间的（昨天/上周/前几天/下周三/上个月/去年等）
+- 结合该记忆的 date/created_at 字段推断确切日期，对这类记忆执行 reclassify：
+{"action":"reclassify","targetId":"记忆id","newText":"用绝对日期替换相对时间后的文本"}
+- 推断不出的（如"很久以前"）→ 标注为"约 <年份>"，实在无法确定的保持原文不动
+- 只改含相对时间的记忆；已用绝对日期的跳过；拿不准的不动（避免幻觉日期）
+
 【任务3：知识图谱】
 - 找出可以建立关联的记忆 → relate
 - 相关事件组成序列 → relate (relationType: "sequence" 或 "follows")
