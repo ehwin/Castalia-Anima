@@ -1107,7 +1107,7 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('[airi-memory] v5.0.0 started — unified MCP server (proxy + LLM tools)');
+  console.error('[castalia-anima] v2.0.0 started — emotional memory MCP server');
 
   // ═══ 启动时自动反思 ═══
   // 触发逻辑:条件达成(距上次反思 ≥ REFLECT_MIN_GAP_HOURS 且未分析对话 > REFLECT_MIN_UNANALYZED)
