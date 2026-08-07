@@ -56,8 +56,8 @@ function memorySnapshotWarn(createdAt) {
     const diffDays = Math.floor((Date.now() - new Date(createdAt).getTime()) / 86400000);
     if (diffDays < 1)
         return null;
-    const ageText = diffDays === 0 ? '今天' : `${diffDays} 天前`;
-    return `> ⚠️ [Memory Snapshot Warning] 该记忆记录于 ${ageText},属于历史快照,引用前请以最新对话/代码为准`;
+    const dateText = new Date(createdAt).toISOString().slice(0, 10);
+    return `> ⚠️ [Memory Snapshot Warning] 该记忆记录于 ${dateText}(约 ${diffDays} 天前),属于历史快照,引用前请以最新对话/代码为准`;
 }
 // ═══════════════════════════════════════════════════════════════════
 // 工具分级(借鉴 engram ProfileAgent/ProfileAdmin)
