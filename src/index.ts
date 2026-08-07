@@ -26,7 +26,7 @@ import { reflect, getAllMemories, getMemoryGraph, REFLECT_SYSTEM_PROMPT, getUnan
 import { autoProcess } from './autoProcessor.js';
 import { runAutoReflect, runDeepReflect, shouldAutoReflect, runConsolidate, shouldAutoConsolidate } from './reflectDriver.js';
 import { ensureSeedInstructions, saveInstruction, getInstruction, listInstructions, deleteInstruction } from './instructions.js';
-import { CHAR_ID, PROJECT_ID, SERVER_NAME, SERVER_VERSION, normalizeProject } from './env.js';
+import { CHAR_ID, PROJECT_ID, SERVER_NAME, SERVER_VERSION, normalizeProject, charFor, getPersona } from './env.js';
 import { MEM_TYPES, MEM_TYPE_LABELS, summarizeForIndex } from './memType.js';
 // Anima 情感层
 import { getAgentState } from './agentState.js';
@@ -42,6 +42,14 @@ function ok(data: any) {
 }
 function err(msg: string, code = 'ERROR') {
   return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: false, error: { code, message: msg } }, null, 2) }], isError: true as const };
+}
+
+/** 人格声明行:[角色声明] 我是 <name>(charId=<charId>) [。人格设定:<persona>](persona 非空时) */
+function roleDeclaration(project?: string): string {
+  const p = getPersona(project);
+  return p.persona
+    ? `[角色声明] 我是 ${p.name}(charId=${p.charId}) 。人格设定:${p.persona}`
+    : `[角色声明] 我是 ${p.name}(charId=${p.charId})`;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -118,7 +126,7 @@ register(
   },
   async (args) => {
     try {
-      const r = await searchMemory({ query: args.query, topK: args.topK ?? 5, profile: 'balanced', category: args.category, memType: args.memType, characterId: CHAR_ID, project: args.project });
+      const r = await searchMemory({ query: args.query, topK: args.topK ?? 5, profile: 'balanced', category: args.category, memType: args.memType, characterId: charFor(args.project), project: args.project });
       return ok({
         op: 'search',
         query: args.query,
@@ -194,7 +202,7 @@ register(
   },
   async (args) => {
     try {
-      const r = await saveMemory({ text: args.text, project: args.project, sessionId: args.sessionId, type: args.type, memType: args.memType, category: args.category, tags: args.tags, emotionalImpact: args.emotionalImpact, importance: args.importance, tier: args.tier, source: args.source, subject: args.subject, characterId: CHAR_ID, skipEmbed: args.skipEmbed, expiresAt: args.expiresAt });
+      const r = await saveMemory({ text: args.text, project: args.project, sessionId: args.sessionId, type: args.type, memType: args.memType, category: args.category, tags: args.tags, emotionalImpact: args.emotionalImpact, importance: args.importance, tier: args.tier, source: args.source, subject: args.subject, characterId: charFor(args.project), skipEmbed: args.skipEmbed, expiresAt: args.expiresAt });
       return ok({ id: r.id, text: r.text.substring(0, 100), type: r.type, memType: r.memType, category: r.category });
     } catch (e: any) { return err(e.message); }
   }
@@ -258,7 +266,7 @@ register(
       const r = await saveMemory({
         text: args.text, project: args.project, type: conf.type, category: conf.category,
         tags: conf.tags, importance: conf.importance, tier: conf.tier,
-        source: 'agent_log', characterId: CHAR_ID,
+        source: 'agent_log', characterId: charFor(args.project),
       });
       return ok({ id: r.id, kind, category: conf.category, tier: conf.tier });
     } catch (e: any) { return err(e.message, 'LOG_FAILED'); }
@@ -278,13 +286,15 @@ register(
     moodValue: z.number().optional(),
     moodReason: z.string().optional(),
     sessionId: z.string().optional().describe('Session identifier for progressive in-session reflection (rolls session memory, promotes long-term facts). Omit to keep the legacy behavior (no session buffer).'),
+    characterId: z.string().optional().describe('AI persona charId (optional; defaults to the persona resolved from project, falling back to CHAR_ID). Explicit value takes priority.'),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
   },
   async (args) => {
     try {
-      const r = await autoProcess({ userMessage: args.userMessage, assistantMessage: args.assistantMessage, characterId: CHAR_ID, moodValue: args.moodValue, moodReason: args.moodReason, sessionId: args.sessionId, project: args.project });
+      const cid = args.characterId || charFor(args.project);
+      const r = await autoProcess({ userMessage: args.userMessage, assistantMessage: args.assistantMessage, characterId: cid, moodValue: args.moodValue, moodReason: args.moodReason, sessionId: args.sessionId, project: args.project });
       // Trigger event-driven digest
-      maybeDigest(CHAR_ID)?.catch(() => {});
+      maybeDigest(cid)?.catch(() => {});
       return ok(r);
     } catch (e: any) { return err(e.message); }
   }
@@ -293,10 +303,10 @@ register(
 register(
   'digest_run', 'harness',
   '[Internal] Run the digest cycle: flush VAD queue, cleanup expired memories, restore lost critical memories.',
-  {},
-  async () => {
+  { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') },
+  async (args) => {
     try {
-      const r = await runDigest(CHAR_ID);
+      const r = await runDigest(charFor(args.project));
       return ok(r);
     } catch (e: any) { return err(e.message); }
   }
@@ -314,7 +324,7 @@ register(
   },
   async (args) => {
     try {
-      const r = await saveConversationTurn(args.userMessage, args.assistantMessage, CHAR_ID, args.moodValue, args.moodReason, args.project);
+      const r = await saveConversationTurn(args.userMessage, args.assistantMessage, charFor(args.project), args.moodValue, args.moodReason, args.project);
       return ok(r);
     } catch (e: any) { return err(e.message); }
   }
@@ -330,16 +340,18 @@ register(
   { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') },
   async (args) => {
     try {
-      const state = getAgentState(CHAR_ID);
-      const bias = getBiasPrompt(CHAR_ID);
-      const profile = getUserProfilePrompt(CHAR_ID, 'default');
-      const db = DatabaseManager.getInstance(args.project);
       const proj = normalizeProject(args.project);
-      const recent = getRecentMemories(CHAR_ID, 5, 24, proj);
+      const p = getPersona(args.project);
+      const state = getAgentState(charFor(args.project));
+      const bias = getBiasPrompt(charFor(args.project));
+      const profile = getUserProfilePrompt(charFor(args.project), 'default');
+      const db = DatabaseManager.getInstance(args.project);
+      const recent = getRecentMemories(charFor(args.project), 5, 24, proj);
       const stats = db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(proj) as any;
       return ok({
         op: 'context',
-        state: state.toPromptString(),
+        state: roleDeclaration(args.project) + '\n' + state.toPromptString(),
+        persona: { charId: p.charId, name: p.name, persona: p.persona },
         bias,
         profile,
         recentMemories: recent.map(m => ({ text: m.text, category: m.category, importance: m.importance, createdAt: m.createdAt })),
@@ -377,12 +389,12 @@ register(
       const proj = normalizeProject(args.project);
 
       // 1. 近期重要记忆
-      const recent = getRecentMemories(CHAR_ID, recentLimit, hoursBack, proj);
+      const recent = getRecentMemories(charFor(args.project), recentLimit, hoursBack, proj);
 
       // 2. 与当前任务相关的记忆(向量搜索)
       let related: any[] = [];
       if (args.query) {
-        const r = await searchMemory({ query: args.query, topK: relatedLimit, profile: 'balanced', characterId: CHAR_ID, project: proj });
+        const r = await searchMemory({ query: args.query, topK: relatedLimit, profile: 'balanced', characterId: charFor(args.project), project: proj });
         related = r.map(m => ({ text: m.text, category: m.category, importance: m.importance, score: m.score, createdAt: m.createdAt }));
       }
 
@@ -393,7 +405,7 @@ register(
         WHERE is_active = 1 AND character_id = ? AND project = ?
           AND (category IN ('decision','mistake') OR tags LIKE '%pattern%')
         ORDER BY created_at DESC LIMIT 9
-      `).all(CHAR_ID, proj) as any[];
+      `).all(charFor(args.project), proj) as any[];
 
       // 4. 关键事实(高置信度)
       const facts = db.prepare(`
@@ -410,7 +422,7 @@ register(
           AND mem_type IN ('user','feedback','project','reference')
         ORDER BY updated_at DESC
         LIMIT 10
-      `).all(CHAR_ID, proj) as any[];
+      `).all(charFor(args.project), proj) as any[];
       const indexLayer = indexRows.map((row: any) => {
         const s = row.summary || '';
         return {
@@ -426,8 +438,9 @@ register(
 
       const stats = db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(proj) as any;
 
-      // 5. Ground Truth 提示词组装(指令分节在最前面)
+      // 5. Ground Truth 提示词组装(人格声明在最前,指令分节次之)
       const sections: string[] = [];
+      sections.push(roleDeclaration(args.project));
       if (instructions.length > 0) {
         const lines = instructions.map(i => {
           const base = i.scope === 'global' ? '[全局]' : i.scope === 'user' ? '[用户]' : '[项目]';
@@ -519,14 +532,14 @@ register(
     try {
       const db = DatabaseManager.getInstance(args.project);
       const proj = normalizeProject(args.project);
-      const total = db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=?').get(CHAR_ID, proj) as any;
+      const total = db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=?').get(charFor(args.project), proj) as any;
       return ok({
         op: 'stats',
         total: total.c,
-        byCategory: db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY category').all(CHAR_ID, proj),
-        bySource: db.prepare('SELECT source,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY source').all(CHAR_ID, proj),
-        byMemType: db.prepare('SELECT mem_type,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY mem_type').all(CHAR_ID, proj),
-        characterId: CHAR_ID,
+        byCategory: db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY category').all(charFor(args.project), proj),
+        bySource: db.prepare('SELECT source,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY source').all(charFor(args.project), proj),
+        byMemType: db.prepare('SELECT mem_type,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY mem_type').all(charFor(args.project), proj),
+        characterId: charFor(args.project),
         project: proj,
       });
     } catch (e: any) { return err(e.message, 'STATS_FAILED'); }
@@ -541,10 +554,13 @@ register(
 register(
   'user_observe', 'harness',
   '[Internal] Observe a user message for communication pattern learning.',
-  { message: z.string().describe('User message to learn from') },
+  {
+    message: z.string().describe('User message to learn from'),
+    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+  },
   async (args) => {
     try {
-      observeUserMessage(CHAR_ID, 'default', args.message);
+      observeUserMessage(charFor(args.project), 'default', args.message);
       return ok({ observed: true });
     } catch (e: any) { return err(e.message); }
   }
@@ -561,11 +577,13 @@ register(
     try {
       const db = DatabaseManager.getInstance(args.project);
       const proj = normalizeProject(args.project);
+      const p = getPersona(args.project);
       const since = new Date(Date.now() - (args.days || 7) * 86400000).toISOString();
       return ok({
         op: 'mood_journal',
         days: args.days,
         project: proj,
+        persona: { charId: p.charId, name: p.name, persona: p.persona },
         moods: db.prepare("SELECT emotional_impact as value, created_at, text, category FROM memory WHERE is_active=1 AND project=? AND (category='emotional' OR category='mood_snapshot' OR tier='temporary') AND created_at>? ORDER BY created_at DESC LIMIT 30").all(proj, since),
       });
     } catch (e: any) { return err(e.message); }
@@ -588,7 +606,7 @@ register(
   },
   async (args) => {
     try {
-      const memories = getAllMemories(CHAR_ID, args.limit, args.project);
+      const memories = getAllMemories(charFor(args.project), args.limit, args.project);
       let filtered = memories;
       if (args.category) filtered = filtered.filter((m: any) => m.category === args.category);
       if (args.source) filtered = filtered.filter((m: any) => m.source === args.source);
@@ -661,7 +679,7 @@ register(
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') },
   async (args) => {
     try {
-      const g = getMemoryGraph(CHAR_ID, args.project);
+      const g = getMemoryGraph(charFor(args.project), args.project);
       const limit = args.limit ?? 50;
       const nodes = g.nodes.slice(0, limit);
       const nodeIds = new Set(nodes.map((n: any) => n.id));
@@ -689,7 +707,7 @@ register(
   },
   async (args) => {
     try {
-      const r = getRecentMemories(CHAR_ID, args.limit, args.hoursBack, args.project, args.memType);
+      const r = getRecentMemories(charFor(args.project), args.limit, args.hoursBack, args.project, args.memType);
       return ok({
         op: 'recent',
         count: r.length,
@@ -722,7 +740,7 @@ register(
       const proj = normalizeProject(args.project);
       const limit = Math.min(args.limit ?? 20, 100);
       const conds = ['is_active = 1', 'character_id = ?', 'project = ?'];
-      const params: any[] = [CHAR_ID, proj];
+      const params: any[] = [charFor(args.project), proj];
       if (args.memType) { conds.push('mem_type = ?'); params.push(args.memType); }
       params.push(limit);
       const rows = db.prepare(`
@@ -758,7 +776,7 @@ register(
   },
   async (args) => {
     try {
-      const r = getRecentConversations(CHAR_ID, args.hoursBack, args.limit, args.project);
+      const r = getRecentConversations(charFor(args.project), args.hoursBack, args.limit, args.project);
       return ok({ count: r.length, results: r });
     } catch (e: any) { return err(e.message); }
   }
@@ -775,7 +793,7 @@ register(
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') },
   async (args) => {
     try {
-      const conversations = getUnanalyzedConversations(CHAR_ID, undefined, args.limit ?? 30, args.project);
+      const conversations = getUnanalyzedConversations(charFor(args.project), undefined, args.limit ?? 30, args.project);
       const prompt = conversations.map((c: any) => c.text).join('\n---\n');
       return ok({
         conversationCount: conversations.length,
@@ -804,7 +822,7 @@ register(
         const m = args.actions.match(/```(?:json)?\s*([\s\S]*?)```/);
         parsed = m ? JSON.parse(m[1]) : JSON.parse(args.actions);
       }
-      const r = await reflect(args.action, { actions: parsed, project: args.project });
+      const r = await reflect(args.action, { actions: parsed, project: args.project, characterId: charFor(args.project) });
       return ok(r);
     } catch (e: any) { return err(e.message); }
   }
@@ -821,8 +839,8 @@ register(
   async (args) => {
     try {
       const r = args.mode === 'deep'
-        ? await runDeepReflect(CHAR_ID, args.limit ?? 500, args.project)
-        : await runAutoReflect(CHAR_ID, args.limit ?? 30, args.project);
+        ? await runDeepReflect(charFor(args.project), args.limit ?? 500, args.project)
+        : await runAutoReflect(charFor(args.project), args.limit ?? 30, args.project);
       return ok({ op: args.mode === 'deep' ? 'reflect_deep' : 'reflect_auto', ...r });
     } catch (e: any) { return err(e.message, 'REFLECT_FAILED'); }
   }
@@ -835,7 +853,7 @@ register(
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') },
   async (args) => {
     try {
-      const r = await runDeepReflect(CHAR_ID, args.limit ?? 500, args.project);
+      const r = await runDeepReflect(charFor(args.project), args.limit ?? 500, args.project);
       return ok({ op: 'reflect_deep', ...r });
     } catch (e: any) { return err(e.message, 'REFLECT_FAILED'); }
   }
@@ -847,7 +865,7 @@ register(
   { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') },
   async (args) => {
     try {
-      const r = await batchEmbedPending(CHAR_ID, args.project);
+      const r = await batchEmbedPending(charFor(args.project), args.project);
       return ok(r);
     } catch (e: any) { return err(e.message); }
   }
@@ -868,7 +886,7 @@ register(
   },
   async (args) => {
     try {
-      const r = await runConsolidate(CHAR_ID, args.project, args.threshold, args.limit);
+      const r = await runConsolidate(charFor(args.project), args.project, args.threshold, args.limit);
       return ok({ op: 'consolidate_deep', ...r });
     } catch (e: any) { return err(e.message, 'CONSOLIDATE_FAILED'); }
   }
@@ -920,6 +938,7 @@ register(
           byId[key].facts = r.c;
         }
         const projects = Object.values(byId).sort((a: any, b: any) => (b.memories + b.facts) - (a.memories + a.facts));
+        projects.forEach((p: any) => { const pp = getPersona(p.project); p.persona = { charId: pp.charId, name: pp.name, persona: pp.persona }; });
         return ok({
           op: 'project_list',
           count: projects.length,
@@ -949,6 +968,7 @@ register(
             memories: mem.c,
             facts: facts.c,
             createdAt: regMap.get(name) || null,
+            persona: getPersona(name),
           });
         } catch { /* 打不开的库跳过 */ }
       }

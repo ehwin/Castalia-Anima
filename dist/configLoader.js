@@ -70,7 +70,13 @@ try {
             process.env.CONSOLIDATE_MIN_MEMORIES = String(cons.minMemories);
         if (cons.similarity != null)
             process.env.CONSOLIDATE_SIMILARITY = String(cons.similarity);
-        console.error(`[config] loaded ${CONFIG_PATH} (embed=${emb.mode || 'ollama'}, reflect=${ref.model || 'unset'}, facts=${process.env.REFLECT_FACT_EXTRACTION || 'auto'}, consolidate=${process.env.CONSOLIDATE_MIN_MEMORIES || '15'}/${process.env.CONSOLIDATE_SIMILARITY || '0.88'}, triage=${tri.model || 'unset'}, buffer=${process.env.BUFFER_SIZE || '5'}, sessionTtl=${process.env.SESSION_MEMORY_TTL_DAYS || '7'}d)`);
+        // v1.12: 人格配置(项目库 = AI 人格):{"项目名": {"charId","name","persona"}}
+        // 解析后写入 process.env.PERSONAS_JSON(供 env.charFor / getPersona 按项目解析人格)
+        const personas = (cfg.personas && typeof cfg.personas === 'object') ? cfg.personas : {};
+        if (Object.keys(personas).length > 0) {
+            process.env.PERSONAS_JSON = JSON.stringify(personas);
+        }
+        console.error(`[config] loaded ${CONFIG_PATH} (embed=${emb.mode || 'ollama'}, reflect=${ref.model || 'unset'}, facts=${process.env.REFLECT_FACT_EXTRACTION || 'auto'}, consolidate=${process.env.CONSOLIDATE_MIN_MEMORIES || '15'}/${process.env.CONSOLIDATE_SIMILARITY || '0.88'}, triage=${tri.model || 'unset'}, buffer=${process.env.BUFFER_SIZE || '5'}, sessionTtl=${process.env.SESSION_MEMORY_TTL_DAYS || '7'}d, personas=${Object.keys(personas).length})`);
     }
 }
 catch (e) {

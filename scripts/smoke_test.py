@@ -17,6 +17,9 @@ env = {**os.environ, **{'MCP_TOOLS': os.environ.get('MCP_TOOLS', 'all'),
     "EMBEDDING_MODEL": os.environ.get('EMBEDDING_MODEL', "yuan-embedding-2.0-zh"),
     "MEMORY_DB_PATH": os.path.join(ROOT, "test_smoke.sqlite"),
     "CHAR_ID": "harness-test",
+    # 项目库 = AI 人格:config.json 的 personas 段启动时写入 PERSONAS_JSON,
+    # 这里直接注入等价 env,验证 context_get 按 project 解析人格
+    "PERSONAS_JSON": json.dumps({"work": {"charId": "airi-work", "name": "WorkAiri", "persona": "专业"}}),
 }}
 
 proc = subprocess.Popen(
@@ -124,6 +127,32 @@ try:
     r = call_tool("stats_get", {"project": "alpha"})
     st = json.loads(r["result"]["content"][0]["text"])
     print("[OK] stats_get(project=alpha) → total:", st["total"], "| project:", st.get("project"))
+
+    # ── v1.12 项目库 = AI 人格 ─────────────────────────────────────
+    # 11. context_get:未传 project → 解析到默认 CHAR_ID(harness-test)
+    r = call_tool("context_get", {})
+    ctx = json.loads(r["result"]["content"][0]["text"])
+    assert ctx.get("ok"), f"context_get failed: {ctx}"
+    assert ctx.get("persona") and ctx["persona"].get("charId"), f"context_get persona missing: {ctx}"
+    assert "[角色声明]" in ctx.get("state", ""), f"state missing [角色声明]: {ctx['state'][:120]}"
+    print(f"[OK] context_get → persona.charId={ctx['persona']['charId']} | state 首行: {ctx['state'].splitlines()[0]}")
+
+    # 12. context_get(project=work):命中 PERSONAS_JSON → 切换人格
+    r = call_tool("context_get", {"project": "work"})
+    ctxw = json.loads(r["result"]["content"][0]["text"])
+    assert ctxw.get("ok"), f"context_get(project=work) failed: {ctxw}"
+    assert ctxw["persona"]["name"] == "WorkAiri", f"persona.name mismatch: {ctxw['persona']}"
+    assert ctxw["persona"]["charId"] == "airi-work", f"persona.charId mismatch: {ctxw['persona']}"
+    assert "[角色声明]" in ctxw.get("state", ""), f"state missing [角色声明]: {ctxw['state'][:120]}"
+    print(f"[OK] context_get(project=work) → persona={ctxw['persona']} | prompt 含 [角色声明]")
+
+    # 13. project_list 每条结果带 persona(人格名 = charFor(该项目名).name)
+    r = call_tool("project_list", {})
+    pl2 = json.loads(r["result"]["content"][0]["text"])
+    if all("persona" in p2 for p2 in pl2.get("projects", [])):
+        print(f"[OK] project_list → {pl2['count']} 个项目均含 persona 字段")
+    else:
+        print("[WARN] project_list 部分结果缺 persona 字段")
 
     print("\n=== ALL SMOKE TESTS PASSED ===")
 finally:

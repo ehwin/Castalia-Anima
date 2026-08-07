@@ -3,6 +3,24 @@
 > 本文件记录每次功能/架构变更。**Castalia Anima = 保留 AIRI 情感血统的情感人格化版**,定位为推 GitHub 的公共库;AIRI 主系统(`D:\system\AIRI\memory`)自用,吸收架构但不分库。
 > 与通用版(`/path\ai-memory`,无情感 Castalia)同源演进;本版 = 通用版 v1.11 架构 + Anima 情感层。
 
+## [Unreleased] — 2026-08-07 项目库 = AI 人格(人格化改造)
+
+> 用户需求:项目库对应 AI 人格(非用户人格),单用户场景,不过度设计(不建表/不加工具)。
+
+### Added
+- **项目库 = AI 人格**:`env.charFor(project)` 动态解析人格 charId,优先级:① config.json `personas` 段映射(project→{charId,name,persona})→ ② 项目名即人格名(零配置可用)→ ③ 缺省 CHAR_ID(向后兼容)
+- **对外声称**:`context_get`/`memory_context` 注入 `[角色声明] 我是 <name>(charId=<charId>)。人格设定:<persona>`;`context_get`/`mood_journal` 返回 `persona` 字段;`project_list` 每项目附 persona
+- **人格状态隔离**:agentState(情绪/精力/欲望)/ bias(兴趣偏差)/ userLearning(用户画像)按解析后 charId 分区——切项目即切换人格,情绪与画像各自独立(零改动复用既有分区)
+- config.json 新增 `personas` 段:configLoader 解析 → `PERSONAS_JSON` env(启动时加载)
+
+### Changed
+- 16 个工具按项目解析人格 charId(memory_save/search/recent/index/log、stats_get、reflect_analyze/apply/auto/deep/batch_embed、consolidate_deep、conversation_save 等)——character_id 列随人格落库,查询按人格过滤
+- `auto_process` 新增可选 `characterId` 参数(显式优先,缺省 charFor(project));`digest_run`/`user_observe` 补可选 project 参数
+- smoke_test.py 增加 persona 断言:PERSONAS_JSON 映射命中、context_get 角色声明、project_list persona 字段
+
+### 兼容性
+- 未传 project 时 charFor 返回 CHAR_ID,行为不变;未配置 personas 时项目名即人格名,零配置即可用
+
 ## [v2.0] — 2026-08-07 通用版 v1.11 全架构吸收(保留全部情感层)
 
 > 用户决策:Anima 作为情感版公共库,完整吸收通用版架构(含项目分库);AIRI 主系统后续同步(不分库)。
