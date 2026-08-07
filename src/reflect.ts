@@ -286,7 +286,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           if (updates.length > 0) {
             values.push(tid + '%');
             const _recR = db.prepare(`UPDATE memory SET ${updates.join(', ')}, updated_at = ? WHERE id LIKE ?`)
-              .run(new Date().toISOString(), ...values);
+              .run(...values, new Date().toISOString());
             receipt.rowsAffected = _recR.changes;
             if (_recR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found: ${tid}`; }
             if (receipt.status === 'applied') result.applied++;
