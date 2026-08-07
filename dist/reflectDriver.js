@@ -238,6 +238,14 @@ export function buildDeepReflectPrompt(factExtraction = FACT_EXTRACTION, maxFact
 - importance < 0.3 且无 tags 的陈旧记忆 → delete
 - 已被覆盖的临时信息 → decay
 
+【任务：时间规范化检查】
+- 扫描所有记忆文本,找出含相对时间表达的(昨天/上周/前几天/下周三/上个月/去年等)
+- 结合该记忆的 date 字段(created_at 的 YYYY-MM-DD)推断确切日期 → 执行 reclassify 动作更新文本:
+  {"action":"reclassify","targetId":"记忆id","newText":"用绝对日期(如 2026-08-12)替换相对时间的完整文本"}
+- 推断不出确切日期(如"很久以前")→ 标注"约 <年份>"(按 date 字段年份)或保持原文
+- 只改含相对时间的记忆;已是绝对日期/无时间歧义的跳过;拿不准的不要动
+- locked=1 的记忆跳过,绝不修改
+
 ══════════════════════
 锁规则：locked=1 的记忆仅供理解上下文，绝对不修改/删除/合并
 ${outputFormatSpec(factExtraction, maxFacts)}

@@ -283,10 +283,18 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             }
             updates.push('tags = ?'); values.push(JSON.stringify(valid));
           }
+          // v2.0: reclassify 支持 newText — 时间规范化检查用它把相对时间改写为绝对日期
+          if (action.newText !== undefined && action.newText !== null) {
+            if (typeof action.newText !== 'string' || action.newText.trim().length === 0) {
+              result.errors.push('reclassify: newText must be a non-empty string, skipped');
+              receipt.status = 'failed'; receipt.reason = 'invalid newText';
+              continue;
+            }
+            updates.push('text = ?'); values.push(action.newText.trim());
+          }
           if (updates.length > 0) {
-            values.push(tid + '%');
             const _recR = db.prepare(`UPDATE memory SET ${updates.join(', ')}, updated_at = ? WHERE id LIKE ?`)
-              .run(...values, new Date().toISOString());
+              .run(...values, new Date().toISOString(), tid + '%');
             receipt.rowsAffected = _recR.changes;
             if (_recR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found: ${tid}`; }
             if (receipt.status === 'applied') result.applied++;
