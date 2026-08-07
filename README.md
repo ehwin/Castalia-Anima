@@ -2,7 +2,7 @@
 
 **Castalia Anima** is the personality-driven companion of [**Castalia**](https://github.com/ehwin/Castalia): a standalone MCP memory server with a full **emotion layer** on top of the neutral Castalia architecture. It inherits the entire Castalia v1.11 architecture (per-project DBs, 3-channel LLM pipeline, three-layer instructions, closed memory types, progressive session reflection, consolidation) and adds an emotional personality system — VAD 3D emotion analysis, tsundere detection, emotion-anchored retrieval, per-project personas.
 
-Forked from the AIRI memory system (the emotional bloodline). SQLite + sqlite-vec local vector storage, zero API cost for embeddings. Bring your own LLM for reflection/triage.
+Forked from [**Castalia**](https://github.com/ehwin/Castalia), extended with a full emotional personality layer. SQLite + sqlite-vec local vector storage, zero API cost for embeddings. Bring your own LLM for reflection/triage.
 
 > **Relationship to Castalia**: Castalia is the neutral, general-purpose component (no personality). Castalia Anima is the emotional variant — same architecture, plus feelings. See [Credits & Upstream](#credits--upstream).
 
@@ -128,14 +128,12 @@ Via environment or `memory/config.json` (loaded at startup):
 
 ## Credits & Upstream
 
-Castalia Anima is an independent, emotion-focused evolution of the AIRI memory system. Design and storage patterns informed by:
+Castalia Anima is an independent, emotion-focused evolution of Castalia. Design and storage patterns informed by:
 
 - **[Castalia](https://github.com/ehwin/Castalia)** — the neutral general-purpose variant; Anima inherits its full v1.11 architecture (per-project DBs, 3-channel pipeline, three-layer instructions, closed memTypes, session reflection, consolidation). Architectures cross-pollinate between the two repos.
-- **AIRI memory system** — the emotional bloodline: VAD emotion engine, tsundere layer, agent state, bias layer, user learning
 - **Claude Code** (Anthropic) — closed memory types (user/feedback/project/reference), MEMORY.md index, progressive session maintenance, consolidation sub-agent, snapshot warnings (patterns re-implemented in SQLite)
 - **engram** — profile-gated tool exposure, setup script
 - **memory-os / cognitive-memory** — local vector storage patterns
-- **AIRI Alaya scoring design** — emotion-weighted / time-decay retrieval formula ideas
 - **SynaBun** — hierarchical categories and smart-relevance weighting ideas
 - **千问 (Qwen) architecture suggestions** — agent self-state (mood/desire/energy) design inspiration
 
