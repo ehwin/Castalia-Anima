@@ -25,7 +25,7 @@ Forked from [**Castalia**](https://github.com/ehwin/Castalia), extended with a f
   - 3-channel LLM pipeline: LLM1 triage (inbound memType classification + incremental session reflection), vector model (embeddings), LLM2 reflect (daily reflection / deep calibration / consolidation)
   - Three-layer instructions (global / user / project + reusable rule groups, glob path filtering)
   - Closed memory types: user / feedback / project / reference (Markdown-normalized) + general fallback
-  - Progressive session reflection: rolling session memory + promote-to-project (promote-and-delete) + TTL sweep
+  - Progressive session reflection: rolling session memory + promote-to-project (promote-and-delete) + TTL sweep; extraction-agent style prompts (Claude Code `extract_memories` lineage) with **output dedup** (text-normalized + vector-cosine pre-filter) so repeated insights never pile up
   - Memory consolidation: vector pre-screen similar pairs → LLM dedup / conflict resolution (never invent facts)
   - Per-action reflection receipts, persisted to `memory/receipts/` for audit
   - Snapshot warnings with exact dates for memories older than 24h
@@ -69,7 +69,7 @@ node scripts/keygen.js --reflect-api-key sk-xxx \
 ```json
 {
   "personas": {
-    "work":  { "charId": "airi-work", "name": "Airi", "persona": "专业高效, 简洁直接" }
+    "work":  { "charId": "work-agent", "name": "Work Agent", "persona": "professional, concise, direct" }
   },
   "reflect": { "api_url": "https://api.deepseek.com/v1", "model": "deepseek-chat" },
   "triage":  { "api_url": "https://api.deepseek.com/v1", "model": "deepseek-chat" }
@@ -91,7 +91,7 @@ node scripts/keygen.js --reflect-api-key sk-xxx \
         "OLLAMA_URL": "http://127.0.0.1:11436",
         "EMBEDDING_MODEL": "yuan-embedding-2.0-zh",
         "MEMORY_DB_DIR": "D:\\AI\\AI memory\\memory",
-        "CHAR_ID": "airi",
+        "CHAR_ID": "my-char",
         "MCP_TOOLS": "all"
       }
     }
@@ -111,7 +111,7 @@ node scripts/keygen.js --reflect-api-key sk-xxx \
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CHAR_ID` | `airi` | Default persona/character ID |
+| `CHAR_ID` | `my-char` | Default persona/character ID (used when no persona map entry matches) |
 | `CASTALIA_PROJECT` | `default` | Default project namespace |
 | `MEMORY_DB_DIR` | `<cwd>/memory` | Per-project DB directory (`global.sqlite` + `project-*.sqlite`); `MEMORY_DB_PATH` → legacy single-file mode |
 | `OLLAMA_URL` / `EMBEDDING_MODEL` | `:11434` / `yuan-embedding-2.0-zh` | Embedding service (1024-dim) |
