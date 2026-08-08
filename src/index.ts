@@ -22,6 +22,7 @@ import { consolidate } from './consolidate.js';
 import { DatabaseManager, listProjectNames, sweepExpiredSessionMemories } from './db.js';
 import { getCategoryTree } from './category.js';
 import { runDigest, getRecentConversations, maybeDigest } from './digest.js';
+import { flushAllBuffers } from './buffer.js';
 import { reflect, getAllMemories, getMemoryGraph, REFLECT_SYSTEM_PROMPT, getUnanalyzedConversations, applyReflectResult } from './reflect.js';
 import { autoProcess } from './autoProcessor.js';
 import { runAutoReflect, runDeepReflect, shouldAutoReflect, runConsolidate, shouldAutoConsolidate } from './reflectDriver.js';
@@ -306,6 +307,8 @@ register(
   { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') },
   async (args) => {
     try {
+      // 周期兜底:先强制 flush 所有会话 buffer(补漏未达阈值的尾部消息)
+      flushAllBuffers();
       const r = await runDigest(charFor(args.project));
       return ok(r);
     } catch (e: any) { return err(e.message); }
