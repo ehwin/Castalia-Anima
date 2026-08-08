@@ -40,6 +40,18 @@ function ok(data) {
 function err(msg, code = 'ERROR') {
     return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: { code, message: msg } }, null, 2) }], isError: true };
 }
+// ── 可选 HTTP 健康检查(默认关闭;设 HEALTH_PORT 才监听,供容器/编排/验证探活)──
+const _healthPort = parseInt(process.env.HEALTH_PORT || '0', 10);
+if (_healthPort > 0) {
+    import('node:http').then((http) => {
+        const _h = http.createServer((_req, res) => {
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ ok: true, service: SERVER_NAME, version: SERVER_VERSION }));
+        });
+        _h.listen(_healthPort, '127.0.0.1');
+        console.error(`[health] listening on http://127.0.0.1:${_healthPort}/`);
+    }).catch((e) => console.error('[health] init failed:', e.message));
+}
 /** 人格声明行:[角色声明] 我是 <name>(charId=<charId>) [。人格设定:<persona>](persona 非空时) */
 function roleDeclaration(project) {
     const p = getPersona(project);
