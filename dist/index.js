@@ -45,6 +45,11 @@ const _healthPort = parseInt(process.env.HEALTH_PORT || '0', 10);
 if (_healthPort > 0) {
     import('node:http').then((http) => {
         const _h = http.createServer((_req, res) => {
+            if (_req.url !== '/health' && _req.url !== '/') {
+                res.statusCode = 404;
+                res.end('not found');
+                return;
+            }
             res.setHeader('Content-Type', 'application/json');
             res.end(JSON.stringify({ ok: true, service: SERVER_NAME, version: SERVER_VERSION }));
         });
