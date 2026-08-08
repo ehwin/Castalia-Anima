@@ -13,10 +13,13 @@
  *
  * 回退逻辑:isTriageConfigured() = 有 TRIAGE key 或 REFLECT key。
  */
+import crypto from 'node:crypto';
 import { callLlm, makeLlmChannel } from './reflectDriver.js';
 import { isMemType, isClosedMemType, normalizeMarkdown } from './memType.js';
 import { getSessionMemory, upsertSessionMemory, promoteToProject, deleteSessionFragments } from './store.js';
-import { normalizeProject } from './env.js';
+import { DatabaseManager } from './db.js';
+import { normalizeProject, CHAR_ID } from './env.js';
+import { embed, cosineSimilarity } from './ollama.js';
 /** triage 通道:未配置时回退 REFLECT_* 值(由 makeLlmChannel 统一处理) */
 export function triageChannel() {
     return makeLlmChannel('triage');
@@ -99,33 +102,36 @@ export async function classifyMemTypeLLM(text, project) {
 //   → sessionMemory(会话滚动状态,滚动覆盖) + promoted(长效干货晋升项目级,晋升即删)
 // ═══════════════════════════════════════════════════════════════════
 /**
- * 会话记忆维护子代理 prompt(中文,Claude 原厂渐进式反思精神):
- * ①更新会话滚动状态(当前目标/活跃问题/本会话决策)
- * ②发现长效干货(user/feedback/project/reference)→ promoted
- * ③不重复、简洁(会话记忆 < 1000 字)
- * ④只关注当前任务上下文,用户长期偏好归长效
+ * 会话记忆提取子代理 prompt(原厂化,吸收 Claude Code extract_memories
+ * sub-agent 定位 + 四类封闭类型 + 绝对禁止项;保留我们的 JSON 输出协议)。
+ * 任务:①更新会话滚动状态(sessionMemory) ②发现长效干货(promoted)。
  */
-export const INCREMENTAL_REFLECT_PROMPT = `你是会话记忆维护子代理。输入是最近对话增量 + 该会话已有的滚动记忆快照。你要维护两件事:
+export const INCREMENTAL_REFLECT_PROMPT = `You are a memory extraction sub-agent. Your sole responsibility is to extract long-term information from the recent conversation and update the memory system.
 
-【任务1:更新会话滚动状态(sessionMemory)】
+You receive a recent conversation transcript plus the existing rolling memory snapshot for this session. Maintain two things:
+① the session rolling state (sessionMemory) and ② long-term memories worth keeping (promoted).
+
+【ALLOWED MEMORY TYPES】(4 closed types, memType 必须属于其一)
+- user — User profile, developer preferences, skill level, or response style.(用户画像:偏好/技术栈/技能水平/回复风格,关于"用户是什么样的人")
+- feedback — Behavioral corrections or affirmations (negative & positive).(行为纠正或肯定,正负双向都记)
+- project — Non-code-derivable project context (deadlines, env vars, architecture rules).(项目上下文:截止时间/环境变量/架构约定等非代码可推导信息)相对时间(如下周三)必须转成绝对日期(如 2026-08-12)
+- reference — External links, Jira IDs, Swagger/API doc pointers.(外部指针:URL/Jira ID/Swagger 或 API 文档位置,只存指针不存内容副本)
+
+【ABSOLUTE PROHIBITIONS】(绝对禁止)
+- NEVER save code snippets, function definitions, file paths, or git hashes. The codebase/database itself is the Single Source of Truth.
+- NEVER save temporary debugging logs, error stack traces, or single-session task states.
+
+【任务 1:更新会话滚动状态(sessionMemory,可选)】
 - 维护本会话:当前目标 / 活跃问题 / 本会话已做出的决策
 - 用简洁的滚动要点式自然语言,控制在 1000 字以内
 - 已完成或已解决的事项从状态中移除;仍相关/进行中的保留
 - 只保留依赖本会话上下文的信息(如"正在做 X,下一步 Y")
 
-【任务2:发现长效干货(promoted)】
-- 从对话增量中提炼具有跨会话长期价值的信息,分类到 4 种封闭类型之一:
-  - user — 用户画像:偏好/技术栈/风格/人物关系洞察(关于"用户是什么样的人")
-  - feedback — 行为纠正:用户对 agent 行为的纠正或肯定(正负双向都记)
-  - project — 项目上下文:截止时间/环境约定/非代码可推导信息;相对时间(如下周三)必须转成绝对日期(如 2026-08-12)
-  - reference — 外部指针:URL/ID/文档链接,只存指针不存内容副本
+【任务 2:发现长效干货(promoted)】
+- 从对话增量中提炼具有跨会话长期价值的信息,归入上方 4 种类型之一
 - 记忆内容中的相对时间(昨天/上周/几天前/下周三)必须转成绝对日期(如 2026-08-12),否则视为模糊信息不采纳
+- 不重复:旧快照或已有记忆已包含的信息不要重复写入 sessionMemory,也不要重复 promote
 - 只关注当前任务上下文;用户长期偏好等不依赖单次会话的内容 → 归 promoted 长效
-- 不存:临时调试日志/错误栈/代码片段/文件路径/git hash/单次会话临时状态
-
-【任务3:不重复】
-- 旧快照已包含的信息不要重复写入 sessionMemory,也不要重复 promote
-- 简洁为上:sessionMemory 必须 < 1000 字
 
 【输出】只返回严格 JSON 对象,不要代码围栏,不要任何其他文字:
 {
@@ -161,6 +167,79 @@ function parseIncrementalReflection(raw) {
     return null;
 }
 /**
+ * 文本归一化:去空白/换行 + 常见标点 + 统一小写。
+ * 用于 promote 前查重(精确/包含判定)。
+ */
+export function normalizeText(text) {
+    return (text || '')
+        .toLowerCase()
+        .replace(/[\s\u3000]+/g, '')
+        .replace(/[，。、；：""''（）【】《》〈〉？！…—·,.!?;:'"()\[\]{}<>|/\\\-_*#~`+=\u3000]+/g, '')
+        .trim();
+}
+/**
+ * promote 前查重:同项目同 memType 的已有项目级记忆是否与候选重复。
+ * 三层判定(命中即 true):
+ *   ① 文本精确:归一化后相等
+ *   ② 文本包含:归一化后一方含另一方,minLen>10 且 minLen/maxLen>0.7
+ *   ③ 向量增强:候选文本读 embedding_cache 缓存向量,与 embed() 出的
+ *      promoted 向量算 cosine > 0.92 → 重复;嵌入失败/无缓存静默跳过
+ * 已有记忆排除自身来源(session_memory/auto_process/conversation_log)。
+ * 任何异常静默降级为不重复(查重失败不阻断 promote)。
+ */
+export async function isDuplicate(proj, text, memType, characterId) {
+    try {
+        const project = normalizeProject(proj);
+        const db = DatabaseManager.getInstance(project);
+        const target = normalizeText(text);
+        if (!target)
+            return false;
+        const cid = characterId || CHAR_ID;
+        const rows = db.prepare(`
+      SELECT text FROM memory
+      WHERE project = ? AND mem_type = ? AND is_active = 1
+        AND character_id = ?
+        AND COALESCE(source, '') NOT IN ('session_memory', 'auto_process', 'conversation_log')
+    `).all(project, memType, cid);
+        if (rows.length === 0)
+            return false;
+        // ① 精确 ② 包含
+        for (const row of rows) {
+            const cand = normalizeText(row.text);
+            if (!cand)
+                continue;
+            if (cand === target)
+                return true;
+            const minLen = Math.min(cand.length, target.length);
+            const maxLen = Math.max(cand.length, target.length);
+            if (minLen > 10 && (cand.includes(target) || target.includes(cand)) && minLen / maxLen > 0.7)
+                return true;
+        }
+        // ③ 向量增强:候选走 embedding_cache 缓存向量,promoted 用 embed()
+        try {
+            const targetVec = await embed(text, project);
+            for (const row of rows) {
+                try {
+                    const hash = crypto.createHash('sha256').update(row.text).digest('hex');
+                    const cached = db.prepare('SELECT embedding FROM embedding_cache WHERE text_hash = ?').get(hash);
+                    if (!cached)
+                        continue;
+                    const vec = Array.from(new Float32Array(cached.embedding.buffer, cached.embedding.byteOffset, cached.embedding.byteLength / 4));
+                    if (cosineSimilarity(targetVec, vec) > 0.92)
+                        return true;
+                }
+                catch { /* 单条向量读取失败,静默跳过 */ }
+            }
+        }
+        catch { /* embed 失败/嵌入禁用,静默跳过(文本查重兜底) */ }
+        return false;
+    }
+    catch (e) {
+        console.error('[reflect-incremental] isDuplicate 失败(静默降级):', e.message);
+        return false;
+    }
+}
+/**
  * 增量反思(渐进式临时反思)主流程:
  * 取最近 delta(最多 10 条)→ triage 通道调 LLM → 解析 → 晋升(promote+即删)→ 滚动覆盖。
  * 无 key / 解析失败 → 静默跳过(console.error),绝不影响主流程。
@@ -182,14 +261,16 @@ export async function runIncrementalReflection(project, sessionId, recentMessage
         const proj = normalizeProject(project);
         const oldSnapshot = getSessionMemory(proj, sessionId);
         const lines = recent.map(m => {
-            const who = m.role === 'user' ? '用户' : m.role === 'assistant' ? '助手' : String(m.role);
+            const who = m.role === 'user' ? 'USER' : m.role === 'assistant' ? 'ASSISTANT' : String(m.role).toUpperCase();
             return `${who}: ${(m.content || '').slice(0, 2000)}`;
         }).join('\n');
-        const userPrompt = `【会话 ID】${sessionId}
-【该会话旧滚动快照】${oldSnapshot ? `\n${oldSnapshot}` : '\n(无)'}
+        const userPrompt = `[Session ID] ${sessionId}
+[Existing session snapshot] ${oldSnapshot ? `\n${oldSnapshot}` : '\n(none)'}
 
-【最近对话增量】
-${lines}`;
+[Conversation transcript]
+<transcript>
+${lines}
+</transcript>`;
         const llm = await callLlm(INCREMENTAL_REFLECT_PROMPT, userPrompt, channel);
         if (!llm)
             return { ...base, errors: ['LLM 调用失败'] };
@@ -209,6 +290,11 @@ ${lines}`;
                 const text = typeof raw.text === 'string' ? raw.text.trim() : '';
                 if (!mtRaw || !isClosedMemType(mtRaw) || !text)
                     continue;
+                try {
+                    if (await isDuplicate(proj, text, mtRaw, characterId))
+                        continue;
+                }
+                catch { /* 查重失败不阻断,静默跳过 */ }
                 promoted.push({ memType: mtRaw, text: normalizeMarkdown(text, mtRaw) });
             }
         }
