@@ -270,13 +270,17 @@ export async function batchEmbedPending(characterId = 'airi', project) {
     const db = DatabaseManager.getInstance(project);
     const errors = [];
     // 找所有有记忆但无向量的记录(source 为 NULL 也算,修复 NULL != 'x' 恒假的坑)
+    // characterId='any' 时不按角色过滤(跨库产物如 reflect 库 character_id 为 NULL 也能补嵌入)
     const conditions = [
         'm.is_active = 1',
-        'm.character_id = ?',
-        "COALESCE(m.source, '') != 'conversation_log'",
         'm.rowid NOT IN (SELECT rowid FROM vec_memory)',
     ];
-    const params = [characterId];
+    const params = [];
+    if (characterId !== 'any') {
+        conditions.push('m.character_id = ?');
+        params.push(characterId);
+    }
+    conditions.push("COALESCE(m.source, '') != 'conversation_log'");
     if (project) {
         conditions.push('m.project = ?');
         params.push(normalizeProject(project));

@@ -887,11 +887,12 @@ register(
 
 register(
   'reflect_batch_embed', 'harness',
-  '[Internal] Batch embed all pending (un-embedded) memories. Called after reflect.',
-  { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') },
+  '[Internal] Batch embed all pending (un-embedded) memories. Called after reflect. characterId="any" embeds across all roles (e.g. reflect library).',
+  { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+    characterId: z.string().optional().describe('Character id filter (default CHAR_ID; "any" = no filter, e.g. for reflect library)') },
   async (args) => {
     try {
-      const r = await batchEmbedPending(charFor(args.project), args.project);
+      const r = await batchEmbedPending(args.characterId ?? charFor(args.project), args.project);
       return ok(r);
     } catch (e: any) { return err(e.message); }
   }

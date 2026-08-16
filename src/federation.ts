@@ -20,8 +20,12 @@ export interface FedLibrary {
 /** 解析参与联邦的库列表:本实例 + FEDERATION_DIRS 声明的外部实例 */
 export function resolveFedLibraries(ownDir: string): FedLibrary[] {
   const libs: FedLibrary[] = [];
+  const seenDirs = new Set<string>();
   const scan = (dir: string, instance: string) => {
     try {
+      const norm = path.resolve(dir);
+      if (seenDirs.has(norm)) return; // ownDir 与 FEDERATION_DIRS 同目录时去重
+      seenDirs.add(norm);
       for (const f of fs.readdirSync(dir)) {
         if (f.startsWith('project-') && f.endsWith('.sqlite')) {
           libs.push({ instance, project: f.slice('project-'.length, -'.sqlite'.length), file: path.join(dir, f) });
