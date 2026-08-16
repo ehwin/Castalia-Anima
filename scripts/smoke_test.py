@@ -8,7 +8,8 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NODE = shutil.which('node') or r"D:\system\New Folder\node.exe"  # fallback:本机 node
+NODE137 = r"D:\system\New Folder\node.exe"  # better-sqlite3/sqlite-vec 按 NODE_MODULE_VERSION 137 编译
+NODE = NODE137 if os.path.exists(NODE137) else (shutil.which('node') or NODE137)  # PATH 第一个可能是 Hermes 127,会 ABI 崩溃
 SERVER = os.path.join(ROOT, "dist", "index.js")
 
 # 继承完整系统环境(env 传自定义 dict 会完全替换,导致 node crypto 初始化崩溃)

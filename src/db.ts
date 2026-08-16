@@ -54,6 +54,11 @@ export function listProjectNames(): string[] {
     .filter(f => f.startsWith('project-') && f.endsWith('.sqlite'))
     .map(f => f.slice('project-'.length, -'.sqlite'.length));
 }
+/** 当前实例的 memory 目录(供联邦搜索/聚合层使用) */
+export function currentMemDir(): string {
+  return memDir();
+}
+
 
 // ═══════════════════════════════════════════════════════════════════
 // Schema 初始化(拆分为 全局库 / 项目库 两组)
