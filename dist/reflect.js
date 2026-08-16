@@ -12,7 +12,7 @@
  *   GET  /memory/reflect/list    — 获取所有记忆（供大模型分析）
  *   POST /memory/reflect/apply   — 应用大模型的重构指令
  */
-import { DatabaseManager } from './db.js';
+import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { saveFacts, saveMemory, batchEmbedPending } from './store.js';
 import { normalizeProject } from './env.js';
 import { isMemType, MEM_TYPES } from './memType.js';
@@ -22,16 +22,27 @@ import path from 'node:path';
  * 获取所有记忆（供大模型分析）
  */
 export function listAllMemories(characterId = 'airi', limit = 200, project) {
-    const db = DatabaseManager.getInstance(project);
     const proj = normalizeProject(project);
-    const rows = db.prepare(`
-    SELECT id, text, type, mem_type, category, tags, importance, emotional_impact,
-           subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked
-    FROM memory
-    WHERE is_active = 1 AND character_id = ? AND project = ?
-    ORDER BY importance DESC, created_at DESC
-    LIMIT ?
-  `).all(characterId, proj, limit);
+    // memdir:聚合项目全部分类库
+    const dirs = listMemTypeDirs(proj);
+    const all = [];
+    for (const mt of dirs) {
+        try {
+            const db = DatabaseManager.getInstance(proj, mt);
+            const rows = db.prepare(`
+        SELECT id, text, type, mem_type, category, tags, importance,
+               subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked
+        FROM memory
+        WHERE is_active = 1 AND character_id = ? AND project = ?
+        ORDER BY importance DESC, created_at DESC
+        LIMIT ?
+      `).all(characterId, proj, limit);
+            all.push(...rows);
+        }
+        catch { /* 单分类库失败不影响其他 */ }
+    }
+    all.sort((a, b) => (b.importance - a.importance) || String(b.created_at || '').localeCompare(String(a.created_at || '')));
+    const rows = all.slice(0, limit);
     return rows.map(r => {
         let tags = [];
         try {
@@ -49,7 +60,6 @@ export function listAllMemories(characterId = 'airi', limit = 200, project) {
             category: r.category,
             tags,
             importance: r.importance,
-            emotionalImpact: r.emotional_impact ?? 0,
             subject: r.subject,
             source: r.source,
             tier: r.tier || 'standard',

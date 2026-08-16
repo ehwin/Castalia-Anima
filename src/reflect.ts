@@ -13,7 +13,7 @@
  *   POST /memory/reflect/apply   — 应用大模型的重构指令
  */
 
-import { DatabaseManager } from './db.js';
+import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { getEmbeddingCached } from './ollama.js';
 import { saveFacts, saveMemory, reEmbedMemory, batchEmbedPending } from './store.js';
 import { normalizeProject } from './env.js';
@@ -80,16 +80,26 @@ export interface ReflectAction {
  * 获取所有记忆（供大模型分析）
  */
 export function listAllMemories(characterId: string = 'airi', limit: number = 200, project?: string): ReflectMemory[] {
-  const db = DatabaseManager.getInstance(project);
   const proj = normalizeProject(project);
-  const rows = db.prepare(`
-    SELECT id, text, type, mem_type, category, tags, importance, emotional_impact,
-           subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked
-    FROM memory
-    WHERE is_active = 1 AND character_id = ? AND project = ?
-    ORDER BY importance DESC, created_at DESC
-    LIMIT ?
-  `).all(characterId, proj, limit) as any[];
+  // memdir:聚合项目全部分类库
+  const dirs = listMemTypeDirs(proj);
+  const all: any[] = [];
+  for (const mt of dirs) {
+    try {
+      const db = DatabaseManager.getInstance(proj, mt);
+      const rows = db.prepare(`
+        SELECT id, text, type, mem_type, category, tags, importance,
+               subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked
+        FROM memory
+        WHERE is_active = 1 AND character_id = ? AND project = ?
+        ORDER BY importance DESC, created_at DESC
+        LIMIT ?
+      `).all(characterId, proj, limit) as any[];
+      all.push(...rows);
+    } catch { /* 单分类库失败不影响其他 */ }
+  }
+  all.sort((a: any, b: any) => (b.importance - a.importance) || String(b.created_at || '').localeCompare(String(a.created_at || '')));
+  const rows = all.slice(0, limit);
 
   return rows.map(r => {
     let tags: string[] = [];
@@ -106,7 +116,6 @@ export function listAllMemories(characterId: string = 'airi', limit: number = 20
     category: r.category,
     tags,
     importance: r.importance,
-    emotionalImpact: r.emotional_impact ?? 0,
     subject: r.subject,
     source: r.source,
     tier: r.tier || 'standard',
@@ -118,7 +127,6 @@ export function listAllMemories(characterId: string = 'airi', limit: number = 20
     locked: r.locked || 0,
   };
   });}
-
 /**
  * 应用大模型的重构指令
  */
