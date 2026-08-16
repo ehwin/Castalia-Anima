@@ -130,7 +130,7 @@ function initGlobalSchema(db) {
     catch (_e) { }
 }
 /** 项目库 schema:全部业务表(与旧单库一致)+ 指令表(保持原 schema) */
-function initProjectSchema(db) {
+export function initProjectSchema(db) {
     db.exec(`
     CREATE TABLE IF NOT EXISTS memory (
       id TEXT PRIMARY KEY,
