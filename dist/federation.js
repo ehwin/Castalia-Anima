@@ -21,9 +21,32 @@ export function resolveFedLibraries(ownDir) {
                 return; // ownDir 与 FEDERATION_DIRS 同目录时去重
             seenDirs.add(norm);
             for (const f of fs.readdirSync(dir)) {
+                // 旧结构 project-<name>.sqlite
                 if (f.startsWith('project-') && f.endsWith('.sqlite')) {
                     libs.push({ instance, project: f.slice('project-'.length, -'.sqlite'.length), file: path.join(dir, f) });
+                    continue;
                 }
+                // memdir 新结构 <project>/<memType>/memory.sqlite(以及 <project>/ 下的其他 *.sqlite)
+                const p = path.join(dir, f);
+                try {
+                    if (fs.statSync(p).isDirectory()) {
+                        for (const sub of fs.readdirSync(p)) {
+                            const sp = path.join(p, sub);
+                            try {
+                                if (fs.statSync(sp).isDirectory()) {
+                                    const mp = path.join(sp, 'memory.sqlite');
+                                    if (fs.existsSync(mp))
+                                        libs.push({ instance, project: f, memType: sub, file: mp });
+                                }
+                                else if (sub.endsWith('.sqlite')) {
+                                    libs.push({ instance, project: f, file: sp });
+                                }
+                            }
+                            catch { /* skip */ }
+                        }
+                    }
+                }
+                catch { /* skip */ }
             }
         }
         catch {

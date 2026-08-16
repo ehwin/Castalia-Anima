@@ -4,7 +4,7 @@
  * v5.0: skipEmbed 参数 — digest 暂不向量化，reflect 后统一 embed
  * v4.0: 去重不再丢弃，SQLite 持久化 embedding 缓存
  */
-import { DatabaseManager, generateId } from './db.js';
+import { DatabaseManager, generateId, listMemTypeDirs } from './db.js';
 import { embed, getEmbeddingCached } from './ollama.js';
 import { recordTopics } from './bias.js';
 import { CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
@@ -14,7 +14,8 @@ const CONSOLIDATE_INTERVAL = 50;
 export async function saveMemory(params) {
     if (!params.text || !params.text.trim())
         throw new Error('memory text must not be empty');
-    const db = DatabaseManager.getInstance(params.project);
+    // memdir 路由:按 memType 落对应分类库(memory/<project>/<memType>/memory.sqlite)
+    const db = DatabaseManager.getInstance(params.project, params.memType);
     const now = new Date().toISOString();
     const skipEmbed = params.skipEmbed === true;
     const project = normalizeProject(params.project);
@@ -123,19 +124,65 @@ export async function saveMemory(params) {
     }
     return record;
 }
+/** 按 id 定位记忆所在分类库(memdir 遍历),返回库连接+分类;找不到返回 null */
+function findDbByMemoryId(id, project) {
+    const proj = normalizeProject(project);
+    for (const mt of listMemTypeDirs(proj)) {
+        const db = DatabaseManager.getInstance(proj, mt);
+        if (db.prepare('SELECT id FROM memory WHERE id = ?').get(id))
+            return { db, memType: mt };
+    }
+    return null;
+}
 export function forgetMemory(id, project) {
-    const db = DatabaseManager.getInstance(project);
-    return db.prepare('UPDATE memory SET is_active = 0 WHERE id = ?').run(id).changes > 0;
+    const found = findDbByMemoryId(id, project);
+    if (!found)
+        return false;
+    return found.db.prepare('UPDATE memory SET is_active = 0 WHERE id = ?').run(id).changes > 0;
 }
 export function restoreMemory(id, project) {
-    const db = DatabaseManager.getInstance(project);
-    return db.prepare('UPDATE memory SET is_active = 1 WHERE id = ?').run(id).changes > 0;
+    const found = findDbByMemoryId(id, project);
+    if (!found)
+        return false;
+    return found.db.prepare('UPDATE memory SET is_active = 1 WHERE id = ?').run(id).changes > 0;
 }
 export async function updateMemory(id, updates) {
-    const db = DatabaseManager.getInstance(updates.project);
+    const found = findDbByMemoryId(id, updates.project);
+    if (!found)
+        return null;
+    let db = found.db;
     const existing = db.prepare('SELECT * FROM memory WHERE id = ?').get(id);
     if (!existing)
         return null;
+    // memdir 跨分类移动:memType 变更 → 复制到新分类库 + 软删原库
+    const newMt = updates.memType !== undefined ? normalizeMemType(updates.memType) : found.memType;
+    if (newMt !== found.memType) {
+        const proj = normalizeProject(updates.project);
+        const newDb = DatabaseManager.getInstance(proj, newMt);
+        const text = updates.text !== undefined ? normalizeMarkdown(updates.text, newMt) : existing.text;
+        const tags = updates.tags !== undefined ? JSON.stringify(updates.tags) : (existing.tags ?? '[]');
+        const now = new Date().toISOString();
+        newDb.prepare(`
+      INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+    `).run(id, text, proj, existing.session_id, updates.type !== undefined ? updates.type : existing.type, newMt, updates.category !== undefined ? updates.category : existing.category, updates.subcategory !== undefined ? updates.subcategory : existing.subcategory, tags, updates.importance !== undefined ? updates.importance : existing.importance, updates.characterId !== undefined ? updates.characterId : existing.character_id, updates.source !== undefined ? updates.source : existing.source, updates.subject !== undefined ? updates.subject : existing.subject, updates.tier !== undefined ? updates.tier : existing.tier, existing.created_at, now, now, existing.accessed_count, existing.reference_count ?? 0);
+        // 向量一并搬移(若有)
+        try {
+            const srcVec = db.prepare('SELECT embedding FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id = ?)').get(id);
+            if (srcVec) {
+                newDb.prepare('DELETE FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id = ?)').run(id);
+                const rowInfo = newDb.prepare('SELECT rowid FROM memory WHERE id = ?').get(id);
+                newDb.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(BigInt(rowInfo.rowid), srcVec.embedding);
+            }
+        }
+        catch { /* 无向量/损坏忽略 */ }
+        db.prepare('UPDATE memory SET is_active = 0 WHERE id = ?').run(id);
+        db = newDb;
+        // 已处理 memType 变更,移除以免重复 SET
+        if (updates.memType !== undefined)
+            delete updates.memType;
+        return db.prepare('SELECT * FROM memory WHERE id = ?').get(id);
+    }
     const fields = [];
     const values = [];
     let text;
@@ -164,10 +211,6 @@ export async function updateMemory(id, updates) {
     if (updates.tags !== undefined) {
         fields.push('tags = ?');
         values.push(JSON.stringify(updates.tags));
-    }
-    if (updates.emotionalImpact !== undefined) {
-        fields.push('emotional_impact = ?');
-        values.push(updates.emotionalImpact);
     }
     if (updates.importance !== undefined) {
         fields.push('importance = ?');
@@ -432,7 +475,6 @@ export function upsertSessionMemory(project, sessionId, content, memType) {
  */
 export function promoteToProject(project, items, characterId) {
     const cid = characterId || CHAR_ID;
-    const db = DatabaseManager.getInstance(project);
     const proj = normalizeProject(project);
     const now = new Date().toISOString();
     const ids = [];
@@ -441,6 +483,8 @@ export function promoteToProject(project, items, characterId) {
         const text = typeof item.text === 'string' ? item.text.trim() : '';
         if (!mt || !text)
             continue;
+        // memdir 路由:反思晋升产物按 memType 落对应分类库
+        const db = DatabaseManager.getInstance(proj, mt);
         const md = normalizeMarkdown(text, mt);
         const dup = db.prepare(`
       SELECT id FROM memory

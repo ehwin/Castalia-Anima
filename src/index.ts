@@ -19,7 +19,7 @@ import { z } from 'zod';
 import { searchMemory, searchFacts, getRecentMemories, searchMemoryAcross } from './search.js';
 import { saveMemory, forgetMemory, updateMemory, saveConversationTurn, cleanupExpiredMemories, batchEmbedPending } from './store.js';
 import { consolidate } from './consolidate.js';
-import { DatabaseManager, listProjectNames, safeFilePart, currentMemDir, sweepExpiredSessionMemories } from './db.js';
+import { DatabaseManager, listProjectNames, listMemTypeDirs, safeFilePart, currentMemDir, sweepExpiredSessionMemories } from './db.js';
 import { getCategoryTree } from './category.js';
 import { runDigest, getRecentConversations, maybeDigest } from './digest.js';
 import { flushAllBuffers } from './buffer.js';
@@ -556,16 +556,32 @@ register(
   { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') },
   async (args) => {
     try {
-      const db = DatabaseManager.getInstance(args.project);
       const proj = normalizeProject(args.project);
-      const total = db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=?').get(charFor(args.project), proj) as any;
+      // memdir:聚合项目全部分类库统计
+      let total = 0;
+      const byCategory: Record<string, number> = {};
+      const bySource: Record<string, number> = {};
+      const byMemType: Record<string, number> = {};
+      for (const mt of listMemTypeDirs(proj)) {
+        const db = DatabaseManager.getInstance(proj, mt);
+        total += (db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=?').get(CHAR_ID, proj) as any).c;
+        for (const r of db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY category').all(CHAR_ID, proj) as any[]) {
+          byCategory[r.category] = (byCategory[r.category] || 0) + r.c;
+        }
+        for (const r of db.prepare('SELECT source,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY source').all(CHAR_ID, proj) as any[]) {
+          bySource[r.source] = (bySource[r.source] || 0) + r.c;
+        }
+        for (const r of db.prepare('SELECT mem_type,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY mem_type').all(CHAR_ID, proj) as any[]) {
+          byMemType[r.mem_type] = (byMemType[r.mem_type] || 0) + r.c;
+        }
+      }
       return ok({
         op: 'stats',
-        total: total.c,
-        byCategory: db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY category').all(charFor(args.project), proj),
-        bySource: db.prepare('SELECT source,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY source').all(charFor(args.project), proj),
-        byMemType: db.prepare('SELECT mem_type,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY mem_type').all(charFor(args.project), proj),
-        characterId: charFor(args.project),
+        total,
+        byCategory: Object.entries(byCategory).map(([category, c]) => ({ category, c })),
+        bySource: Object.entries(bySource).map(([source, c]) => ({ source, c })),
+        byMemType: Object.entries(byMemType).map(([mem_type, c]) => ({ mem_type, c })),
+        characterId: CHAR_ID,
         project: proj,
       });
     } catch (e: any) { return err(e.message, 'STATS_FAILED'); }
@@ -665,8 +681,15 @@ register(
   },
   async (args) => {
     try {
-      const db = DatabaseManager.getInstance(args.project);
-      const row = db.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(args.id) as any;
+      // memdir:按 id 遍历项目分类库定位
+      const proj = normalizeProject(args.project);
+      let db: any = null;
+      let row: any = null;
+      for (const mt of listMemTypeDirs(proj)) {
+        const d = DatabaseManager.getInstance(proj, mt);
+        const r = d.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(args.id) as any;
+        if (r) { db = d; row = r; break; }
+      }
       if (!row) return err('memory not found: ' + args.id, 'NOT_FOUND');
       // v1.3: 访问一次 → 热度 +1(配合热度升格:accessed_count ≥ 阈值自动升 tier)
       db.prepare('UPDATE memory SET accessed_count = accessed_count + 1, last_accessed_at = ? WHERE id = ?')
@@ -965,7 +988,6 @@ register(
           byId[key].facts = r.c;
         }
         const projects = Object.values(byId).sort((a: any, b: any) => (b.memories + b.facts) - (a.memories + a.facts));
-        projects.forEach((p: any) => { const pp = getPersona(p.project); p.persona = { charId: pp.charId, name: pp.name, persona: pp.persona }; });
         return ok({
           op: 'project_list',
           count: projects.length,
@@ -987,15 +1009,19 @@ register(
       const projects: any[] = [];
       for (const name of listProjectNames()) {
         try {
-          const db = DatabaseManager.getInstance(name);
-          const mem = db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1').get() as any;
-          const facts = db.prepare('SELECT COUNT(*) as c FROM facts WHERE is_active=1').get() as any;
+          // memdir:聚合项目全部分类库统计
+          let mem = 0;
+          let facts = 0;
+          for (const mt of listMemTypeDirs(name)) {
+            const db = DatabaseManager.getInstance(name, mt);
+            mem += (db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1').get() as any).c;
+            try { facts += (db.prepare('SELECT COUNT(*) as c FROM facts WHERE is_active=1').get() as any).c; } catch {}
+          }
           projects.push({
             project: name,
-            memories: mem.c,
-            facts: facts.c,
+            memories: mem,
+            facts,
             createdAt: regMap.get(name) || null,
-            persona: getPersona(name),
           });
         } catch { /* 打不开的库跳过 */ }
       }
