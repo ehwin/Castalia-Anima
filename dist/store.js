@@ -310,39 +310,43 @@ export async function reEmbedMemory(id) {
 export async function batchEmbedPending(characterId = 'airi', project) {
     if (!isEmbedEnabled())
         return { embedded: 0, errors: ['embedding disabled (EMBED_MODE=none)'] };
-    const db = DatabaseManager.getInstance(project);
+    const proj = normalizeProject(project);
+    let embedded = 0;
     const errors = [];
-    // 找所有有记忆但无向量的记录(source 为 NULL 也算,修复 NULL != 'x' 恒假的坑)
-    // characterId='any' 时不按角色过滤(跨库产物如 reflect 库 character_id 为 NULL 也能补嵌入)
-    const conditions = [
-        'm.is_active = 1',
-        'm.rowid NOT IN (SELECT rowid FROM vec_memory)',
-    ];
-    const params = [];
-    if (characterId !== 'any') {
-        conditions.push('m.character_id = ?');
-        params.push(characterId);
-    }
-    conditions.push("COALESCE(m.source, '') != 'conversation_log'");
-    if (project) {
-        conditions.push('m.project = ?');
-        params.push(normalizeProject(project));
-    }
-    const pending = db.prepare(`
+    // memdir:遍历项目全部分类库补嵌入
+    for (const mt of listMemTypeDirs(proj)) {
+        const db = DatabaseManager.getInstance(proj, mt);
+        // 找所有有记忆但无向量的记录(source 为 NULL 也算,修复 NULL != 'x' 恒假的坑)
+        // characterId='any' 时不按角色过滤(跨库产物如 reflect 库 character_id 为 NULL 也能补嵌入)
+        const conditions = [
+            'm.is_active = 1',
+            'm.rowid NOT IN (SELECT rowid FROM vec_memory)',
+        ];
+        const params = [];
+        if (characterId !== 'any') {
+            conditions.push('m.character_id = ?');
+            params.push(characterId);
+        }
+        conditions.push("COALESCE(m.source, '') != 'conversation_log'");
+        if (project) {
+            conditions.push('m.project = ?');
+            params.push(proj);
+        }
+        const pending = db.prepare(`
     SELECT m.id, m.text, m.rowid FROM memory m
     WHERE ${conditions.join(' AND ')}
     ORDER BY m.created_at ASC
     LIMIT 200
   `).all(...params);
-    let embedded = 0;
-    for (const row of pending) {
-        try {
-            const vec = new Float32Array(await embed(row.text, project));
-            db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(BigInt(row.rowid), vec);
-            embedded++;
-        }
-        catch (e) {
-            errors.push(`${row.id}: ${e.message}`);
+        for (const row of pending) {
+            try {
+                const vec = new Float32Array(await embed(row.text, project));
+                db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(BigInt(row.rowid), vec);
+                embedded++;
+            }
+            catch (e) {
+                errors.push(`${row.id}: ${e.message}`);
+            }
         }
     }
     return { embedded, errors };
