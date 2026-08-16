@@ -135,7 +135,7 @@ function initGlobalSchema(db: Database.Database) {
 }
 
 /** 项目库 schema:全部业务表(与旧单库一致)+ 指令表(保持原 schema) */
-function initProjectSchema(db: Database.Database) {
+export function initProjectSchema(db: Database.Database) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS memory (
       id TEXT PRIMARY KEY,
