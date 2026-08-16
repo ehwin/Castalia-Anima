@@ -12,8 +12,10 @@
  *  - 系统提示仿写 reflectDriver.ts 的 REFLECT_SYSTEM_PROMPT 严格 JSON 输出风格
  */
 import Database from 'better-sqlite3';
+import * as sqliteVec from 'sqlite-vec';
+import path from 'node:path';
 import { resolveFedLibraries } from './federation.js';
-import { currentMemDir, DatabaseManager, generateId } from './db.js';
+import { currentMemDir, DatabaseManager, generateId, initProjectSchema } from './db.js';
 import { makeLlmChannel, callLlm } from './reflectDriver.js';
 import { normalizeMemType } from './memType.js';
 const DEFAULT_MAX_TOTAL = 300;
@@ -238,10 +240,24 @@ export async function runReflectAll(opts) {
         return { ...base, ok: true };
     }
     // 6. 写入 project=reflect(查重跳过)
+    // 总库位置:env REFLECT_DIR 指定(统一多实例的总库到同一目录,如 /path/to/run/memory),默认本实例 memory 目录
     let saved = 0;
     let skipped = 0;
+    let reflectDb = null;
     try {
-        const db = DatabaseManager.getInstance('reflect');
+        const reflectDir = process.env.REFLECT_DIR ? path.resolve(process.env.REFLECT_DIR) : null;
+        if (reflectDir) {
+            reflectDb = new Database(path.join(reflectDir, 'project-reflect.sqlite'));
+            try {
+                sqliteVec.load(reflectDb);
+            }
+            catch { }
+            initProjectSchema(reflectDb);
+        }
+        else {
+            reflectDb = DatabaseManager.getInstance('reflect');
+        }
+        const db = reflectDb;
         const existsStmt = db.prepare('SELECT 1 FROM memory WHERE is_active = 1 AND text = ?');
         const insertStmt = db.prepare(`
       INSERT INTO memory (id, text, project, type, mem_type, category, tags, importance, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
@@ -267,6 +283,15 @@ export async function runReflectAll(opts) {
     }
     catch (e) {
         base.errors.push(`打开/写入 reflect 总库失败: ${e.message}`);
+    }
+    finally {
+        // 独立连接(REFLECT_DIR 模式)用完即关;连接池模式由 DatabaseManager 管理
+        if (reflectDb && process.env.REFLECT_DIR) {
+            try {
+                reflectDb.close();
+            }
+            catch { }
+        }
     }
     base.llm.skipped = skipped;
     base.llm.saved = saved;
