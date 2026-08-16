@@ -388,8 +388,12 @@ export async function reEmbedMemory(id: string): Promise<boolean> {
  */
 export async function batchEmbedPending(characterId: string = 'airi', project?: string): Promise<{ embedded: number; errors: string[] }> {
   if (!isEmbedEnabled()) return { embedded: 0, errors: ['embedding disabled (EMBED_MODE=none)'] };
-  const db = DatabaseManager.getInstance(project);
+  const proj = normalizeProject(project);
+  let embedded = 0;
   const errors: string[] = [];
+  // memdir:遍历项目全部分类库补嵌入
+  for (const mt of listMemTypeDirs(proj)) {
+    const db = DatabaseManager.getInstance(proj, mt);
 
   // 找所有有记忆但无向量的记录(source 为 NULL 也算,修复 NULL != 'x' 恒假的坑)
   // characterId='any' 时不按角色过滤(跨库产物如 reflect 库 character_id 为 NULL 也能补嵌入)
@@ -405,7 +409,7 @@ export async function batchEmbedPending(characterId: string = 'airi', project?: 
   conditions.push("COALESCE(m.source, '') != 'conversation_log'");
   if (project) {
     conditions.push('m.project = ?');
-    params.push(normalizeProject(project));
+    params.push(proj);
   }
   const pending = db.prepare(`
     SELECT m.id, m.text, m.rowid FROM memory m
@@ -414,7 +418,6 @@ export async function batchEmbedPending(characterId: string = 'airi', project?: 
     LIMIT 200
   `).all(...params) as any[];
 
-  let embedded = 0;
   for (const row of pending) {
     try {
       const vec = new Float32Array(await embed(row.text, project));
@@ -423,6 +426,7 @@ export async function batchEmbedPending(characterId: string = 'airi', project?: 
     } catch (e: any) {
       errors.push(`${row.id}: ${e.message}`);
     }
+  }
   }
   return { embedded, errors };
 }
