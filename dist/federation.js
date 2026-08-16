@@ -13,8 +13,13 @@ import Database from 'better-sqlite3';
 /** 解析参与联邦的库列表:本实例 + FEDERATION_DIRS 声明的外部实例 */
 export function resolveFedLibraries(ownDir) {
     const libs = [];
+    const seenDirs = new Set();
     const scan = (dir, instance) => {
         try {
+            const norm = path.resolve(dir);
+            if (seenDirs.has(norm))
+                return; // ownDir 与 FEDERATION_DIRS 同目录时去重
+            seenDirs.add(norm);
             for (const f of fs.readdirSync(dir)) {
                 if (f.startsWith('project-') && f.endsWith('.sqlite')) {
                     libs.push({ instance, project: f.slice('project-'.length, -'.sqlite'.length), file: path.join(dir, f) });
