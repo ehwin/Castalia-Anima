@@ -10,12 +10,17 @@
  * - 重启不丢失，重复文本 0ms 返回
  * - 暴露 getEmbeddingCached() 供 store.ts 使用
  */
-import { DatabaseManager } from './db.js';
+import { DatabaseManager, VEC_DIM } from './db.js';
 import { isEmbedEnabled } from './env.js';
 import crypto from 'node:crypto';
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://127.0.0.1:11434'; // Ollama embed server (standard port)
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'yuan-embedding-2.0-zh'; // 1024 dim
 const EMBEDDING_API_KEY = process.env.EMBEDDING_API_KEY || ''; // set → OpenAI-compatible /embeddings mode
+// 嵌入服务超时(秒):防止嵌入服务挂起导致 saveMemory/search 永久阻塞
+const EMBED_TIMEOUT_MS = (() => {
+    const v = parseInt(process.env.EMBED_TIMEOUT_MS || '30000', 10);
+    return Number.isFinite(v) && v > 0 ? v : 30000;
+})();
 // 内存级 LRU 缓存（热数据，<1ms）
 const memCache = new Map();
 const MEM_CACHE_MAX = 200;
@@ -45,11 +50,13 @@ export async function embed(text, project) {
     catch { }
     // 3. 调嵌入服务(API key 模式 → OpenAI 兼容 /embeddings;否则 Ollama /api/embed)
     let vector;
+    const signal = AbortSignal.timeout(EMBED_TIMEOUT_MS);
     if (EMBEDDING_API_KEY) {
         const resp = await fetch(`${OLLAMA_URL}/embeddings`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${EMBEDDING_API_KEY}` },
             body: JSON.stringify({ model: EMBEDDING_MODEL, input: text }),
+            signal,
         });
         if (!resp.ok) {
             throw new Error(`Embed API failed: ${resp.status} ${await resp.text()}`);
@@ -58,8 +65,9 @@ export async function embed(text, project) {
         if (data.error)
             throw new Error(`Embed API error: ${data.error}`);
         const item = data.data?.[0];
-        if (!item?.embedding)
-            throw new Error(`Embed API: no embedding in response`);
+        if (!item || !Array.isArray(item.embedding) || item.embedding.length === 0) {
+            throw new Error('Embed API: no embedding in response');
+        }
         vector = item.embedding;
     }
     else {
@@ -67,12 +75,23 @@ export async function embed(text, project) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ model: EMBEDDING_MODEL, input: text }),
+            signal,
         });
         if (!resp.ok) {
             throw new Error(`Ollama embed failed: ${resp.status} ${await resp.text()}`);
         }
         const data = (await resp.json());
-        vector = data.embeddings[0];
+        if (data.error)
+            throw new Error(`Ollama embed error: ${data.error}`);
+        const vec = data.embeddings?.[0];
+        if (!Array.isArray(vec) || vec.length === 0) {
+            throw new Error('Ollama embed: empty/invalid embedding response');
+        }
+        vector = vec;
+    }
+    // 维度护栏:向量维度与 vec 表(VEC_DIM)不符时给出清晰报错,而非后续 sqlite-vec 隐式失败
+    if (vector.length !== VEC_DIM) {
+        throw new Error(`Embedding dimension mismatch: got ${vector.length}, expected ${VEC_DIM}`);
     }
     // 写入缓存
     setMemCache(text, vector);
