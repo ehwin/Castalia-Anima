@@ -11,7 +11,7 @@
  *
  * 保留通用版能力:按项目分库隔离(project 过滤)、memType 用途过滤、向量/文本回退。
  */
-import { DatabaseManager } from './db.js';
+import { DatabaseManager, listProjectNames } from './db.js';
 import { embed } from './ollama.js';
 import { normalizeProject, isEmbedEnabled } from './env.js';
 import { computeBiasBoost } from './bias.js';
@@ -111,6 +111,41 @@ export async function searchMemory(options) {
     }
     updateAccessed(db, unique.slice(0, topK));
     return unique.slice(0, topK);
+}
+/**
+ * 跨库搜索(多项目合并,2026-08-16) — 显式语义:
+ * 调用方明确指定要搜哪些库(projects),引擎不做隐式合并/共享魔法;
+ * 互通规则由上层决定(接口先行)。结果按 score 降序,每行 project 标注来源库。
+ * projects=['*'] 或 ['all'] → 本实例全部库(扫描 memory 目录)。
+ */
+export async function searchMemoryAcross(options) {
+    const raw = (options.projects ?? []).map(x => (x ?? '').trim()).filter(Boolean);
+    const targetProjects = raw.length === 0
+        ? [normalizeProject(options.project)]
+        : raw.some(x => x === '*' || x === 'all')
+            ? listProjectNames()
+            : raw.map(normalizeProject);
+    const perProject = Math.max(3, Math.ceil((options.topK ?? 10) * 1.5));
+    const all = [];
+    for (const proj of targetProjects) {
+        try {
+            const r = await searchMemory({ ...options, project: proj, topK: perProject });
+            all.push(...r);
+        }
+        catch {
+            // 单个库失败不影响其他库
+        }
+    }
+    all.sort((a, b) => b.score - a.score);
+    const seen = new Set();
+    const unique = [];
+    for (const r of all) {
+        if (seen.has(r.id))
+            continue;
+        seen.add(r.id);
+        unique.push(r);
+    }
+    return unique.slice(0, options.topK ?? 10);
 }
 // ═══════════════════════════════════════════════════════════════════
 // 标签搜索 — 从 query 提取关键词，SQL tag LIKE 匹配
