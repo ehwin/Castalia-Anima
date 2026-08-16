@@ -377,6 +377,10 @@ function textFallbackSearch(
   const conds: string[] = [`m.is_active = 1`, `m.project = ?`, `(${likeConditions})`];
   const params: any[] = [project, ...likeParams];
   if (options.memType) { conds.push('m.mem_type = ?'); params.push(options.memType); }
+  if (options.type) { conds.push('m.type = ?'); params.push(options.type); }
+  if (options.category) { conds.push('m.category = ?'); params.push(options.category); }
+  if (options.characterId) { conds.push('m.character_id = ?'); params.push(options.characterId); }
+  if (options.subject) { conds.push('m.subject = ?'); params.push(options.subject); }
 
   const rows = db.prepare(`
     SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,

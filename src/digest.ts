@@ -14,7 +14,7 @@
  * 事件驱动：有新对话才跑，间隔 ≥ 1 分钟
  */
 
-import { DatabaseManager } from './db.js';
+import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { normalizeProject } from './env.js';
 import { flushVadQueue, regressToBaseline, isNightTime } from './emotion.js';
 import { cleanupExpiredMemories } from './store.js';
@@ -60,12 +60,17 @@ export async function runDigest(characterId: string = 'airi'): Promise<DigestRes
   // 2. 清理过期临时记忆
   result.cleaned = cleanupExpiredMemories();
 
-  // 3. 恢复被误标记的 critical 记忆
-  const lostCritical = db.prepare(`
-    UPDATE memory SET is_active = 1
-    WHERE tier = 'critical' AND is_active = 0
-  `).run();
-  result.restored = lostCritical.changes;
+  // 3. 恢复被误标记的 critical 记忆(memdir:遍历全部分类库)
+  let restored = 0;
+  for (const mt of listMemTypeDirs(normalizeProject(undefined))) {
+    const mdb = DatabaseManager.getInstance(undefined, mt);
+    const lostCritical = mdb.prepare(`
+      UPDATE memory SET is_active = 1
+      WHERE tier = 'critical' AND is_active = 0
+    `).run();
+    restored += lostCritical.changes;
+  }
+  result.restored = restored;
 
   return result;
 }

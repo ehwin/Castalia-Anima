@@ -225,8 +225,8 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>): P
     const tags = updates.tags !== undefined ? JSON.stringify(updates.tags) : (existing.tags ?? '[]');
     const now = new Date().toISOString();
     newDb.prepare(`
-      INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       text,
@@ -242,8 +242,10 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>): P
       updates.source !== undefined ? updates.source : existing.source,
       updates.subject !== undefined ? updates.subject : existing.subject,
       updates.tier !== undefined ? updates.tier : existing.tier,
+      existing.expires_at ?? null,
       existing.created_at, now, now,
       existing.accessed_count, existing.reference_count ?? 0,
+      existing.locked ?? 0,
     );
     // 向量一并搬移(若有)
     try {
@@ -339,26 +341,38 @@ export async function saveConversationTurn(
 const HEAT_PROMOTE_THRESHOLD = parseInt(process.env.HEAT_PROMOTE_THRESHOLD || '5', 10);
 
 export function promoteByAccess(project?: string): number {
-  const db = DatabaseManager.getInstance(project);
+  const proj = normalizeProject(project);
   const now = new Date().toISOString();
-  const r = db.prepare(`
-    UPDATE memory SET tier = 'standard', updated_at = ?
-    WHERE tier = 'temporary' AND accessed_count >= ? AND is_active = 1
-  `).run(now, HEAT_PROMOTE_THRESHOLD);
-  if (r.changes > 0) console.error(`[memory] heat promote: ${r.changes} temporary → standard`);
-  return r.changes;
+  let total = 0;
+  // memdir:遍历项目全部分类库(临时记忆可能落在任意 memType 分类库)
+  for (const mt of listMemTypeDirs(proj)) {
+    const db = DatabaseManager.getInstance(proj, mt);
+    const r = db.prepare(`
+      UPDATE memory SET tier = 'standard', updated_at = ?
+      WHERE tier = 'temporary' AND accessed_count >= ? AND is_active = 1
+    `).run(now, HEAT_PROMOTE_THRESHOLD);
+    total += r.changes;
+  }
+  if (total > 0) console.error(`[memory] heat promote: ${total} temporary → standard`);
+  return total;
 }
 
 export function cleanupExpiredMemories(project?: string): number {
-  const db = DatabaseManager.getInstance(project);
+  const proj = normalizeProject(project);
   const now = new Date().toISOString();
   // 先升格再清理:被反复访问的 temporary 不该被清
   promoteByAccess(project);
-  const result = db.prepare(`
-    UPDATE memory SET is_active = 0, updated_at = ?
-    WHERE tier = 'temporary' AND expires_at IS NOT NULL AND expires_at < ? AND is_active = 1
-  `).run(now, now);
-  return result.changes;
+  let total = 0;
+  // memdir:遍历项目全部分类库清理过期 temporary(避免只清 general 漏掉 user/feedback/project/reference)
+  for (const mt of listMemTypeDirs(proj)) {
+    const db = DatabaseManager.getInstance(proj, mt);
+    const result = db.prepare(`
+      UPDATE memory SET is_active = 0, updated_at = ?
+      WHERE tier = 'temporary' AND expires_at IS NOT NULL AND expires_at < ? AND is_active = 1
+    `).run(now, now);
+    total += result.changes;
+  }
+  return total;
 }
 
 /**

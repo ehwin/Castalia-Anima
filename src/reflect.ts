@@ -174,13 +174,14 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           const tx = db.transaction(() => {
             // 旧记忆全部软删除 + 删向量
             // v5.1: LLM 可能返回短ID前缀，用 LIKE 匹配
+            // locked=1 永久锁定记忆绝不软删(护栏在代码层兜底,防止 LLM 幻觉破坏锁定记忆)
             for (const id of action.sourceIds!) {
-              const src = db.prepare('SELECT id FROM memory WHERE id LIKE ?').get(id + '%') as any;
+              const src = db.prepare('SELECT id FROM memory WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').get(id + '%') as any;
               if (src) receipt.rowsAffected++;
-              else { receipt.status = 'failed'; receipt.reason = `source not found: ${id}`; }
-              db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ?').run(id + '%');
+              else { receipt.status = 'failed'; receipt.reason = `source not found or locked: ${id}`; }
+              db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').run(id + '%');
               try {
-                db.prepare('DELETE FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id LIKE ?)').run(id + '%');
+                db.prepare('DELETE FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id LIKE ? AND (locked IS NULL OR locked = 0))').run(id + '%');
               } catch {}
             }
           });
@@ -214,10 +215,10 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             receipt.status = 'failed'; receipt.reason = 'need targetId and fragments';
             continue;
           }
-          // 软删除旧记忆（v5.1: LIKE 匹配短ID）
-          const _splitSrc = db.prepare('SELECT id FROM memory WHERE id LIKE ?').get(action.targetId + '%') as any;
-          if (!_splitSrc) { receipt.status = 'failed'; receipt.reason = `target not found: ${action.targetId}`; }
-          db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ?').run(action.targetId + '%');
+          // 软删除旧记忆（v5.1: LIKE 匹配短ID;locked=1 永久锁定不删）
+          const _splitSrc = db.prepare('SELECT id FROM memory WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').get(action.targetId + '%') as any;
+          if (!_splitSrc) { receipt.status = 'failed'; receipt.reason = `target not found or locked: ${action.targetId}`; }
+          db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').run(action.targetId + '%');
           // 插入碎片
           const { saveMemory } = await import('./store.js');
           for (const frag of action.fragments) {
@@ -309,7 +310,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             updates.push('text = ?'); values.push(action.newText.trim());
           }
           if (updates.length > 0) {
-            const _recR = db.prepare(`UPDATE memory SET ${updates.join(', ')}, updated_at = ? WHERE id LIKE ?`)
+            const _recR = db.prepare(`UPDATE memory SET ${updates.join(', ')}, updated_at = ? WHERE id LIKE ? AND (locked IS NULL OR locked = 0)`)
               .run(...values, new Date().toISOString(), tid + '%');
             receipt.rowsAffected = _recR.changes;
             if (_recR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found: ${tid}`; }
@@ -369,9 +370,9 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             receipt.status = 'failed'; receipt.reason = 'need targetId';
             continue;
           }
-          const _delR = db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ?').run(action.targetId + '%');
+          const _delR = db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').run(action.targetId + '%');
           receipt.rowsAffected = _delR.changes;
-          if (_delR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found: ${action.targetId}`; }
+          if (_delR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found or locked: ${action.targetId}`; }
           if (receipt.status === 'applied') result.applied++;
           result.details.push(`delete: ${action.targetId}`);
           break;
@@ -383,10 +384,10 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             receipt.status = 'failed'; receipt.reason = 'need targetId and delta';
             continue;
           }
-          const _boR = db.prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance + ?)) WHERE id LIKE ?')
+          const _boR = db.prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance + ?)) WHERE id LIKE ? AND (locked IS NULL OR locked = 0)')
             .run(action.delta, action.targetId + '%');
           receipt.rowsAffected = _boR.changes;
-          if (_boR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found: ${action.targetId}`; }
+          if (_boR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found or locked: ${action.targetId}`; }
           if (receipt.status === 'applied') result.applied++;
           result.details.push(`boost: ${action.targetId} += ${action.delta}`);
           break;
@@ -398,10 +399,10 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             receipt.status = 'failed'; receipt.reason = 'need targetId and delta';
             continue;
           }
-          const _deR = db.prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance - ?)) WHERE id LIKE ?')
+          const _deR = db.prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance - ?)) WHERE id LIKE ? AND (locked IS NULL OR locked = 0)')
             .run(action.delta, action.targetId + '%');
           receipt.rowsAffected = _deR.changes;
-          if (_deR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found: ${action.targetId}`; }
+          if (_deR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found or locked: ${action.targetId}`; }
           if (receipt.status === 'applied') result.applied++;
           result.details.push(`decay: ${action.targetId} -= ${action.delta}`);
           break;

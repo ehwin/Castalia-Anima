@@ -1,4 +1,4 @@
-﻿/**
+/**
  * AIRI Memory Database Manager
  * SQLite + sqlite-vec with Alaya-compatible schema
  *
@@ -52,6 +52,20 @@ function isLegacyMode(): boolean {
   return !!legacyDbPath();
 }
 
+/** 判断某目录是否是 memdir 项目目录(含 memory.sqlite 或任意 .sqlite),排除 receipts 等元目录 */
+function dirLooksLikeProject(p: string): boolean {
+  try {
+    for (const f of fs.readdirSync(p)) {
+      if (f.endsWith('.sqlite')) return true;
+      const sub = path.join(p, f);
+      try {
+        if (fs.statSync(sub).isDirectory() && fs.existsSync(path.join(sub, 'memory.sqlite'))) return true;
+      } catch { /* skip */ }
+    }
+  } catch { /* unreadable */ }
+  return false;
+}
+
 /** 扫描 memory 目录下已有的项目(目录或旧 project-<name>.sqlite),返回项目名 */
 export function listProjectNames(): string[] {
   const dir = memDir();
@@ -59,7 +73,9 @@ export function listProjectNames(): string[] {
   const names = new Set<string>();
   for (const f of fs.readdirSync(dir)) {
     const p = path.join(dir, f);
-    try { if (fs.statSync(p).isDirectory()) names.add(f); } catch { /* skip */ }
+    try {
+      if (fs.statSync(p).isDirectory() && dirLooksLikeProject(p)) names.add(f);
+    } catch { /* skip */ }
   }
   // 兼容旧结构 project-<name>.sqlite(迁移脚本运行前仍可识别)
   for (const f of fs.readdirSync(dir)) {
@@ -402,16 +418,22 @@ export class DatabaseManager {
  *    而非 SQLite datetime('now','-N days')(两种格式文本序不一致)。
  */
 export function sweepExpiredSessionMemories(project?: string): number {
-  const db = DatabaseManager.getInstance(project);
   const ttlDays = (() => {
     const v = parseInt(process.env.SESSION_MEMORY_TTL_DAYS || '7', 10);
     return Number.isFinite(v) && v > 0 ? v : 7; // 非法值兜底 7
   })();
   const cutoff = new Date(Date.now() - ttlDays * 86400000).toISOString();
-  const r = db.prepare(`
-    DELETE FROM memory
-    WHERE source = 'session_memory' AND session_id IS NOT NULL AND is_active = 1
-      AND updated_at < ?
-  `).run(cutoff);
-  return r.changes;
+  const proj = normalizeProject(project);
+  let total = 0;
+  // memdir:会话滚动记忆也可能落在任意 memType 分类库,逐库清扫
+  for (const mt of listMemTypeDirs(proj)) {
+    const db = DatabaseManager.getInstance(proj, mt);
+    const r = db.prepare(`
+      DELETE FROM memory
+      WHERE source = 'session_memory' AND session_id IS NOT NULL AND is_active = 1
+        AND updated_at < ?
+    `).run(cutoff);
+    total += r.changes;
+  }
+  return total;
 }
