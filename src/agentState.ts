@@ -1,5 +1,5 @@
 /**
- * AIRI Agent State — real-time self-state management
+ * Anima Agent State — real-time self-state management
  *
  * Inspired by 千问's architecture suggestion:
  * - Short-term state in memory (not persisted to long-term memory)
@@ -173,7 +173,7 @@ class AgentState {
     else moodDesc = '心情不好';
 
     let lines = [
-      `[AIRI 当前状态]`,
+      `[Anima 当前状态]`,
       `情绪指数：${mood >= 0 ? '+' : ''}${mood.toFixed(1)}（${moodDesc}）`,
       `精力值：${energy}/100`,
     ];

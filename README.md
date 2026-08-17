@@ -1,231 +1,165 @@
-# AIRI Memory Fused
+# Castalia Anima — Emotional Memory Server (MCP)
 
-融合版记忆系统 — cognitive-memory 底座 + Alaya 评分 + SynaBun 优点 + User Learning + Bias Layer + Agent State
+**The emotional variant of [Castalia](https://github.com/ehwin/Castalia).** Same architecture (SQLite + sqlite-vec local memory, zero API cost), with a personality layer on top: agent self-state (mood/desire/energy), bias layer, user learning, and emotion-weighted search.
 
-## 核心能力
+Neutral core stays in Castalia; Anima feeds emotional features back upstream — the two repos cross-pollinate.
 
-| 能力 | 来源 | 说明 |
-|------|------|------|
-| SQLite + sqlite-vec 存储 | cognitive-memory | 本地向量存储，零 API 成本 |
-| Alaya 评分公式 | AIRI Alaya | 1.2×similarity + 0.3×time_decay + 0.1×emotion |
-| 情感权重 | AIRI Alaya | -10 到 +10，影响搜索排名 |
-| 时间衰减 | AIRI Alaya | 艾宾浩斯遗忘曲线，30天半衰期 |
-| 访问频率加权 | SynaBun Smart Relevance | 常访问的记忆排名更高 |
-| 偏见层 | AIRI #2005 | 话题权重累积，影响检索优先级 |
-| 角色 ID | AIRI 设计 | 多角色支持 |
-| 层级分类 | SynaBun Categories | 11 个预设分类，可自定义 |
-| 图关系 | cognitive-memory | 记忆之间建立关联 |
-| 记忆整合 | cognitive-memory + SynaBun | 去重、时间衰减淘汰、每 50 次自动触发 |
-| Agent 自我状态 | 千问建议 | 情绪/欲望/精力，指数衰减聚合 |
-| User Learning | SynaBun Directive 5 | 自动观察用户沟通模式和兴趣 |
-| 嵌入模型 | qwen3-embedding:8b | 4096维，中文 MTEB 71.58 |
-| 权重可调 | 本次改进 | 环境变量控制评分权重 |
+> 📖 详细技术设计见 [docs/TECHNICAL.md](docs/TECHNICAL.md)。
 
-## 快速开始
+---
+
+## Quick Start
+
+### 1. Build + verify
 
 ```bash
-cd D:\system\AIRI\memory\memory-fused
 npm install
-cd node_modules\better-sqlite3 && npx --yes node-gyp rebuild && cd ..\..
-npx tsc
-node dist/index.js
+npm run build                  # tsc → dist/index.js
 ```
 
-## MCP 配置
+### 2. Start the embedding service (first load ~30-60s)
+
+Any Ollama-compatible embed service works — point `OLLAMA_URL` + `EMBEDDING_MODEL` at it.
+
+```bat
+scripts\start-embed.bat
+```
+
+### 3. Configure LLM channels (optional but recommended)
+
+Copy `memory/config.json` from the template (or create it) to wire the two LLM channels:
+
+```json
+{
+  "triage":   { "llm_url": "https://api.deepseek.com/v1", "api_key": "sk-...", "model": "deepseek-chat" },
+  "reflect":  { "llm_url": "https://api.deepseek.com/v1", "api_key": "sk-...", "model": "deepseek-chat" },
+  "embedding": { "mode": "ollama", "ollama_url": "http://127.0.0.1:11436", "model": "yuan-embedding-2.0-zh" }
+}
+```
+
+`triage` is optional — unset values fall back to `reflect`. Without any LLM key, the server still works fully as a read/write memory store; only reflection/triage are skipped.
+
+> 🔐 **Recommended: encrypt API keys** (not plaintext in config.json) — three-channel keys via `scripts/keygen.js` into `memory/keys.enc` (AES-256-GCM, key in `memory/keys.key`, both git-ignored).
+
+### 4. Connect from your MCP client
 
 ```json
 {
   "mcpServers": {
-    "airi-memory": {
+    "anima-memory": {
       "command": "node",
-      "args": ["D:\\system\\AIRI\\memory\\memory-fused\\dist\\index.js"],
+      "args": ["<path>/dist/index.js"],
       "env": {
-        "OLLAMA_URL": "http://127.0.0.1:11434",
-        "EMBEDDING_MODEL": "qwen3-embedding:8b",
-        "MEMORY_DB_PATH": "D:\\system\\AIRI\\memory\\memory-fused\\memory.sqlite",
-        "WEIGHT_SIMILARITY": "1.2",
-        "WEIGHT_TIME_DECAY": "0.3",
-        "WEIGHT_EMOTION": "0.1",
-        "HALF_LIFE_DAYS": "30"
+        "OLLAMA_URL": "http://127.0.0.1:11436",
+        "EMBEDDING_MODEL": "yuan-embedding-2.0-zh",
+        "MEMORY_DB_DIR": "<path>/memory",
+        "CHAR_ID": "anima"
       }
     }
   }
 }
 ```
 
-## MCP 工具列表（32 个）
+---
 
-### 记忆 CRUD（8 个）
-| 工具 | 说明 |
-|------|------|
-| `memory_save` | 存储记忆（情感权重、角色ID、分类、subject、agentMood） |
-| `memory_search` | 搜索记忆（Alaya 评分 + 访问频率 + 偏见加权 + profile 预设） |
-| `memory_update` | 更新记忆（内容变化自动重新嵌入） |
-| `memory_forget` | 软删除记忆 |
-| `memory_restore` | 恢复已删除记忆 |
-| `memory_relate` | 建立记忆之间的图关系 |
-| `memory_list` | 列出记忆（支持 subject/type/category 过滤） |
-| `memory_digest` | 记忆系统统计 |
+## Features
 
-### 记忆管理（4 个）
-| 工具 | 说明 |
-|------|------|
-| `memory_consolidate` | 记忆整合（去重、衰减、淘汰，每 50 次 save 自动触发 + 6 小时定时） |
-| `category_list` | 列出分类（树形结构） |
-| `category_create` | 创建新分类 |
-| `category_delete` | 删除分类（自动迁移关联记忆） |
+### Personality layer (Anima-only)
 
-### 记忆高级操作（2 个）
-| 工具 | 说明 |
-|------|------|
-| `memory_brainstorm` | 多轮 recall（直接/相邻/情感/里程碑/广域 5 轮） |
-| `memory_session_digest` | 会话摘要存储 |
+| Capability | Description |
+|-----------|-------------|
+| **Agent self-state** | mood / desire / energy with exponential-decay aggregation; `|value|>=7` auto-persisted |
+| **Emotion-weighted search** | Alaya scoring: 1.2×similarity + 0.3×time_decay + 0.1×emotion |
+| **Time decay** | Ebbinghaus forgetting curve, 30-day half-life |
+| **Bias layer** | topic weight accumulation, affects retrieval priority |
+| **User Learning** | observes user communication patterns & interests |
+| **Character ID** | multi-character support |
+| **Agent prompt injection** | `[Anima current state]` + `[user profile]` + `[interest trends]` bundle |
 
-### Agent 自我状态（4 个）
-| 工具 | 说明 |
-|------|------|
-| `agent_mood` | 报告/更新情绪（\|值\|>=7 自动持久化） |
-| `agent_desire` | 设置当前想做的事 |
-| `agent_status` | 获取完整状态 + prompt 注入字符串 |
-| `agent_energy` | 补充精力值 |
+### Core memory (shared with Castalia)
 
-### 偏见层（2 个）
-| 工具 | 说明 |
-|------|------|
-| `bias_record` | 记录话题提及，累积权重 |
-| `bias_status` | 查看话题偏见 |
+- **memdir storage**: `memory/<project>/<memType>/memory.sqlite` — per-project, user/feedback/project/reference/general folders
+- 29+ MCP tools: memory CRUD, search (profiles: quick/balanced/deep), instructions (3 layers), reflection (auto/deep/analyze/apply), consolidation, conversation automation (auto_process/digest)
+- **Injection-ready context**: `memory_context` → 三层指令 + recent + related + facts + session rolling state, with Memory Snapshot Warning
+- **Progressive reflection**: session buffer (5 turns / 4000 tokens dual threshold) + digest cycle
+- **3D Star Map**: three-layer galaxy layout (project → memType → fixed-orbit nodes), semantic clusters, directional bridges, starfield background
 
-### User Learning（2 个）
-| 工具 | 说明 |
-|------|------|
-| `user_observe` | 观察用户消息，学习沟通模式 |
-| `user_profile` | 获取用户画像 |
-
-### 上下文构建（1 个）
-| 工具 | 说明 |
-|------|------|
-| `context_build` | 一键构建完整上下文 |
-
-### Hook 系统（7 个）⭐
-| 工具 | 时机 | 替代 SynaBun |
-|------|------|-------------|
-| `hook_session_start` | 对话开始 | SessionStart |
-| `hook_prompt_submit` | 每条用户消息 | UserPromptSubmit |
-| `hook_pre_compact` | 压缩前 | PreCompact |
-| `hook_stop` | 对话结束 | Stop |
-| `hook_pre_tool_use` | 工具调用前 | PreToolUse |
-| `hook_post_tool_use` | 工具调用后 | PostToolUse |
-| `hook_post_plan` | 退出计划模式 | PostToolUse Plan |
-
-## 评分公式
+## Scoring formula
 
 ```
-最终得分 = (1.2 × 语义相似度 + 0.3 × 时间衰减 + 0.1 × 情感权重) × 重要性系数 × 访问频率加权 × 偏见加权
-
-其中：
-- 语义相似度：qwen3-embedding:8b cosine similarity (4096维)
-- 时间衰减：e^(-t/S)，S = HALF_LIFE_DAYS / ln(2)
-- 情感权重：|emotionalImpact| / 10
-- 重要性系数：0.5 + importance（范围 0.5 ~ 1.5）
-- 访问频率加权：1 + min(0.5, log2(1 + accessCount) × 0.1)
-- 偏见加权：1 + min(0.5, topicWeight × 0.05)
+score = (1.2 × similarity + 0.3 × time_decay + 0.1 × emotion) × importance × access_freq × bias
 ```
 
-## 预设分类
+where:
+- similarity — embedding cosine (any Ollama-compatible /api/embed)
+- time_decay — e^(-t/S), S = HALF_LIFE_DAYS / ln(2)
+- emotion — |emotionalImpact| / 10
+- importance — 0.5 + importance (0.5 ~ 1.5)
+- access_freq — 1 + min(0.5, log2(1 + accessCount) × 0.1)
+- bias — 1 + min(0.5, topicWeight × 0.05)
+
+## Preset categories
 
 ```
-├ entity       — 实体记忆（人物、地点、物品）
-│ └ relationship — 关系记忆
-├ episodic     — 事件记忆（发生了什么）
-│ ├ conversation — 对话记忆
-│ ├ emotional    — 情感经历 ⭐
-│ └ milestone    — 成长里程碑 ⭐
-├ preference   — 偏好记忆（用户喜好和习惯）
-└ semantic     — 事实记忆（知识和关系）
-  ├ identity     — 身份信息
-  └ knowledge    — 知识事实
+├ entity       — entity memories (people, places, things)
+│ └ relationship — relationship memories
+├ episodic     — event memories
+│ ├ conversation — dialog memories
+│ ├ emotional    — emotional experiences ⭐
+│ └ milestone    — growth milestones ⭐
+├ preference   — user preferences and habits
+└ semantic     — factual knowledge
+  ├ identity     — identity info
+  └ knowledge    — knowledge facts
 ```
 
-## Prompt 注入输出示例
+## File structure
 
 ```
-[AIRI 当前状态]
-情绪指数：+4.5（心情不错）
-精力值：100/100
-当前想法：想研究一下新的嵌入模型
-最近经历：被夸奖了、有趣的问题、有点无聊
-
-[用户画像]
-交流风格：喜欢简短回复
-平均回复长度：45字
-语言偏好：主要用中文
-交互次数：12
-常聊话题：AI(8)、记忆系统(5)、模型(3)
-
-[兴趣倾向] ai(8.5)、记忆(5.2)、模型(3.1)
-```
-
-## 文件结构
-
-```
-memory/memory-fused/
 ├ src/
-│   index.ts         — MCP 服务器入口（22 个工具）
-│   db.ts            — SQLite 数据库管理
-│   ollama.ts        — Ollama embedding 客户端
-│   store.ts         — 记忆存储 + 自动话题记录 + 自动整合
-│   search.ts        — Alaya 评分搜索 + 偏见加权
-│   category.ts      — 层级分类管理
-│   consolidate.ts   — 记忆整合
-│   agentState.ts    — Agent 自我状态（情绪/欲望/精力）
-│   bias.ts          — 偏见层（话题权重累积）
-│   userLearning.ts  — 用户学习（沟通模式观察）
-├ dist/              — 编译输出
-├ memory.sqlite      — SQLite 数据库
+│   index.ts         — MCP server entry (29+ tools)
+│   db.ts            — SQLite + memdir database manager
+│   ollama.ts        — embedding client (per-project isolation)
+│   store.ts         — memory store + dedup + auto consolidation
+│   search.ts        — Alaya scoring search + bias weighting
+│   category.ts      — hierarchical category management
+│   consolidate.ts   — memory consolidation
+│   agentState.ts    — agent self-state (mood/desire/energy)  [Anima]
+│   bias.ts          — bias layer (topic weight accumulation) [Anima]
+│   emotion.ts       — emotion extraction                      [Anima]
+│   userLearning.ts  — user communication pattern learning     [Anima]
+├ dist/              — compiled output
+├ memory/            — DB files (memdir layout)
 ├ package.json
 ├ tsconfig.json
 └ README.md
 ```
 
-## 环境变量
+## Environment variables
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `OLLAMA_URL` | http://127.0.0.1:11434 | Ollama API 地址 |
-| `EMBEDDING_MODEL` | qwen3-embedding:8b | 嵌入模型名 |
-| `MEMORY_DB_PATH` | ./memory.sqlite | 数据库路径 |
-| `WEIGHT_SIMILARITY` | 1.2 | 语义相似度权重 |
-| `WEIGHT_TIME_DECAY` | 0.3 | 时间衰减权重 |
-| `WEIGHT_EMOTION` | 0.1 | 情感权重 |
-| `HALF_LIFE_DAYS` | 30 | 时间衰减半衰期（天） |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OLLAMA_URL` | http://127.0.0.1:11436 | embedding API endpoint |
+| `EMBEDDING_MODEL` | yuan-embedding-2.0-zh | embedding model name |
+| `MEMORY_DB_DIR` | ./memory | memdir root for per-project/per-type DBs |
+| `CHAR_ID` | default | character/agent identity for multi-char support |
+| `WEIGHT_SIMILARITY` | 1.2 | similarity weight |
+| `WEIGHT_TIME_DECAY` | 0.3 | time-decay weight |
+| `WEIGHT_EMOTION` | 0.1 | emotion weight |
+| `HALF_LIFE_DAYS` | 30 | time-decay half-life (days) |
 
-## 搜索预设 (Search Profiles)
+## Search profiles
 
-| 预设 | topK | minScore | 用途 |
-|------|------|----------|------|
-| `quick` | 3 | 0.6 | 快速回忆，只返回高相关结果 |
-| `balanced` | 5 | 0.3 | 默认，平衡精度和覆盖面 |
-| `deep` | 10 | 0.1 | 深度回忆，找更多关联记忆 |
+| Profile | topK | minScore | Use |
+|---------|------|----------|-----|
+| `quick` | 3 | 0.6 | fast recall, high precision |
+| `balanced` | 5 | 0.3 | default, balanced |
+| `deep` | 10 | 0.1 | deep recall, more related |
 
-使用方式：`memory_search({ query: "...", profile: "deep" })`
+## Credits & Upstream
 
-## Hook 系统迁移策略
+- **[Castalia](https://github.com/ehwin/Castalia)** — the neutral core this project builds on; the two repos cross-pollinate (Anima feeds emotional features upstream, Castalia keeps the neutral core stable)
+- **cognitive-memory** (Apache-2.0) — schema & vector KNN concepts (code heavily rewritten)
+- **Claude Code** (Anthropic) — closed memory types, MEMORY.md index, progressive session maintenance patterns (re-implemented in SQLite)
 
-当前记忆系统的工具层（25 个 MCP 工具）是**标准 MCP 协议**，与宿主松耦合。
-Hook 触发机制建议分阶段实现：
-
-| 阶段 | 方案 | 迁移成本 |
-|------|------|---------|
-| **当前** | 角色卡系统提示写绑定指令（LLM 自己调用工具） | 零（纯提示词） |
-| **短期** | 独立 Node.js 服务监听 AIRI 事件（WebSocket/IPC） | 低（工具层不变） |
-| **长期** | 等 AIRI 官方 Alaya 框架出来后集成 | 低（只改触发层，工具不变） |
-
-**关键原则**：业务逻辑（memory_save/search/brainstorm 等）在 MCP 工具层，
-触发机制（什么时候调用）在宿主层。迁移时只改触发层，不改工具层。
-
-## 依赖
-
-- Node.js 22+
-- Ollama（本地运行 qwen3-embedding:8b）
-- better-sqlite3（native 编译）
-- sqlite-vec
+License: MIT, see `LICENSE`.

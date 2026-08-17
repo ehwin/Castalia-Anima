@@ -1,5 +1,5 @@
 /**
- * AIRI Memory Database Manager
+ * Memory Database Manager
  * SQLite + sqlite-vec with Alaya-compatible schema
  *
  * v6.0: 单库 → 按项目分库(物理隔离)

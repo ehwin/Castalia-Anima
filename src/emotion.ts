@@ -57,7 +57,7 @@ export interface DecayedVAD {
 // Constants
 // ═══════════════════════════════════════════════════════════════════
 
-/** AIRI 人格基线 — "sharp, resourceful, no-nonsense" */
+/** Anima 人格基线 — "sharp, resourceful, no-nonsense" */
 export const AIRI_BASELINE: PersonalityBaseline = {
   vad: { valence: 0.4, arousal: 0.3, dominance: 0.6 },
   traits: {

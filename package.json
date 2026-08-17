@@ -1,7 +1,7 @@
 {
-  "name": "airi-memory-fused",
+  "name": "castalia-anima",
   "version": "1.0.0",
-  "description": "AIRI Memory MCP Server — cognitive-memory base + Alaya scoring + character layer",
+  "description": "Castalia Anima — emotional memory MCP server: Castalia core + agent state, bias layer, user learning, emotion-weighted search",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
