@@ -1,5 +1,5 @@
 /**
- * AIRI Memory Category Manager
+ * Memory Category Manager
  * Hierarchical categories inspired by SynaBun
  */
 import { DatabaseManager } from './db.js';

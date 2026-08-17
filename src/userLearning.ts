@@ -1,5 +1,5 @@
 /**
- * AIRI User Learning — observe and remember user communication patterns
+ * User Learning — observe and remember user communication patterns
  *
  * Inspired by SynaBun Directive 5: autonomously observes user communication
  * patterns, preferences, and behavioral singularity across sessions.
