@@ -59,9 +59,9 @@ export function shouldAutoReflect(charId = 'airi', project) {
     // 最近一次反思时间(source='reflect_summary',按 project 过滤)
     const last = db.prepare(`
     SELECT created_at FROM memory
-    WHERE source = 'reflect_summary' AND character_id = ? AND project = ?
+    WHERE source = 'reflect_summary' AND project = ?
     ORDER BY created_at DESC LIMIT 1
-  `).get(charId, proj);
+  `).get(proj);
     const lastTime = last?.created_at ? new Date(last.created_at).getTime() : null;
     const hoursSince = lastTime === null
         ? Number.POSITIVE_INFINITY // 从未反思 → 视为超时,满足时间条件
@@ -76,8 +76,8 @@ export function shouldAutoReflect(charId = 'airi', project) {
     const cnt = db.prepare(`
     SELECT COUNT(*) as c FROM memory
     WHERE is_active = 1 AND source = 'conversation_log'
-      AND character_id = ? AND project = ? AND created_at > ?
-  `).get(charId, proj, since);
+      AND project = ? AND created_at > ?
+  `).get(proj, since);
     const count = cnt?.c ?? 0;
     if (count <= MIN_UNANALYZED) {
         return { should: false, reason: `未分析对话 ${count} 条,未超 ${MIN_UNANALYZED}` };

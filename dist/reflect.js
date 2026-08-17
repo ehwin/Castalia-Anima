@@ -33,10 +33,10 @@ export function listAllMemories(characterId = 'airi', limit = 200, project) {
         SELECT id, text, type, mem_type, category, tags, importance,
                subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked
         FROM memory
-        WHERE is_active = 1 AND character_id = ? AND project = ?
+        WHERE is_active = 1 AND project = ?
         ORDER BY importance DESC, created_at DESC
         LIMIT ?
-      `).all(characterId, proj, limit);
+      `).all(proj, limit);
             all.push(...rows);
         }
         catch { /* 单分类库失败不影响其他 */ }
@@ -503,9 +503,9 @@ limit = 30, project) {
     if (!since) {
         const lastReflect = db.prepare(`
       SELECT created_at FROM memory
-      WHERE source = 'reflect_summary' AND character_id = ? AND project = ?
+      WHERE source = 'reflect_summary' AND project = ?
       ORDER BY created_at DESC LIMIT 1
-    `).get(characterId, proj);
+    `).get(proj);
         since = lastReflect?.created_at || new Date(0).toISOString();
     }
     return db.prepare(`
@@ -513,12 +513,11 @@ limit = 30, project) {
     FROM memory
     WHERE is_active = 1
       AND source = 'conversation_log'
-      AND character_id = ?
       AND project = ?
       AND created_at > ?
     ORDER BY created_at ASC
     LIMIT ?
-  `).all(characterId, proj, since, limit);
+  `).all(proj, since, limit);
 }
 /**
  * 应用大模型反思结果

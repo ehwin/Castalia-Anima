@@ -19,8 +19,8 @@ import { flushVadQueue } from './emotion.js';
 import { cleanupExpiredMemories } from './store.js';
 const MIN_DIGEST_GAP_MS = 60 * 1000;
 let lastDigestTime = 0;
-export async function runDigest(characterId = 'airi') {
-    const db = DatabaseManager.getInstance();
+export async function runDigest(characterId = 'airi', project) {
+    const db = DatabaseManager.getInstance(project);
     const result = {
         success: true,
         vadUpdated: false,
@@ -43,35 +43,41 @@ export async function runDigest(characterId = 'airi') {
     catch (e) {
         result.errors.push('VAD flush: ' + e.message);
     }
-    // 2. 清理过期临时记忆
-    result.cleaned = cleanupExpiredMemories();
-    // 3. 恢复被误标记的 critical 记忆(memdir:遍历全部分类库)
+    // 2. 清理过期临时记忆(memdir:遍历项目全部分类库)
+    result.cleaned = cleanupExpiredMemories(project);
+    // 3. 恢复被误标记的 critical 记忆(memdir:遍历项目全部分类库)
+    const proj = normalizeProject(project);
     let restored = 0;
-    for (const mt of listMemTypeDirs(normalizeProject(undefined))) {
-        const mdb = DatabaseManager.getInstance(undefined, mt);
-        const lostCritical = mdb.prepare(`
-      UPDATE memory SET is_active = 1
-      WHERE tier = 'critical' AND is_active = 0
-    `).run();
-        restored += lostCritical.changes;
+    for (const mt of listMemTypeDirs(proj)) {
+        try {
+            const mdb = DatabaseManager.getInstance(proj, mt);
+            const lostCritical = mdb.prepare(`
+        UPDATE memory SET is_active = 1
+        WHERE tier = 'critical' AND is_active = 0
+      `).run();
+            restored += lostCritical.changes;
+        }
+        catch (e) {
+            result.errors.push('restore critical: ' + e.message);
+        }
     }
     result.restored = restored;
     return result;
 }
-export function maybeDigest(characterId = 'airi') {
+export function maybeDigest(characterId = 'airi', project) {
     const now = Date.now();
     if (now - lastDigestTime < MIN_DIGEST_GAP_MS)
         return null;
-    const db = DatabaseManager.getInstance();
+    const db = DatabaseManager.getInstance(project);
     const unanalyzed = db.prepare(`
     SELECT COUNT(*) as c FROM memory
     WHERE is_active = 1 AND source = 'conversation_log'
-      AND character_id = ? AND last_accessed_at = created_at
-  `).get(characterId)?.c || 0;
+      AND last_accessed_at = created_at
+  `).get()?.c || 0;
     if (unanalyzed === 0)
         return null;
     lastDigestTime = now;
-    return runDigest(characterId);
+    return runDigest(characterId, project);
 }
 export function getRecentConversations(characterId, hoursBack = 24, limit = 50, project) {
     const db = DatabaseManager.getInstance(project);
@@ -80,8 +86,8 @@ export function getRecentConversations(characterId, hoursBack = 24, limit = 50, 
     return db.prepare(`
     SELECT id, text, created_at, importance
     FROM memory WHERE is_active = 1
-      AND source = 'conversation_log' AND character_id = ? AND project = ?
+      AND source = 'conversation_log' AND project = ?
       AND created_at > ?
     ORDER BY created_at DESC LIMIT ?
-  `).all(characterId, proj, since, limit);
+  `).all(proj, since, limit);
 }
