@@ -84,9 +84,9 @@ export function shouldAutoReflect(charId: string = 'airi', project?: string): Re
   // 最近一次反思时间(source='reflect_summary',按 project 过滤)
   const last = db.prepare(`
     SELECT created_at FROM memory
-    WHERE source = 'reflect_summary' AND character_id = ? AND project = ?
+    WHERE source = 'reflect_summary' AND project = ?
     ORDER BY created_at DESC LIMIT 1
-  `).get(charId, proj) as any;
+  `).get(proj) as any;
   const lastTime = last?.created_at ? new Date(last.created_at).getTime() : null;
 
   const hoursSince = lastTime === null
@@ -104,8 +104,8 @@ export function shouldAutoReflect(charId: string = 'airi', project?: string): Re
   const cnt = db.prepare(`
     SELECT COUNT(*) as c FROM memory
     WHERE is_active = 1 AND source = 'conversation_log'
-      AND character_id = ? AND project = ? AND created_at > ?
-  `).get(charId, proj, since) as any;
+      AND project = ? AND created_at > ?
+  `).get(proj, since) as any;
   const count = cnt?.c ?? 0;
 
   if (count <= MIN_UNANALYZED) {

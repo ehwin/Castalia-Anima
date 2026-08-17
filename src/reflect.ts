@@ -91,10 +91,10 @@ export function listAllMemories(characterId: string = 'airi', limit: number = 20
         SELECT id, text, type, mem_type, category, tags, importance,
                subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked
         FROM memory
-        WHERE is_active = 1 AND character_id = ? AND project = ?
+        WHERE is_active = 1 AND project = ?
         ORDER BY importance DESC, created_at DESC
         LIMIT ?
-      `).all(characterId, proj, limit) as any[];
+      `).all(proj, limit) as any[];
       all.push(...rows);
     } catch { /* 单分类库失败不影响其他 */ }
   }
@@ -534,9 +534,9 @@ export function getUnanalyzedConversations(
   if (!since) {
     const lastReflect = db.prepare(`
       SELECT created_at FROM memory
-      WHERE source = 'reflect_summary' AND character_id = ? AND project = ?
+      WHERE source = 'reflect_summary' AND project = ?
       ORDER BY created_at DESC LIMIT 1
-    `).get(characterId, proj) as any;
+    `).get(proj) as any;
     since = lastReflect?.created_at || new Date(0).toISOString();
   }
 
@@ -545,12 +545,11 @@ export function getUnanalyzedConversations(
     FROM memory
     WHERE is_active = 1
       AND source = 'conversation_log'
-      AND character_id = ?
       AND project = ?
       AND created_at > ?
     ORDER BY created_at ASC
     LIMIT ?
-  `).all(characterId, proj, since, limit) as any[];
+  `).all(proj, since, limit) as any[];
 }
 
 export interface ReflectResult {

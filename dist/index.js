@@ -73,10 +73,17 @@ function roleDeclaration(project) {
 function memorySnapshotWarn(createdAt) {
     if (!createdAt)
         return null;
-    const diffDays = Math.floor((Date.now() - new Date(createdAt).getTime()) / 86400000);
+    const d = new Date(createdAt);
+    const diffDays = Math.floor((Date.now() - d.getTime()) / 86400000);
     if (diffDays < 1)
         return null;
-    const dateText = new Date(createdAt).toISOString().slice(0, 10);
+    let dateText;
+    try {
+        dateText = d.toISOString().slice(0, 10);
+    }
+    catch {
+        return null;
+    }
     return `> ⚠️ [Memory Snapshot Warning] 该记忆记录于 ${dateText}(约 ${diffDays} 天前),属于历史快照,引用前请以最新对话/代码为准`;
 }
 // ═══════════════════════════════════════════════════════════════════
@@ -149,6 +156,7 @@ register('memory_search', 'agent', 'Search past memories using tag-first then ve
             query: args.query,
             count: r.length,
             results: r.map(m => ({
+                project: m.project,
                 id: m.id,
                 text: m.text.length > 200 ? m.text.substring(0, 200) + '…' : m.text,
                 truncated: m.text.length > 200,
@@ -287,7 +295,7 @@ register('auto_process', 'harness', '[Internal] Process a conversation turn: sav
         const cid = args.characterId || charFor(args.project);
         const r = await autoProcess({ userMessage: args.userMessage, assistantMessage: args.assistantMessage, characterId: cid, moodValue: args.moodValue, moodReason: args.moodReason, sessionId: args.sessionId, project: args.project });
         // Trigger event-driven digest
-        maybeDigest(cid)?.catch(() => { });
+        maybeDigest(cid, args.project)?.catch(() => { });
         return ok(r);
     }
     catch (e) {
@@ -297,7 +305,7 @@ register('auto_process', 'harness', '[Internal] Process a conversation turn: sav
 register('digest_run', 'harness', '[Internal] Run the digest cycle: flush VAD queue, cleanup expired memories, restore lost critical memories.', { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') }, async (args) => {
     try {
         flushAllBuffers(); // 周期兜底:强制 flush 所有会话 buffer(补漏未达阈值的尾部消息)
-        const r = await runDigest(charFor(args.project));
+        const r = await runDigest(charFor(args.project), args.project);
         return ok(r);
     }
     catch (e) {
@@ -379,10 +387,10 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         const cognitiveCats = ['decision', 'mistake'];
         const cognitives = db.prepare(`
         SELECT text, category, importance, created_at FROM memory
-        WHERE is_active = 1 AND character_id = ? AND project = ?
+        WHERE is_active = 1 AND project = ?
           AND (category IN ('decision','mistake') OR tags LIKE '%pattern%')
         ORDER BY created_at DESC LIMIT 9
-      `).all(charFor(args.project), proj);
+      `).all(proj);
         // 4. 关键事实(高置信度)
         const facts = db.prepare(`
         SELECT subject, predicate, object, confidence FROM facts
@@ -393,11 +401,11 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         const indexRows = db.prepare(`
         SELECT id, mem_type, substr(text, 1, 150) AS summary, length(text) AS full_len
         FROM memory
-        WHERE is_active = 1 AND character_id = ? AND project = ?
+        WHERE is_active = 1 AND project = ?
           AND mem_type IN ('user','feedback','project','reference')
         ORDER BY updated_at DESC
         LIMIT 10
-      `).all(charFor(args.project), proj);
+      `).all(proj);
         const indexLayer = indexRows.map((row) => {
             const s = row.summary || '';
             return {
@@ -499,14 +507,14 @@ register('stats_get', 'admin', 'Get memory system statistics: total count, by ca
         const byMemType = {};
         for (const mt of listMemTypeDirs(proj)) {
             const db = DatabaseManager.getInstance(proj, mt);
-            total += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=?').get(CHAR_ID, proj).c;
-            for (const r of db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY category').all(CHAR_ID, proj)) {
+            total += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(proj).c;
+            for (const r of db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? GROUP BY category').all(proj)) {
                 byCategory[r.category] = (byCategory[r.category] || 0) + r.c;
             }
-            for (const r of db.prepare('SELECT source,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY source').all(CHAR_ID, proj)) {
+            for (const r of db.prepare('SELECT source,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? GROUP BY source').all(proj)) {
                 bySource[r.source] = (bySource[r.source] || 0) + r.c;
             }
-            for (const r of db.prepare('SELECT mem_type,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY mem_type').all(CHAR_ID, proj)) {
+            for (const r of db.prepare('SELECT mem_type,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? GROUP BY mem_type').all(proj)) {
                 byMemType[r.mem_type] = (byMemType[r.mem_type] || 0) + r.c;
             }
         }
@@ -708,8 +716,8 @@ register('memory_index', 'agent', 'Lightweight memory index (corresponds to Clau
         const db = DatabaseManager.getInstance(args.project);
         const proj = normalizeProject(args.project);
         const limit = Math.min(args.limit ?? 20, 100);
-        const conds = ['is_active = 1', 'character_id = ?', 'project = ?'];
-        const params = [charFor(args.project), proj];
+        const conds = ['is_active = 1', 'project = ?'];
+        const params = [proj];
         if (args.memType) {
             conds.push('mem_type = ?');
             params.push(args.memType);

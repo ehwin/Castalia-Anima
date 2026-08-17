@@ -4,6 +4,8 @@
  * 去重完全交给大模型 reflect 接口做语义判断，consolidate 只做纯规则维护：
  * - Phase 1: sigmoid 时间衰减 → 旧记忆自动降权，低于阈值软删除
  * - Phase 2: reference_count 升华 → 被反复引用的记忆重要性提升
+ *
+ * v1.10: findSimilarCandidates — 记忆整合(Memory Consolidator)的向量预筛候选。
  */
 import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { cosineSimilarity } from './ollama.js';
