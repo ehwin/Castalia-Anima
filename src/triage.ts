@@ -17,6 +17,9 @@ import { callLlm, makeLlmChannel, LlmChannel } from './reflectDriver.js';
 import { isMemType, isClosedMemType, normalizeMarkdown, MemType } from './memType.js';
 import { getSessionMemory, upsertSessionMemory, promoteToProject, deleteSessionFragments } from './store.js';
 import { normalizeProject } from './env.js';
+import { embed, cosineSimilarity } from './ollama.js';
+import { createHash } from 'node:crypto';
+import { DatabaseManager } from './db.js';
 
 /** triage 通道:未配置时回退 REFLECT_* 值(由 makeLlmChannel 统一处理) */
 export function triageChannel(): LlmChannel {
@@ -180,6 +183,66 @@ export interface IncrementalReflectionResult {
   errors: string[];
 }
 
+/** 归一化:去空白/换行/常见标点,统一小写(文本查重用) */
+function normalizeText(s: string): string {
+  return (s || '')
+    .toLowerCase()
+    .replace(/[\s.,!?;:()\[\]{}"'<>`~\-_=+\/\\|@#$%^&*。，、！？；：…]/g, '');
+}
+
+/**
+ * 长效干货查重(仅同项目):
+ * ① 文本查重:归一化相等→true;一方包含另一方且 minLen>10 且 minLen/maxLen>0.7→true
+ * ② 向量增强:候选从 embedding_cache 按 text_hash 读缓存向量,与 embed() 后的 promoted
+ *    文本算 cosineSimilarity>0.92→true;embed 失败/无缓存→跳过(文本查重兜底)
+ * 任何异常 → 返回 false(不阻断晋升)。
+ */
+export async function isDuplicate(proj: string, text: string, memType: string): Promise<boolean> {
+  const hasVec = typeof embed === 'function' && typeof cosineSimilarity === 'function';
+  try {
+    const candidates = DatabaseManager.getInstance(proj).prepare(`
+      SELECT text FROM memory
+      WHERE is_active = 1 AND mem_type = ? AND project = ?
+        AND COALESCE(source, '') NOT IN ('conversation_log', 'auto_process', 'session_memory')
+    `).all(memType, proj) as any[];
+    if (!candidates || candidates.length === 0) return false;
+
+    // ① 文本查重
+    const nText = normalizeText(text);
+    for (const row of candidates) {
+      const cand = row?.text;
+      if (typeof cand !== 'string') continue;
+      const nCand = normalizeText(cand);
+      if (nCand.length === 0) continue;
+      if (nText === nCand) return true;
+      const minLen = Math.min(nText.length, nCand.length);
+      const maxLen = Math.max(nText.length, nCand.length);
+      if (minLen > 10 && (nText.includes(nCand) || nCand.includes(nText)) && minLen / maxLen > 0.7) {
+        return true;
+      }
+    }
+
+    // ② 向量增强(embed/无缓存失败 → 跳过,文本查重兜底)
+    if (!hasVec) return false;
+    const db = DatabaseManager.getInstance(proj);
+    const queryVec = await embed(text, proj);
+    for (const row of candidates) {
+      const cand = row?.text;
+      if (typeof cand !== 'string') continue;
+      const hash = createHash('sha256').update(cand).digest('hex');
+      const cached = db.prepare('SELECT embedding FROM embedding_cache WHERE text_hash = ?').get(hash) as any;
+      if (!cached?.embedding) continue;
+      const candVec = Array.from(new Float32Array(
+        cached.embedding.buffer, cached.embedding.byteOffset, cached.embedding.byteLength / 4,
+      ));
+      if (cosineSimilarity(queryVec, candVec) > 0.92) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * 增量反思(渐进式临时反思)主流程:
  * 取最近 delta(最多 10 条)→ triage 通道调 LLM → 解析 → 晋升(promote+即删)→ 滚动覆盖。
@@ -226,8 +289,9 @@ ${lines}`;
     // sessionMemory:滚动状态(可省略)
     const sessionMemory = typeof parsed.sessionMemory === 'string' ? parsed.sessionMemory.trim() : '';
 
-    // promoted:校验 memType 白名单(4 种封闭类型,非法丢弃)+ normalizeMarkdown 包装(4 类强制 Markdown)
+    // promoted:校验 memType 白名单(4 种封闭类型,非法丢弃)+ 查重(isDuplicate)+ normalizeMarkdown 包装(4 类强制 Markdown)
     const promoted: { memType: MemType; text: string }[] = [];
+    let skippedDup = 0;
     if (Array.isArray(parsed.promoted)) {
       for (const item of parsed.promoted) {
         if (!item || typeof item !== 'object') continue;
@@ -235,9 +299,11 @@ ${lines}`;
         const mtRaw = typeof raw.memType === 'string' ? raw.memType.trim().toLowerCase() : '';
         const text = typeof raw.text === 'string' ? raw.text.trim() : '';
         if (!mtRaw || !isClosedMemType(mtRaw) || !text) continue;
+        if (await isDuplicate(proj, text, mtRaw)) { skippedDup++; continue; }
         promoted.push({ memType: mtRaw, text: normalizeMarkdown(text, mtRaw) });
       }
     }
+    if (skippedDup > 0) console.log(`[reflect-incremental] 查重跳过 ${skippedDup} 条重复 promoted`);
 
     // ① 晋升 → 项目级;晋升成功才清会话碎片(晋升即删)
     let promotedCount = 0;
