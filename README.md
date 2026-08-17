@@ -4,6 +4,8 @@
 
 Neutral core stays in Castalia; Anima feeds emotional features back upstream — the two repos cross-pollinate.
 
+> **Emotional edition (this repo).** For the neutral single-instance edition see **[Castalia](https://github.com/ehwin/Castalia)**; for the neutral full edition with cross-library federation (`reflect_all` / `memory_search_all` over `FEDERATION_DIRS`) see **[Castalia-Full](https://github.com/ehwin/Castalia-Full)**.
+
 > 📖 详细技术设计见 [docs/TECHNICAL.md](docs/TECHNICAL.md)。
 
 ---
@@ -158,7 +160,9 @@ where:
 
 ## Credits & Upstream
 
-- **[Castalia](https://github.com/ehwin/Castalia)** — the neutral core this project builds on; the two repos cross-pollinate (Anima feeds emotional features upstream, Castalia keeps the neutral core stable)
+- **[Castalia](https://github.com/ehwin/Castalia)** — the neutral single-instance core this project builds on
+- **[Castalia-Full](https://github.com/ehwin/Castalia-Full)** — the neutral full edition with cross-library federation
+- The three repos cross-pollinate (Anima feeds emotional features upstream, Castalia keeps the neutral core stable)
 - **cognitive-memory** (Apache-2.0) — schema & vector KNN concepts (code heavily rewritten)
 - **Claude Code** (Anthropic) — closed memory types, MEMORY.md index, progressive session maintenance patterns (re-implemented in SQLite)
 
