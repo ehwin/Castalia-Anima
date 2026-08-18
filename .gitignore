@@ -1,3 +1,21 @@
-
 # ── sourcemap(不推公共仓库,防源码暴露)──
 *.map
+
+# ── AIRI 私有组件(启动链/代理/viz,不入公共仓库;恢复版本地备份见 /path/to/archive)──
+/unified-proxy/
+/viz/
+/scripts/airi_tray.py
+/scripts/start-airi.bat
+/scripts/start.bat
+/scripts/stop.bat
+/scripts/启动AIRI.bat
+/scripts/启动托盘.bat
+/scripts/AIRI-排障.bat
+/scripts/AIRI-日志.bat
+
+# ── 本地密钥与运行时产物 ──
+tts-config.json
+*.log
+__pycache__/
+*.sqlite*
+node_modules/
