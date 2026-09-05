@@ -50,7 +50,8 @@ function computeScore(row, similarity) {
     const hoursSinceCreated = (Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60);
     const { emotionalIntensity, isHighEmotion } = computeEmotionalIntensity(row);
     const consistency = Math.min(Math.max(similarity, 0), 0.7); // 上限 0.7,避免过度拟合人设
-    const timeDecay = computeRecency(hoursSinceCreated);
+    // critical 定案/画像锚点:不受 36h 情感半衰期压制(权威结论 ban 时间,永葆可检索)
+    const timeDecay = row.tier === 'critical' ? 1 : computeRecency(hoursSinceCreated);
     const deviationBonus = (similarity < 0.3 && isHighEmotion) ? 0.8 : 0; // 低一致性+高情绪=珍贵"不像她"瞬间
     const tierBoost = row.tier === 'critical' ? 3.0 : (row.tier === 'temporary' ? 0.5 : 1.0);
     const importanceMult = 0.5 + (row.importance || 0.5);
@@ -231,7 +232,11 @@ function tagSearch(db, options) {
       m.vad_valence, m.vad_arousal, m.vad_dominance, m.tsundere_level
     FROM memory m
     WHERE ${conditions.join(' AND ')}
-    ORDER BY m.importance DESC, m.created_at DESC
+    ORDER BY ${options.sort === 'priority'
+        ? 'COALESCE(m.score_priority, 0) DESC, m.importance DESC, m.created_at DESC'
+        : options.sort === 'urgency'
+            ? 'COALESCE(m.score_urgency, 0) DESC, m.importance DESC, m.created_at DESC'
+            : 'm.importance DESC, m.created_at DESC'}
     LIMIT ?
   `).all(...params, topK * 3);
     return rows.map(row => {
