@@ -13,9 +13,10 @@
  */
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
+import fs from 'node:fs';
 import path from 'node:path';
 import { resolveFedLibraries } from './federation.js';
-import { currentMemDir, DatabaseManager, generateId, initProjectSchema } from './db.js';
+import { currentMemDir, DatabaseManager, generateId, initProjectSchema, memTypeDir } from './db.js';
 import { makeLlmChannel, callLlm } from './reflectDriver.js';
 import { normalizeMemType } from './memType.js';
 const DEFAULT_MAX_TOTAL = 300;
@@ -239,41 +240,50 @@ export async function runReflectAll(opts) {
     if (dryRun) {
         return { ...base, ok: true };
     }
-    // 6. 写入 project=reflect(查重跳过)
-    // 总库位置:env REFLECT_DIR 指定(统一多实例的总库到同一目录,如 /path/to/run/memory),默认本实例 memory 目录
+    // 6. 写入 project=reflect 的 memdir(查重跳过)
+    // REFLECT_DIR = 总库所在实例的 memory 根目录;未设则写本实例 MEMORY_DB_DIR
     let saved = 0;
     let skipped = 0;
-    let reflectDb = null;
+    const reflectRoot = process.env.REFLECT_DIR ? path.resolve(process.env.REFLECT_DIR) : currentMemDir();
+    const customRoot = !!process.env.REFLECT_DIR;
+    const dbs = new Map();
+    const openReflect = (mt) => {
+        const hit = dbs.get(mt);
+        if (hit)
+            return hit;
+        if (!customRoot) {
+            const db = DatabaseManager.getInstance('reflect', mt);
+            dbs.set(mt, db);
+            return db;
+        }
+        const file = path.join(reflectRoot, 'reflect', memTypeDir(mt), 'memory.sqlite');
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        const db = new Database(file);
+        try {
+            sqliteVec.load(db);
+        }
+        catch { }
+        initProjectSchema(db);
+        dbs.set(mt, db);
+        return db;
+    };
     try {
-        const reflectDir = process.env.REFLECT_DIR ? path.resolve(process.env.REFLECT_DIR) : null;
-        if (reflectDir) {
-            reflectDb = new Database(path.join(reflectDir, 'project-reflect.sqlite'));
-            try {
-                sqliteVec.load(reflectDb);
-            }
-            catch { }
-            initProjectSchema(reflectDb);
-        }
-        else {
-            reflectDb = DatabaseManager.getInstance('reflect');
-        }
-        const db = reflectDb;
-        const existsStmt = db.prepare('SELECT 1 FROM memory WHERE is_active = 1 AND text = ?');
-        const insertStmt = db.prepare(`
-      INSERT INTO memory (id, text, project, type, mem_type, category, tags, importance, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
-      VALUES (?, ?, 'reflect', 'semantic', ?, 'general', ?, ?, 'reflect-all', 'user', 'standard', 1, ?, ?, ?, 0, 0)
-    `);
         const now = new Date().toISOString();
         for (const ins of insightList) {
             try {
-                if (existsStmt.get(ins.text)) {
+                const mt = normalizeMemType(ins.memType);
+                const db = openReflect(mt);
+                const exists = db.prepare('SELECT 1 FROM memory WHERE is_active = 1 AND text = ?').get(ins.text);
+                if (exists) {
                     skipped++;
                     continue;
                 }
-                // tags 附上每个来源的 instance:project 标记
                 const markers = ins.sources.map(s => `${s.instance}:${s.project}`);
                 const tags = [...new Set([...ins.tags, ...markers])];
-                insertStmt.run(generateId(), ins.text, ins.memType, JSON.stringify(tags), ins.importance, now, now, now);
+                db.prepare(`
+          INSERT INTO memory (id, text, project, type, mem_type, category, tags, importance, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
+          VALUES (?, ?, 'reflect', 'semantic', ?, 'general', ?, ?, 'reflect-all', 'user', 'standard', 1, ?, ?, ?, 0, 0)
+        `).run(generateId(), ins.text, mt, JSON.stringify(tags), ins.importance, now, now, now);
                 saved++;
             }
             catch (e) {
@@ -285,12 +295,13 @@ export async function runReflectAll(opts) {
         base.errors.push(`打开/写入 reflect 总库失败: ${e.message}`);
     }
     finally {
-        // 独立连接(REFLECT_DIR 模式)用完即关;连接池模式由 DatabaseManager 管理
-        if (reflectDb && process.env.REFLECT_DIR) {
-            try {
-                reflectDb.close();
+        if (customRoot) {
+            for (const db of dbs.values()) {
+                try {
+                    db.close();
+                }
+                catch { }
             }
-            catch { }
         }
     }
     base.llm.skipped = skipped;
