@@ -10,7 +10,7 @@ import sqlite3
 import sys
 
 OLD = r"D:\system\AIRI\memory\memory-fused\memory.sqlite"
-NEW = r"/path\anima-run\memory\project-default.sqlite"
+NEW = r"/path/to/castalia\run\Castalia-Anima\memory\project-default.sqlite"
 
 old = sqlite3.connect(OLD)
 new = sqlite3.connect(NEW)
