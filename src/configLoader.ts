@@ -75,12 +75,12 @@ try {
 
     // 嵌入模型配置
     const emb = cfg.embedding || {};
+    if (emb.mode) process.env.EMBED_MODE = String(emb.mode).toLowerCase();
     if (emb.mode === 'api') {
       if (emb.api_url) process.env.OLLAMA_URL = emb.api_url.replace(/\/+$/, '');
       if (emb.api_model) process.env.EMBEDDING_MODEL = emb.api_model;
       applyApiKey('EMBEDDING_API_KEY', encryptedKeys?.embedding?.api_key, emb.api_key);
-    } else {
-      // 默认 Ollama 模式
+    } else if (emb.mode !== 'none') {
       if (emb.ollama_url) process.env.OLLAMA_URL = emb.ollama_url.replace(/\/+$/, '');
       if (emb.model) process.env.EMBEDDING_MODEL = emb.model;
     }
@@ -95,6 +95,7 @@ try {
     // v1.9: 启动自动反思阈值(可选,给 admin 界面留路;没有则用 env/默认值)
     if (ref.minGapHours != null) process.env.REFLECT_MIN_GAP_HOURS = String(ref.minGapHours);
     if (ref.minUnanalyzed != null) process.env.REFLECT_MIN_UNANALYZED = String(ref.minUnanalyzed);
+    if (ref.intervalHours != null) process.env.REFLECT_INTERVAL_HOURS = String(ref.intervalHours);
 
     // v1.11: triage(LLM1 入站分拣)配置 — admin 第三个通道
     const tri = cfg.triage || {};
@@ -104,12 +105,14 @@ try {
 
     // v1.11 Part2: 渐进式临时反思配置(admin 留路;缺省用 env/默认值)
     if (tri.bufferSize != null) process.env.BUFFER_SIZE = String(tri.bufferSize);
+    if (tri.bufferTokens != null) process.env.BUFFER_TOKENS = String(tri.bufferTokens);
     if (tri.sessionTtlDays != null) process.env.SESSION_MEMORY_TTL_DAYS = String(tri.sessionTtlDays);
 
     // v1.10: 记忆整合配置(可选,给 admin 界面留路;没有则用 env/默认值)
     const cons = cfg.consolidate || {};
     if (cons.minMemories != null) process.env.CONSOLIDATE_MIN_MEMORIES = String(cons.minMemories);
     if (cons.similarity != null) process.env.CONSOLIDATE_SIMILARITY = String(cons.similarity);
+    if (cons.autoOnStart != null) process.env.CONSOLIDATE_AUTO_ON_START = (cons.autoOnStart === false || cons.autoOnStart === 0 || cons.autoOnStart === '0') ? '0' : '1';
 
     // v1.12: 人格配置(项目库 = AI 人格):{"项目名": {"charId","name","persona"}}
     // 解析后写入 process.env.PERSONAS_JSON(供 env.charFor / getPersona 按项目解析人格)
