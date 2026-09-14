@@ -136,6 +136,21 @@ try {
             const dm = cons.decayMemTypes;
             process.env.CONSOLIDATE_DECAY_MEMTYPES = Array.isArray(dm) ? dm.join(',') : String(dm);
         }
+        // 衰减/升华参数(可自定义;详见 consolidate.ts 顶部默认值)
+        const DECAY_MAP = {
+            decaySteepness: 'CONSOLIDATE_DECAY_STEEPNESS',
+            decayMidpointDays: 'CONSOLIDATE_DECAY_MIDPOINT_DAYS',
+            decayMinImportance: 'CONSOLIDATE_DECAY_MIN_IMPORTANCE',
+            decayMinAgeDays: 'CONSOLIDATE_DECAY_MIN_AGE_DAYS',
+            promoteRefCount: 'CONSOLIDATE_PROMOTE_REF_COUNT',
+            promoteBoost: 'CONSOLIDATE_PROMOTE_BOOST',
+            promoteCap: 'CONSOLIDATE_PROMOTE_CAP',
+        };
+        for (const [k, envName] of Object.entries(DECAY_MAP)) {
+            const v = cons[k];
+            if (v != null)
+                process.env[envName] = String(v);
+        }
         // v1.12: 人格配置(项目库 = AI 人格):{"项目名": {"charId","name","persona"}}
         // 解析后写入 process.env.PERSONAS_JSON(供 env.charFor / getPersona 按项目解析人格)
         const personas = (cfg.personas && typeof cfg.personas === 'object') ? cfg.personas : {};

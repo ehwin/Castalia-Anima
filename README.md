@@ -6,6 +6,8 @@ Forked from [**Castalia**](https://github.com/ehwin/Castalia), extended with a f
 
 > **Relationship to Castalia**: Castalia is the neutral, general-purpose component (no personality). Castalia Anima is the emotional variant — it tracks the same architecture, and every engine fix lands upstream first, then gets ported here with the personality layer kept intact.
 
+以上参数也可写进 `memory/config.json` 的 `consolidate` 段(与 `minMemories`/`similarity` 同处),例如 `"decayMidpointDays": 180`、`"decayMemTypes": ["general"]`。
+
 ## Feature Highlights
 
 - **Emotion engine** (`emotion.ts`)
@@ -119,6 +121,14 @@ Exactly one of `agent` (read-only recall) / `harness` (writes + pipeline) / `adm
 | `MEMORY_DB_DIR` | `<cwd>/memory` | Per-project × per-type DB directory (`global.sqlite` + `<project>/<memType>/memory.sqlite`); `MEMORY_DB_PATH` → legacy single-file mode |
 | `OLLAMA_URL` / `EMBEDDING_MODEL` | `:11434` / `yuan-embedding-2.0-zh` | Embedding service (1024-dim) |
 | `EMBED_MODE` | `ollama` | `ollama` / `api` (needs `EMBEDDING_API_KEY`) / `none` |
+| `CONSOLIDATE_DECAY_MEMTYPES` | `general` | 哪些分类库参与衰减+升华(逗号列表或 `all`);user/feedback/project/reference 默认永不衰减 |
+| `CONSOLIDATE_DECAY_STEEPNESS` | `0.04` | sigmoid 衰减陡度(越大衰减越快) |
+| `CONSOLIDATE_DECAY_MIDPOINT_DAYS` | `90` | sigmoid 中点(天),调大 = 衰减更慢 |
+| `CONSOLIDATE_DECAY_MIN_IMPORTANCE` | `0.15` | 衰减后低于此重要度才允许剪枝 |
+| `CONSOLIDATE_DECAY_MIN_AGE_DAYS` | `60` | 年龄不足此天数的记忆绝不剪枝 |
+| `CONSOLIDATE_PROMOTE_REF_COUNT` | `2` | 引用次数超过它触发升华 |
+| `CONSOLIDATE_PROMOTE_BOOST` | `0.1` | 每次升华的重要性增量 |
+| `CONSOLIDATE_PROMOTE_CAP` | `0.95` | 升华后的重要性上限 |
 | `EMBED_TIMEOUT_MS` | `30000` | Embedding request timeout — prevents a hung embed service from blocking `memory_save` / `memory_search` forever |
 | `REFLECT_LLM_*` | — | Reflection LLM (URL / API key / model) |
 | `TRIAGE_LLM_*` | → `REFLECT_*` | Triage LLM channel (falls back to reflect) |

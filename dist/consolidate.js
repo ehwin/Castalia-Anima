@@ -105,6 +105,20 @@ export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIM
     }
     return pairs;
 }
+// ═══ 衰减/升华参数(config.json 的 consolidate.* → env,均可在部署侧自定义)═══
+// 默认值即原行为:sigmoid 衰减(0.04 陡度 / 90 天中点),重要度 <0.15 且年龄 >60 天剪枝;
+// 引用数 >2 升华 +0.1,上限 0.95。调大 midpointDays = 衰减更慢;调小 = 更快被剪。
+const _pnum = (v, d) => {
+    const n = parseFloat(v || '');
+    return Number.isFinite(n) && n > 0 ? n : d;
+};
+const DECAY_STEEPNESS = _pnum(process.env.CONSOLIDATE_DECAY_STEEPNESS, 0.04);
+const DECAY_MIDPOINT_DAYS = _pnum(process.env.CONSOLIDATE_DECAY_MIDPOINT_DAYS, 90);
+const DECAY_MIN_IMPORTANCE = _pnum(process.env.CONSOLIDATE_DECAY_MIN_IMPORTANCE, ACTIVATION_THRESHOLD);
+const DECAY_MIN_AGE_DAYS = _pnum(process.env.CONSOLIDATE_DECAY_MIN_AGE_DAYS, 60);
+const PROMOTE_REF_COUNT = _pnum(process.env.CONSOLIDATE_PROMOTE_REF_COUNT, 2);
+const PROMOTE_BOOST = _pnum(process.env.CONSOLIDATE_PROMOTE_BOOST, 0.1);
+const PROMOTE_CAP = _pnum(process.env.CONSOLIDATE_PROMOTE_CAP, 0.95);
 export async function consolidate() {
     const now = Date.now();
     let prunedCount = 0;
@@ -136,9 +150,9 @@ export async function consolidate() {
                     continue; // 非法时间戳跳过,避免 importance 被写成 NaN
                 const hoursSince = (now - ts) / 3600000;
                 const daysSince = hoursSince / 24;
-                const decay = 1.0 / (1.0 + Math.exp(0.04 * (daysSince - 90)));
+                const decay = 1.0 / (1.0 + Math.exp(DECAY_STEEPNESS * (daysSince - DECAY_MIDPOINT_DAYS)));
                 const newImportance = Math.round(mem.importance * decay * 1000) / 1000;
-                if (newImportance < ACTIVATION_THRESHOLD && daysSince > 60) {
+                if (newImportance < DECAY_MIN_IMPORTANCE && daysSince > DECAY_MIN_AGE_DAYS) {
                     db.prepare('UPDATE memory SET is_active = 0, importance = ? WHERE id = ?')
                         .run(newImportance, mem.id);
                     prunedCount++;
@@ -152,9 +166,9 @@ export async function consolidate() {
         });
         decayTx();
         // ═══ Phase 2: reference_count 升华 ═══
-        const dupes = db.prepare('SELECT id FROM memory WHERE is_active = 1 AND reference_count > 2 LIMIT 20').all();
+        const dupes = db.prepare(`SELECT id FROM memory WHERE is_active = 1 AND reference_count > ${PROMOTE_REF_COUNT} LIMIT 20`).all();
         for (const dup of dupes) {
-            db.prepare('UPDATE memory SET reference_count = 0, importance = MIN(0.95, importance + 0.1) WHERE id = ?').run(dup.id);
+            db.prepare(`UPDATE memory SET reference_count = 0, importance = MIN(${PROMOTE_CAP}, importance + ${PROMOTE_BOOST}) WHERE id = ?`).run(dup.id);
             consolidateCount++;
         }
     }
