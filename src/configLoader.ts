@@ -113,6 +113,11 @@ try {
     if (cons.minMemories != null) process.env.CONSOLIDATE_MIN_MEMORIES = String(cons.minMemories);
     if (cons.similarity != null) process.env.CONSOLIDATE_SIMILARITY = String(cons.similarity);
     if (cons.autoOnStart != null) process.env.CONSOLIDATE_AUTO_ON_START = (cons.autoOnStart === false || cons.autoOnStart === 0 || cons.autoOnStart === '0') ? '0' : '1';
+  // 衰减范围(哪些分类库参与衰减/升华):默认只 general,四个语义分类库永不衰减
+  if ((cons as any).decayMemTypes != null) {
+    const dm = (cons as any).decayMemTypes;
+    process.env.CONSOLIDATE_DECAY_MEMTYPES = Array.isArray(dm) ? dm.join(',') : String(dm);
+  }
 
     // v1.12: 人格配置(项目库 = AI 人格):{"项目名": {"charId","name","persona"}}
     // 解析后写入 process.env.PERSONAS_JSON(供 env.charFor / getPersona 按项目解析人格)

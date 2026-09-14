@@ -110,14 +110,18 @@ export async function consolidate() {
     let prunedCount = 0;
     let updatedCount = 0;
     let consolidateCount = 0;
-    // memdir:遍历默认项目的分类库(时间衰减/升华不只作用 general)
-    // 范围可用 env CONSOLIDATE_DECAY_MEMTYPES 收窄(逗号分隔,如 "general" / "general,project")。
-    // 留空 = 全部分类库。某些部署要求画像/资料类库永不衰减,用该变量把范围收窄。
+    // ═══ 衰减范围(分级口径,与检索侧的 decayFor 对齐)═══
+    // 检索侧:critical→永不衰减 / 时效类→10天半衰 / 其余→30天半衰。
+    // 存储侧沿用同一原则:只让 general(流水/未分类)参与衰减+升华;
+    // 四个语义分类库 user(画像)/feedback(纠偏)/project(项目)/reference(资料)**永不衰减**。
+    // 覆盖方式:env CONSOLIDATE_DECAY_MEMTYPES(逗号分隔;"all" = 全部分类库),
+    //          或 memory/config.json 的 consolidate.decayMemTypes。
     const proj = normalizeProject(undefined);
-    const decayTypes = (process.env.CONSOLIDATE_DECAY_MEMTYPES || '')
+    const decayTypes = (process.env.CONSOLIDATE_DECAY_MEMTYPES || 'general')
         .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+    const decayAll = decayTypes.includes('all');
     const decayDirs = listMemTypeDirs(proj)
-        .filter(mt => decayTypes.length === 0 || decayTypes.includes(mt.toLowerCase()));
+        .filter(mt => decayAll || decayTypes.includes(mt.toLowerCase()));
     for (const mt of decayDirs) {
         const db = DatabaseManager.getInstance(proj, mt);
         // ═══ Phase 1: sigmoid 时间衰减 ═══
