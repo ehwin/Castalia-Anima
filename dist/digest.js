@@ -12,15 +12,17 @@
  *   ✗ 打分新生成句子 → reflect 做
  *
  * 事件驱动：有新对话才跑，间隔 ≥ 1 分钟
+ *
+ * v1.19 B6 同步(三仓同构):digest 热闸 per-project + 分隔带计数 + critical 恢复遍历分类库
  */
-import { DatabaseManager } from './db.js';
+import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { normalizeProject } from './env.js';
 import { flushVadQueue } from './emotion.js';
 import { cleanupExpiredMemories } from './store.js';
 const MIN_DIGEST_GAP_MS = 60 * 1000;
-let lastDigestTime = 0;
-export async function runDigest(characterId = 'airi') {
-    const db = DatabaseManager.getInstance();
+/* v1.19 B6:digest 热闸 per-project */
+const lastDigestTimeByProject = new Map();
+export async function runDigest(characterId = 'airi', project) {
     const result = {
         success: true,
         vadUpdated: false,
@@ -43,30 +45,42 @@ export async function runDigest(characterId = 'airi') {
     catch (e) {
         result.errors.push('VAD flush: ' + e.message);
     }
-    // 2. 清理过期临时记忆
-    result.cleaned = cleanupExpiredMemories();
-    // 3. 恢复被误标记的 critical 记忆
-    const lostCritical = db.prepare(`
-    UPDATE memory SET is_active = 1
-    WHERE tier = 'critical' AND is_active = 0
-  `).run();
-    result.restored = lostCritical.changes;
+    // 2. 清理过期临时记忆(per-project,与上游同构)
+    result.cleaned = cleanupExpiredMemories(project);
+    // 3. 恢复被误标记的 critical 记忆(遍历项目全部分类库)
+    const proj = normalizeProject(project);
+    for (const mt of listMemTypeDirs(proj)) {
+        try {
+            const db = DatabaseManager.getInstance(proj, mt);
+            const lostCritical = db.prepare(`
+        UPDATE memory SET is_active = 1
+        WHERE tier = 'critical' AND is_active = 0
+      `).run();
+            result.restored += lostCritical.changes;
+        }
+        catch (e) {
+            result.errors.push('restore critical: ' + e.message);
+        }
+    }
     return result;
 }
-export function maybeDigest(characterId = 'airi') {
+export function maybeDigest(characterId = 'airi', project) {
+    /* v1.19 B6:热闸 per-project(换项目不互相压制) */
     const now = Date.now();
-    if (now - lastDigestTime < MIN_DIGEST_GAP_MS)
+    const proj = normalizeProject(project);
+    const last = lastDigestTimeByProject.get(proj) || 0;
+    if (now - last < MIN_DIGEST_GAP_MS)
         return null;
-    const db = DatabaseManager.getInstance();
+    const db = DatabaseManager.getInstance(project);
     const unanalyzed = db.prepare(`
     SELECT COUNT(*) as c FROM memory
-    WHERE is_active = 1 AND source = 'conversation_log'
-      AND character_id = ? AND last_accessed_at = created_at
-  `).get(characterId)?.c || 0;
+    WHERE is_active = 0 AND source = 'conversation_log'  /* v1.19 分隔带 */
+      AND last_accessed_at = created_at
+  `).get()?.c || 0;
     if (unanalyzed === 0)
         return null;
-    lastDigestTime = now;
-    return runDigest(characterId);
+    lastDigestTimeByProject.set(proj, now);
+    return runDigest(characterId, project);
 }
 export function getRecentConversations(characterId, hoursBack = 24, limit = 50, project) {
     const db = DatabaseManager.getInstance(project);
@@ -75,8 +89,8 @@ export function getRecentConversations(characterId, hoursBack = 24, limit = 50, 
     return db.prepare(`
     SELECT id, text, created_at, importance
     FROM memory WHERE is_active = 1
-      AND source = 'conversation_log' AND character_id = ? AND project = ?
+      AND source = 'conversation_log' AND project = ?
       AND created_at > ?
     ORDER BY created_at DESC LIMIT ?
-  `).all(characterId, proj, since, limit);
+  `).all(proj, since, limit);
 }

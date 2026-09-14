@@ -44,6 +44,23 @@ let warnedLegacy = false;
 function isLegacyMode() {
     return !!legacyDbPath();
 }
+/** 判断某目录是否是 memdir 项目目录(含 memory.sqlite 或任意 .sqlite),排除 receipts 等元目录 */
+function dirLooksLikeProject(p) {
+    try {
+        for (const f of fs.readdirSync(p)) {
+            if (f.endsWith('.sqlite'))
+                return true;
+            const sub = path.join(p, f);
+            try {
+                if (fs.statSync(sub).isDirectory() && fs.existsSync(path.join(sub, 'memory.sqlite')))
+                    return true;
+            }
+            catch { /* skip */ }
+        }
+    }
+    catch { /* unreadable */ }
+    return false;
+}
 /** 扫描 memory 目录下已有的项目(目录或旧 project-<name>.sqlite),返回项目名 */
 export function listProjectNames() {
     const dir = memDir();
@@ -53,7 +70,7 @@ export function listProjectNames() {
     for (const f of fs.readdirSync(dir)) {
         const p = path.join(dir, f);
         try {
-            if (fs.statSync(p).isDirectory())
+            if (fs.statSync(p).isDirectory() && dirLooksLikeProject(p))
                 names.add(f);
         }
         catch { /* skip */ }

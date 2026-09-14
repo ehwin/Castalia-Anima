@@ -18,7 +18,7 @@ import { callLlm, makeLlmChannel } from './reflectDriver.js';
 import { isMemType, isClosedMemType, normalizeMarkdown } from './memType.js';
 import { getSessionMemory, upsertSessionMemory, promoteToProject, deleteSessionFragments, applyIdentityActions, saveMemory } from './store.js';
 import { DatabaseManager } from './db.js';
-import { normalizeProject, CHAR_ID } from './env.js';
+import { normalizeProject } from './env.js';
 import { embed, cosineSimilarity } from './ollama.js';
 /** triage 通道:未配置时回退 REFLECT_* 值(由 makeLlmChannel 统一处理) */
 export function triageChannel() {
@@ -132,6 +132,7 @@ You receive a recent conversation transcript plus the existing rolling memory sn
 - 记忆内容中的相对时间(昨天/上周/几天前/下周三)必须转成绝对日期(如 2026-08-12),否则视为模糊信息不采纳
 - 不重复:旧快照或已有记忆已包含的信息不要重复写入 sessionMemory,也不要重复 promote
 - 只关注当前任务上下文;用户长期偏好等不依赖单次会话的内容 → 归 promoted 长效
+- 每条 promoted 必须给出语义类别 category(自由词,不超过 4 个词),从这些常用语义中就近取用,没有贴切的就自创准确的:identity(身份属性)/ milestone(里程碑)/ decision(定案结论)/ mistake(教训)/ preference(偏好)/ relationship(关系)/ knowledge(知识)/ emotional(情绪事件)/ conversation(对话存档)/ session(会话状态);禁用 'session_promoted' 这种机制名
 
 【任务3:身份维护(identity)】— 仅当对话涉及用户身份/关系/属性/角色变化时才输出。
 【既有身份列表】(update/remove 的 id 必须从下面选择,禁止发明新 id;找不到对应 → 用 add):
@@ -153,7 +154,7 @@ You receive a recent conversation transcript plus the existing rolling memory sn
 {
   "sessionMemory": "更新后的滚动状态(无变化可省略此字段)",
   "promoted": [
-    {"memType": "user", "text": "长效记忆内容"}
+    {"memType": "user", "text": "长效记忆内容", "category": "milestone"}
   ],
   "identity": {"add": [], "update": [], "remove": []},
   "preferences": []
@@ -206,20 +207,18 @@ export function normalizeText(text) {
  * 已有记忆排除自身来源(session_memory/auto_process/conversation_log)。
  * 任何异常静默降级为不重复(查重失败不阻断 promote)。
  */
-export async function isDuplicate(proj, text, memType, characterId) {
+export async function isDuplicate(proj, text, memType) {
     try {
         const project = normalizeProject(proj);
         const db = DatabaseManager.getInstance(project);
         const target = normalizeText(text);
         if (!target)
             return false;
-        const cid = characterId || CHAR_ID;
         const rows = db.prepare(`
       SELECT text FROM memory
       WHERE project = ? AND mem_type = ? AND is_active = 1
-        AND character_id = ?
         AND COALESCE(source, '') NOT IN ('session_memory', 'auto_process', 'conversation_log')
-    `).all(project, memType, cid);
+    `).all(project, memType);
         if (rows.length === 0)
             return false;
         // ① 精确 ② 包含
@@ -320,11 +319,12 @@ ${lines}
                 if (!mtRaw || !isClosedMemType(mtRaw) || !text)
                     continue;
                 try {
-                    if (await isDuplicate(proj, text, mtRaw, characterId))
+                    if (await isDuplicate(proj, text, mtRaw))
                         continue;
                 }
                 catch { /* 查重失败不阻断,静默跳过 */ }
-                promoted.push({ memType: mtRaw, text: normalizeMarkdown(text, mtRaw) });
+                const catRaw = typeof raw.category === 'string' ? String(raw.category).trim().slice(0, 40) : undefined;
+                promoted.push({ memType: mtRaw, text: normalizeMarkdown(text, mtRaw), category: catRaw || undefined });
             }
         }
         // ① 晋升 → 项目级;晋升成功才清会话碎片(晋升即删)

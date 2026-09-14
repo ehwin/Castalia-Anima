@@ -93,10 +93,10 @@ export function listAllMemories(characterId: string = 'airi', limit: number = 20
         SELECT id, text, type, mem_type, category, tags, importance,
                subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked
         FROM memory
-        WHERE is_active = 1 AND character_id = ? AND project = ?
+        WHERE is_active = 1 AND project = ?
         ORDER BY importance DESC, created_at DESC
         LIMIT ?
-      `).all(characterId, proj, limit) as any[];
+      `).all(proj, limit) as any[];
       all.push(...rows);
     } catch { /* 单分类库失败不影响其他 */ }
   }
@@ -177,12 +177,12 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             // 旧记忆全部软删除 + 删向量
             // v5.1: LLM 可能返回短ID前缀，用 LIKE 匹配
             for (const id of action.sourceIds!) {
-              const src = db.prepare('SELECT id FROM memory WHERE id LIKE ?').get(id + '%') as any;
+              const src = db.prepare('SELECT id FROM memory WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').get(id + '%') as any;
               if (src) receipt.rowsAffected++;
               else { receipt.status = 'failed'; receipt.reason = `source not found: ${id}`; }
-              db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ?').run(id + '%');
+              db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').run(id + '%');
               try {
-                db.prepare('DELETE FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id LIKE ?)').run(id + '%');
+                db.prepare('DELETE FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id LIKE ? AND (locked IS NULL OR locked = 0))').run(id + '%');
               } catch {}
             }
           });
@@ -216,10 +216,10 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             receipt.status = 'failed'; receipt.reason = 'need targetId and fragments';
             continue;
           }
-          // 软删除旧记忆（v5.1: LIKE 匹配短ID）
-          const _splitSrc = db.prepare('SELECT id FROM memory WHERE id LIKE ?').get(action.targetId + '%') as any;
+          // 软删除旧记忆（v5.1: LIKE 匹配短ID;locked=1 永久锁定不删）
+          const _splitSrc = db.prepare('SELECT id FROM memory WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').get(action.targetId + '%') as any;
           if (!_splitSrc) { receipt.status = 'failed'; receipt.reason = `target not found: ${action.targetId}`; }
-          db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ?').run(action.targetId + '%');
+          db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').run(action.targetId + '%');
           // 插入碎片
           const { saveMemory } = await import('./store.js');
           for (const frag of action.fragments) {
@@ -375,7 +375,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             receipt.status = 'failed'; receipt.reason = 'need targetId';
             continue;
           }
-          const _delR = db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ?').run(action.targetId + '%');
+          const _delR = db.prepare('UPDATE memory SET is_active = 0 WHERE id LIKE ? AND (locked IS NULL OR locked = 0)').run(action.targetId + '%');
           receipt.rowsAffected = _delR.changes;
           if (_delR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found: ${action.targetId}`; }
           if (receipt.status === 'applied') result.applied++;
@@ -539,23 +539,22 @@ export function getUnanalyzedConversations(
   if (!since) {
     const lastReflect = db.prepare(`
       SELECT created_at FROM memory
-      WHERE source = 'reflect_summary' AND character_id = ? AND project = ?
+      WHERE source = 'reflect_summary' AND project = ?
       ORDER BY created_at DESC LIMIT 1
-    `).get(characterId, proj) as any;
+    `).get(proj) as any;
     since = lastReflect?.created_at || new Date(0).toISOString();
   }
 
   return db.prepare(`
     SELECT id, text, created_at
     FROM memory
-    WHERE is_active = 1
+    WHERE is_active = 0
       AND source = 'conversation_log'
-      AND character_id = ?
       AND project = ?
       AND created_at > ?
     ORDER BY created_at ASC
     LIMIT ?
-  `).all(characterId, proj, since, limit) as any[];
+  `).all(proj, since, limit) as any[];
 }
 
 export interface ReflectResult {

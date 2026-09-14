@@ -286,8 +286,8 @@ register('auto_process', 'harness', '[Internal] Process a conversation turn: sav
     try {
         const cid = args.characterId || charFor(args.project);
         const r = await autoProcess({ userMessage: args.userMessage, assistantMessage: args.assistantMessage, characterId: cid, moodValue: args.moodValue, moodReason: args.moodReason, sessionId: args.sessionId, project: args.project });
-        // Trigger event-driven digest
-        maybeDigest(cid)?.catch(() => { });
+        // Trigger event-driven digest (v1.19 B6:per-project 热闸,与 AIRI/轻量同构)
+        maybeDigest(cid, args.project)?.catch(() => { });
         return ok(r);
     }
     catch (e) {
@@ -298,7 +298,7 @@ register('digest_run', 'harness', '[Internal] Run the digest cycle: flush VAD qu
     try {
         // 周期兜底:先强制 flush 所有会话 buffer(补漏未达阈值的尾部消息)
         flushAllBuffers();
-        const r = await runDigest(charFor(args.project));
+        const r = await runDigest(charFor(args.project), args.project);
         return ok(r);
     }
     catch (e) {
@@ -380,10 +380,10 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         const cognitiveCats = ['decision', 'mistake'];
         const cognitives = db.prepare(`
         SELECT text, category, importance, created_at FROM memory
-        WHERE is_active = 1 AND character_id = ? AND project = ?
+        WHERE is_active = 1 AND project = ?
           AND (category IN ('decision','mistake') OR tags LIKE '%pattern%')
         ORDER BY created_at DESC LIMIT 9
-      `).all(charFor(args.project), proj);
+      `).all(proj);
         // 4. 关键事实(高置信度)
         const facts = db.prepare(`
         SELECT subject, predicate, object, confidence FROM facts
@@ -394,11 +394,11 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         const indexRows = db.prepare(`
         SELECT id, mem_type, substr(text, 1, 150) AS summary, length(text) AS full_len
         FROM memory
-        WHERE is_active = 1 AND character_id = ? AND project = ?
+        WHERE is_active = 1 AND project = ?
           AND mem_type IN ('user','feedback','project','reference')
         ORDER BY updated_at DESC
         LIMIT 10
-      `).all(charFor(args.project), proj);
+      `).all(proj);
         const indexLayer = indexRows.map((row) => {
             const s = row.summary || '';
             return {
@@ -529,14 +529,14 @@ register('stats_get', 'admin', 'Get memory system statistics: total count, by ca
         const byMemType = {};
         for (const mt of listMemTypeDirs(proj)) {
             const db = DatabaseManager.getInstance(proj, mt);
-            total += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=?').get(CHAR_ID, proj).c;
-            for (const r of db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY category').all(CHAR_ID, proj)) {
+            total += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(proj).c;
+            for (const r of db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? GROUP BY category').all(proj)) {
                 byCategory[r.category] = (byCategory[r.category] || 0) + r.c;
             }
-            for (const r of db.prepare('SELECT source,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY source').all(CHAR_ID, proj)) {
+            for (const r of db.prepare('SELECT source,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? GROUP BY source').all(proj)) {
                 bySource[r.source] = (bySource[r.source] || 0) + r.c;
             }
-            for (const r of db.prepare('SELECT mem_type,COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND project=? GROUP BY mem_type').all(CHAR_ID, proj)) {
+            for (const r of db.prepare('SELECT mem_type,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? GROUP BY mem_type').all(proj)) {
                 byMemType[r.mem_type] = (byMemType[r.mem_type] || 0) + r.c;
             }
         }
@@ -738,7 +738,7 @@ register('memory_index', 'agent', 'Lightweight memory index (corresponds to Clau
         const db = DatabaseManager.getInstance(args.project);
         const proj = normalizeProject(args.project);
         const limit = Math.min(args.limit ?? 20, 100);
-        const conds = ['is_active = 1', 'character_id = ?', 'project = ?'];
+        const conds = ['is_active = 1', 'project = ?'];
         const params = [charFor(args.project), proj];
         if (args.memType) {
             conds.push('mem_type = ?');
