@@ -25,5 +25,11 @@
   "bin": {
     "castalia": "dist/index.js",
     "castalia-federation": "dist/fedServer.js"
+  },
+  "allowScripts": {
+    "better-sqlite3": true
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

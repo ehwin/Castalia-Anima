@@ -72,6 +72,6 @@ export function isEmbedEnabled() {
     return EMBED_MODE !== 'none';
 }
 /** MCP server 自描述名称 */
-export const SERVER_NAME = process.env.MCP_SERVER_NAME || 'airi-memory';
+export const SERVER_NAME = process.env.MCP_SERVER_NAME || 'castalia';
 /** 服务器版本号 */
 export const SERVER_VERSION = process.env.MCP_SERVER_VERSION || '5.0.0';
