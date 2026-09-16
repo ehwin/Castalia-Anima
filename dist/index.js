@@ -28,7 +28,7 @@ import { runAutoReflect, runDeepReflect, shouldAutoReflect, runConsolidate, shou
 import { ensureSeedInstructions, saveInstruction, getInstruction, listInstructions, deleteInstruction } from './instructions.js';
 import { CHAR_ID, PROJECT_ID, SERVER_NAME, SERVER_VERSION, normalizeProject, charFor, getPersona } from './env.js';
 import { MEM_TYPES, summarizeForIndex } from './memType.js';
-import { resolveFedLibraries, fedTextSearch } from './federation.js';
+import { fedSearchAll, resolveFedLibraries } from './federation/index.js';
 import { runReflectAll } from './reflectAll.js';
 // Anima 情感层
 import { getAgentState } from './agentState.js';
@@ -992,24 +992,28 @@ register('memory_search_all', 'admin', 'Federation search interface (read-only):
     mode: z.enum(['text', 'vector']).optional().describe('text = LIKE substring search (default); vector = reserved for sqlite-vec KNN (falls back to text in this build)'),
 }, async (args) => {
     try {
-        const libs = resolveFedLibraries(currentMemDir());
         const topK = args.topK ?? 5;
-        const results = fedTextSearch(libs, args.query, topK);
+        // 接口化(v1.14):并发检索所有成员(本实例 + 配置的成员),单成员失败不影响整体。
+        const { hits, members, errors } = await fedSearchAll(currentMemDir(), args.query, topK);
         return ok({
             op: 'memory_search_all',
             query: args.query,
-            libraries: libs.length,
+            members,
+            libraries: resolveFedLibraries(currentMemDir()).length,
             mode: args.mode === 'vector' ? 'text_fallback' : 'text',
-            count: results.length,
-            results: results.map(r => ({
+            count: hits.length,
+            results: hits.map(r => ({
                 instance: r.instance,
+                member: r.member,
                 project: r.project,
+                memType: r.memType,
                 id: r.id,
                 text: r.text,
                 score: r.score,
                 createdAt: r.createdAt,
             })),
-            hint: '接口先行:互通语义未定,引擎不自动合并库。FEDERATION_DIRS 配置参与联邦的外部实例目录。',
+            errors: errors.length ? errors : undefined,
+            hint: '接口先行:互通语义未定,引擎不自动合并库。成员来自 FEDERATION_MEMBERS(推荐)或 FEDERATION_DIRS(兼容);transport 支持 local-dir 与 mcp-http。',
         });
     }
     catch (e) {

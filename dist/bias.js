@@ -1,8 +1,8 @@
 /**
- * AIRI Bias Layer — topic weight accumulation
- * Inspired by AIRI #2005: letting memory shape personality over time
+ * Anima Bias Layer — topic weight accumulation
+ * Inspired by the emotional-variant design: letting memory shape personality over time
  *
- * As conversations accumulate, AIRI develops topic preferences.
+ * As conversations accumulate, the agent develops topic preferences.
  * High-weight topics surface relevant memories more readily
  * and subtly tilt the injection context toward familiar ground.
  *

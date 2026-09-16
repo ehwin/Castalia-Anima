@@ -1,5 +1,5 @@
 /**
- * AIRI Memory Store — 原文秒存，去重软抑制
+ * Memory Store — 原文秒存，去重软抑制
  *
  * v5.0: skipEmbed 参数 — digest 暂不向量化，reflect 后统一 embed
  * v4.0: 去重不再丢弃，SQLite 持久化 embedding 缓存
