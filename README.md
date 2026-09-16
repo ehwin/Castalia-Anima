@@ -10,6 +10,8 @@ Neutral core stays in Castalia; Anima feeds emotional features back upstream —
 
 ---
 
+> 📦 **New here? Read [INSTALL.md](INSTALL.md)** — full setup steps, including the npm 12 native-module pitfall that makes the engine fail to start.
+
 ## Quick Start
 
 ### 1. Build + verify
