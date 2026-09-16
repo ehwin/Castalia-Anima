@@ -1,7 +1,7 @@
 /**
  * Reflect Driver — LLM reflection driver (bundled into the MCP server)
  *
- * Ported from the AIRI reflect.py: fetch memories → call LLM → parse actions → apply
+ * Ported from the original reflect design: fetch memories → call LLM → parse actions → apply
  * - reflect_auto: unanalyzed conversations → daily digest / memory extraction
  * - reflect_deep: all memories → dedup / profile / graph
  *

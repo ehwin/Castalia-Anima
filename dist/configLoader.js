@@ -127,7 +127,7 @@ try {
             process.env.CONSOLIDATE_MIN_MEMORIES = String(cons.minMemories);
         if (cons.similarity != null)
             process.env.CONSOLIDATE_SIMILARITY = String(cons.similarity);
-        // v1.12(AIRI 情感层):人格配置(项目库 = AI 人格):{"项目名": {"charId","name","persona"}}
+        // v1.12(情感层):人格配置(项目库 = AI 人格):{"项目名": {"charId","name","persona"}}
         // 解析后写入 process.env.PERSONAS_JSON(供 env.charFor / getPersona 按项目解析人格)
         const personas = (cfg.personas && typeof cfg.personas === 'object') ? cfg.personas : {};
         if (Object.keys(personas).length > 0) {
