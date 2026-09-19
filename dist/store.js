@@ -125,7 +125,7 @@ export async function saveMemory(params) {
     return record;
 }
 /** 按 id 定位记忆所在分类库(memdir 遍历),返回库连接+分类;找不到返回 null */
-function findDbByMemoryId(id, project) {
+export function findDbByMemoryId(id, project) {
     const proj = normalizeProject(project);
     for (const mt of listMemTypeDirs(proj)) {
         const db = DatabaseManager.getInstance(proj, mt);
