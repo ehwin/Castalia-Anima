@@ -611,7 +611,7 @@ export function upsertSessionMemory(
  */
 export function promoteToProject(
   project: string,
-  items: { memType: MemType; text: string }[],
+  items: { memType: MemType; text: string; category?: string }[],
   characterId?: string,
 ): string[] {
   const cid = characterId || CHAR_ID;
@@ -634,8 +634,8 @@ export function promoteToProject(
     const id = generateId();
     db.prepare(`
       INSERT INTO memory (id, text, project, session_id, type, mem_type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
-      VALUES (?, ?, ?, NULL, 'semantic', ?, 'session_promoted', '[]', 0.6, ?, 'session_promoted', 'user', 'standard', 1, ?, ?, ?, 0, 0)
-    `).run(id, md, proj, mt, cid, now, now, now);
+      VALUES (?, ?, ?, NULL, 'semantic', ?, ?, '[]', 0.6, ?, 'session_promoted', 'user', 'standard', 1, ?, ?, ?, 0, 0)
+    `).run(id, md, proj, mt, (item.category && String(item.category).trim().slice(0, 40)) || 'knowledge', cid, now, now, now);
     ids.push(id);
   }
   return ids;

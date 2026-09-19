@@ -290,7 +290,7 @@ ${lines}`;
     const sessionMemory = typeof parsed.sessionMemory === 'string' ? parsed.sessionMemory.trim() : '';
 
     // promoted:校验 memType 白名单(4 种封闭类型,非法丢弃)+ 查重(isDuplicate)+ normalizeMarkdown 包装(4 类强制 Markdown)
-    const promoted: { memType: MemType; text: string }[] = [];
+    const promoted: { memType: MemType; text: string; category?: string }[] = [];
     let skippedDup = 0;
     if (Array.isArray(parsed.promoted)) {
       for (const item of parsed.promoted) {
@@ -300,7 +300,8 @@ ${lines}`;
         const text = typeof raw.text === 'string' ? raw.text.trim() : '';
         if (!mtRaw || !isClosedMemType(mtRaw) || !text) continue;
         if (await isDuplicate(proj, text, mtRaw)) { skippedDup++; continue; }
-        promoted.push({ memType: mtRaw, text: normalizeMarkdown(text, mtRaw) });
+        const catRaw = typeof (raw as any).category === 'string' ? String((raw as any).category).trim().slice(0, 40) : undefined;
+        promoted.push({ memType: mtRaw, text: normalizeMarkdown(text, mtRaw), category: catRaw || undefined });
       }
     }
     if (skippedDup > 0) console.log(`[reflect-incremental] 查重跳过 ${skippedDup} 条重复 promoted`);

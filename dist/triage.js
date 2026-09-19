@@ -281,7 +281,8 @@ ${lines}`;
                     skippedDup++;
                     continue;
                 }
-                promoted.push({ memType: mtRaw, text: normalizeMarkdown(text, mtRaw) });
+                const catRaw = typeof raw.category === 'string' ? String(raw.category).trim().slice(0, 40) : undefined;
+                promoted.push({ memType: mtRaw, text: normalizeMarkdown(text, mtRaw), category: catRaw || undefined });
             }
         }
         if (skippedDup > 0)
