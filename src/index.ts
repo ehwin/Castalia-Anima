@@ -33,6 +33,7 @@ import { fedSearchAll, resolveFedLibraries } from './federation/index.js';
 import { runReflectAll } from './reflectAll.js';
 // Anima 情感层
 import { getAgentState } from './agentState.js';
+import { syncTavernChat } from './tavern.js';
 import { getBiasPrompt, loadBiasesFromDb } from './bias.js';
 import { getUserProfilePrompt, loadUserProfilesFromDb, observeUserMessage } from './userLearning.js';
 
@@ -99,7 +100,7 @@ function memorySnapshotWarn(createdAt: string): string | null {
 
 const TOOL_GROUPS: Record<string, string[]> = {
   agent: ['memory_search', 'memory_get', 'memory_recent', 'memory_index', 'fact_search', 'memory_graph'],
-  harness: ['auto_process', 'conversation_save', 'digest_run', 'reflect_auto', 'reflect_deep', 'reflect_batch_embed', 'memory_save', 'memory_update', 'memory_delete', 'memory_log', 'instruction_save', 'user_observe'],
+  harness: ['auto_process', 'conversation_save', 'tavern_sync', 'digest_run', 'reflect_auto', 'reflect_deep', 'reflect_batch_embed', 'memory_save', 'memory_update', 'memory_delete', 'memory_log', 'instruction_save', 'user_observe'],
   admin: ['memory_list', 'stats_get', 'recent_conversations', 'daily_summary_data', 'reflect_analyze', 'reflect_apply', 'memory_context', 'context_get', 'project_list', 'project_create', 'memory_search_all', 'reflect_all', 'instruction_list', 'instruction_delete', 'consolidate_deep', 'mood_journal'],
 };
 
@@ -133,6 +134,20 @@ function register(name: string, group: string, description: string, schema: any,
   server.tool(name, description, schema, handler);
 }
 
+register('tavern_sync', 'harness', 'Synchronize the selected SillyTavern chat snapshot in an isolated project; edits, swipes and deletions replace previous versions. No emotion/profile/reflection processing.', {
+  project: z.string().regex(/^st_[a-f0-9]{40}$/),
+  messages: z.array(z.object({
+    id: z.string().min(1).max(120),
+    role: z.enum(['user', 'assistant']),
+    name: z.string().min(1).max(200),
+    text: z.string().min(1).max(100000),
+    createdAt: z.string().optional(),
+  })).max(5000),
+}, async (args) => {
+  try { return ok({ op: 'tavern_sync', ...syncTavernChat(args.project, args.messages) }); }
+  catch (e: unknown) { return err(e instanceof Error ? e.message : String(e), 'TAVERN_SYNC_FAILED'); }
+});
+
 // ═══════════════════════════════════════════════════════════════════
 // 搜索类工具（LLM 可见）
 // ═══════════════════════════════════════════════════════════════════
@@ -147,6 +162,7 @@ register(
     memType: z.enum(MEM_TYPES).optional().describe('按用途过滤:user=AI对用户画像,feedback=行为纠正,project=情感记忆,reference=外部链接,general=默认'),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
     projects: z.array(z.string()).optional().describe('Cross-library search: search several libraries in one call (e.g. ["default","shared"]). "*" or ["all"] = every library of this instance. Omit for single-library search. Each result carries its source library in "project".'),
+    fullText: z.boolean().optional().describe('Return complete Anima records for companion context injection'),
   },
   async (args) => {
     try {
@@ -160,8 +176,9 @@ register(
         results: r.map(m => ({
           project: m.project,
           id: m.id,
-          text: m.text.length > 200 ? m.text.substring(0, 200) + '…' : m.text,
-          truncated: m.text.length > 200,
+          text: !args.fullText && m.text.length > 200 ? m.text.substring(0, 200) + '…' : m.text,
+          truncated: !args.fullText && m.text.length > 200,
+          subject: m.subject,
           kind: m.type === 'episodic' ? 'episode' : m.type === 'semantic' ? 'reflection' : m.type,
           memType: m.memType,
           category: m.category,
@@ -169,7 +186,7 @@ register(
           score: m.score,
           createdAt: m.createdAt,
         })),
-        hint: '用 memory_get(id) 取完整内容',
+        hint: '用 memory_get(id) 取完整内容；Full 汇总库由 AIRI 接入层独立读取',
       });
     } catch (e: any) { return err(e.message, 'SEARCH_FAILED'); }
   }
@@ -370,12 +387,14 @@ register(
     try {
       const proj = normalizeProject(args.project);
       const p = getPersona(args.project);
-      const state = getAgentState(charFor(args.project));
+      const state = getAgentState(charFor(args.project), args.project);
       const bias = getBiasPrompt(charFor(args.project));
       const profile = getUserProfilePrompt(charFor(args.project), 'default');
-      const db = DatabaseManager.getInstance(args.project);
       const recent = getRecentMemories(charFor(args.project), 5, 24, proj);
-      const stats = db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(proj) as any;
+      // memdir 分库:总数跨 user/feedback/project/reference/general 聚合
+      const total = DatabaseManager.queryAll<{ c: number }>(args.project,
+        'SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?', [proj])
+        .reduce((n, r) => n + (r.c || 0), 0);
       return ok({
         op: 'context',
         state: roleDeclaration(args.project) + '\n' + state.toPromptString(),
@@ -383,7 +402,7 @@ register(
         bias,
         profile,
         recentMemories: recent.map(m => ({ text: m.text, category: m.category, importance: m.importance, createdAt: m.createdAt })),
-        stats: { total: stats.c },
+        stats: { total },
         project: proj,
       });
     } catch (e: any) { return err(e.message); }
@@ -426,14 +445,13 @@ register(
         related = r.map(m => ({ text: m.text, category: m.category, importance: m.importance, score: m.score, createdAt: m.createdAt }));
       }
 
-      // 3. 认知记录(决策/错误/模式)
-      const cognitiveCats = ['decision', 'mistake'];
-      const cognitives = db.prepare(`
+      // 3. 认知记录(决策/错误/模式)—— 跨分类库聚合(decision/mistake 可能落在 project 库)
+      const cognitives = DatabaseManager.queryAll<any>(proj, `
         SELECT text, category, importance, created_at FROM memory
         WHERE is_active = 1 AND project = ?
           AND (category IN ('decision','mistake') OR tags LIKE '%pattern%')
         ORDER BY created_at DESC LIMIT 9
-      `).all(proj) as any[];
+      `, [proj]).sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))).slice(0, 9);
 
       // 4. 关键事实(高置信度)
       const facts = db.prepare(`
@@ -443,14 +461,15 @@ register(
       `).all(proj) as any[];
 
       // 4.5 记忆索引层(4 种封闭类型,轻量摘要 — 对应 Claude Code MEMORY.md,先索引后详情)
-      const indexRows = db.prepare(`
-        SELECT id, mem_type, substr(text, 1, 150) AS summary, length(text) AS full_len
+      //     这 4 类各自独立成库,必须跨库聚合;只读 general 会恒空。
+      const indexRows = DatabaseManager.queryAll<any>(proj, `
+        SELECT id, mem_type, substr(text, 1, 150) AS summary, length(text) AS full_len, updated_at
         FROM memory
         WHERE is_active = 1 AND project = ?
           AND mem_type IN ('user','feedback','project','reference')
         ORDER BY updated_at DESC
         LIMIT 10
-      `).all(proj) as any[];
+      `, [proj]).sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || ''))).slice(0, 10);
       const indexLayer = indexRows.map((row: any) => {
         const s = row.summary || '';
         return {
@@ -464,7 +483,11 @@ register(
       //    path 可选:对带 paths 的指令做 glob 过滤
       const instructions = getInstruction(proj, args.path);
 
-      const stats = db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(proj) as any;
+      // memdir 分库:统计跨全部分类库
+      const total = DatabaseManager.queryAll<{ c: number }>(proj,
+        'SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?', [proj])
+        .reduce((n, r) => n + (r.c || 0), 0);
+      const stats = { c: total };
 
       // 5. Ground Truth 提示词组装(人格声明在最前,指令分节次之)
       const sections: string[] = [];
@@ -619,8 +642,11 @@ register(
   },
   async (args) => {
     try {
-      const db = DatabaseManager.getInstance(args.project);
       const proj = normalizeProject(args.project);
+      // Normalize once before scanning memType partitions.  Passing an
+      // omitted project into listMemTypeDirs used to reach safeFilePart(undefined)
+      // and made the default mood journal fail instead of returning history.
+      const dbs = listMemTypeDirs(proj).map(mt => DatabaseManager.getInstance(proj, mt));
       const p = getPersona(args.project);
       const since = new Date(Date.now() - (args.days || 7) * 86400000).toISOString();
       return ok({
@@ -628,7 +654,7 @@ register(
         days: args.days,
         project: proj,
         persona: { charId: p.charId, name: p.name, persona: p.persona },
-        moods: db.prepare("SELECT emotional_impact as value, created_at, text, category FROM memory WHERE is_active=1 AND project=? AND (category='emotional' OR category='mood_snapshot' OR tier='temporary') AND created_at>? ORDER BY created_at DESC LIMIT 30").all(proj, since),
+        moods: dbs.flatMap(db => db.prepare("SELECT emotional_impact as value, created_at, text, category FROM memory WHERE is_active=1 AND project=? AND (category='emotional' OR category='mood_snapshot' OR tier='temporary') AND created_at>? ORDER BY created_at DESC LIMIT 30").all(proj, since)).sort((a: any, b: any) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 30),
       });
     } catch (e: any) { return err(e.message); }
   }
@@ -787,20 +813,20 @@ register(
   },
   async (args) => {
     try {
-      const db = DatabaseManager.getInstance(args.project);
       const proj = normalizeProject(args.project);
       const limit = Math.min(args.limit ?? 20, 100);
       const conds = ['is_active = 1', 'project = ?'];
       const params: any[] = [proj];
       if (args.memType) { conds.push('mem_type = ?'); params.push(args.memType); }
       params.push(limit);
-      const rows = db.prepare(`
+      // 索引层跨 5 个分类库聚合;每库先取 limit,再全局排序截断。
+      const rows = DatabaseManager.queryAll<any>(proj, `
         SELECT id, mem_type, substr(text, 1, 150) AS summary, length(text) AS full_len, updated_at
         FROM memory
         WHERE ${conds.join(' AND ')}
         ORDER BY updated_at DESC
         LIMIT ?
-      `).all(...params) as any[];
+      `, params).sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || ''))).slice(0, limit);
       return ok({
         op: 'index',
         count: rows.length,
@@ -845,11 +871,11 @@ register(
   async (args) => {
     try {
       const conversations = getUnanalyzedConversations(charFor(args.project), undefined, args.limit ?? 30, args.project);
-      const prompt = conversations.map((c: any) => c.text).join('\n---\n');
+      const prompt = JSON.stringify(conversations);
       return ok({
         conversationCount: conversations.length,
         systemPrompt: REFLECT_SYSTEM_PROMPT,
-        userPrompt: `请分析以下对话，输出反思JSON：\n\n${prompt.substring(0, 30000)}`,
+        userPrompt: `请分析以下对话，输出反思JSON：\n\n${prompt}`,
         conversationIds: conversations.map((c: any) => c.id),
       });
     } catch (e: any) { return err(e.message); }

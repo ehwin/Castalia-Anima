@@ -13,13 +13,12 @@
  *
  * 回退逻辑:isTriageConfigured() = 有 TRIAGE key 或 REFLECT key。
  */
-import { callLlm, makeLlmChannel, LlmChannel } from './reflectDriver.js';
+import { callLlm, makeLlmChannel, LlmChannel } from './reflectionLlm.js';
 import { isMemType, isClosedMemType, normalizeMarkdown, MemType } from './memType.js';
-import { getSessionMemory, upsertSessionMemory, promoteToProject, deleteSessionFragments } from './store.js';
+import { getSessionMemory, upsertSessionMemory, promoteToProject } from './store.js';
 import { normalizeProject } from './env.js';
-import { embed, cosineSimilarity } from './ollama.js';
-import { createHash } from 'node:crypto';
-import { DatabaseManager } from './db.js';
+import { DatabaseManager, listMemTypeDirs } from './db.js';
+import { EMOTIONAL_FIDELITY } from './reflectionFidelity.js';
 
 /** triage 通道:未配置时回退 REFLECT_* 值(由 makeLlmChannel 统一处理) */
 export function triageChannel(): LlmChannel {
@@ -97,7 +96,8 @@ export async function classifyMemTypeLLM(text: string, project?: string): Promis
   if (!llm) {
     return { memType: 'general', skipped: true, raw: '' };
   }
-  const raw = llm.content || llm.reasoning || '';
+  if (llm.finishReason === 'length') return { memType: 'general', skipped: true, raw: '' };
+  const raw = llm.content || '';
   const parsed = parseMemType(raw);
   return {
     memType: parsed ?? 'general',
@@ -120,13 +120,13 @@ export async function classifyMemTypeLLM(text: string, project?: string): Promis
  * ③不重复、简洁(会话记忆 < 1000 字)
  * ④只关注当前任务上下文,用户长期偏好归长效
  */
-export const INCREMENTAL_REFLECT_PROMPT = `你是会话记忆维护子代理。输入是最近对话增量 + 该会话已有的滚动记忆快照。你要维护两件事:
+export const INCREMENTAL_REFLECT_PROMPT = EMOTIONAL_FIDELITY + `\n你是会话记忆维护子代理。输入是最近对话增量 + 该会话已有的滚动记忆快照。你要维护两件事:
 
 【任务1:更新会话滚动状态(sessionMemory)】
 - 维护本会话:当前目标 / 活跃问题 / 本会话已做出的决策
-- 用简洁的滚动要点式自然语言,控制在 1000 字以内
+- 用滚动要点维护导航，仍有效的关系约定、待确认问题和修正条件须保留；长度以表达完整为准
 - 已完成或已解决的事项从状态中移除;仍相关/进行中的保留
-- 只保留依赖本会话上下文的信息(如"正在做 X,下一步 Y")
+- 保留依赖本会话的情绪转折、关系进展、约定及未解决误会
 
 【任务2:发现长效干货(promoted)】
 - 从对话增量中提炼具有跨会话长期价值的信息,分类到 4 种封闭类型之一:
@@ -135,18 +135,18 @@ export const INCREMENTAL_REFLECT_PROMPT = `你是会话记忆维护子代理。�
   - project — 情感分区:情绪/情感经历/情绪快照/情感事件(傲娇瞬间/感动/生气等)
   - reference — 外部链接:URL/ID/文档链接,只存指针不存内容副本
 - 只关注当前任务上下文;用户长期偏好等不依赖单次会话的内容 → 归 promoted 长效
-- 记忆内容中的相对时间(昨天/上周/几天前/下周三)必须转成绝对日期(如 2026-08-12),否则视为模糊信息不采纳
+- 相对时间仅在来源日期明确时转换，否则保留原话并标注未确定
 - 不存:临时调试日志/错误栈/代码片段/文件路径/git hash/单次会话临时状态
 
 【任务3:不重复】
-- 旧快照已包含的信息不要重复写入 sessionMemory,也不要重复 promote
-- 简洁为上:sessionMemory 必须 < 1000 字
+- sessionMemory 是完整替换快照，必须带回旧快照中仍有效的状态与约定；不要因为本轮未重复提及而删除
+- promoted 保留完整事件与关键原话，不受导航摘要长度限制；subject 区分 user/self/environment
 
 【输出】只返回严格 JSON 对象,不要代码围栏,不要任何其他文字:
 {
   "sessionMemory": "更新后的滚动状态(无变化可省略此字段)",
   "promoted": [
-    {"memType": "user", "text": "长效记忆内容"}
+    {"memType": "project", "text": "有日期、原话、情绪转折和条件的完整事件", "subject": "self"}
   ]
 }
 - promoted 允许空数组 [];memType 必须属于 user/feedback/project/reference
@@ -183,69 +183,24 @@ export interface IncrementalReflectionResult {
   errors: string[];
 }
 
-/** 归一化:去空白/换行/常见标点,统一小写(文本查重用) */
-function normalizeText(s: string): string {
-  return (s || '')
-    .toLowerCase()
-    .replace(/[\s.,!?;:()\[\]{}"'<>`~\-_=+\/\\|@#$%^&*。，、！？；：…]/g, '');
-}
-
-/**
- * 长效干货查重(仅同项目):
- * ① 文本查重:归一化相等→true;一方包含另一方且 minLen>10 且 minLen/maxLen>0.7→true
- * ② 向量增强:候选从 embedding_cache 按 text_hash 读缓存向量,与 embed() 后的 promoted
- *    文本算 cosineSimilarity>0.92→true;embed 失败/无缓存→跳过(文本查重兜底)
- * 任何异常 → 返回 false(不阻断晋升)。
- */
-export async function isDuplicate(proj: string, text: string, memType: string): Promise<boolean> {
-  const hasVec = typeof embed === 'function' && typeof cosineSimilarity === 'function';
-  try {
-    const candidates = DatabaseManager.getInstance(proj).prepare(`
-      SELECT text FROM memory
-      WHERE is_active = 1 AND mem_type = ? AND project = ?
-        AND COALESCE(source, '') NOT IN ('conversation_log', 'auto_process', 'session_memory')
-    `).all(memType, proj) as any[];
-    if (!candidates || candidates.length === 0) return false;
-
-    // ① 文本查重
-    const nText = normalizeText(text);
-    for (const row of candidates) {
-      const cand = row?.text;
-      if (typeof cand !== 'string') continue;
-      const nCand = normalizeText(cand);
-      if (nCand.length === 0) continue;
-      if (nText === nCand) return true;
-      const minLen = Math.min(nText.length, nCand.length);
-      const maxLen = Math.max(nText.length, nCand.length);
-      if (minLen > 10 && (nText.includes(nCand) || nCand.includes(nText)) && minLen / maxLen > 0.7) {
-        return true;
-      }
-    }
-
-    // ② 向量增强(embed/无缓存失败 → 跳过,文本查重兜底)
-    if (!hasVec) return false;
-    const db = DatabaseManager.getInstance(proj);
-    const queryVec = await embed(text, proj);
-    for (const row of candidates) {
-      const cand = row?.text;
-      if (typeof cand !== 'string') continue;
-      const hash = createHash('sha256').update(cand).digest('hex');
-      const cached = db.prepare('SELECT embedding FROM embedding_cache WHERE text_hash = ?').get(hash) as any;
-      if (!cached?.embedding) continue;
-      const candVec = Array.from(new Float32Array(
-        cached.embedding.buffer, cached.embedding.byteOffset, cached.embedding.byteLength / 4,
-      ));
-      if (cosineSimilarity(queryVec, candVec) > 0.92) return true;
-    }
-    return false;
-  } catch {
-    return false;
+/** Exact, Markdown-normalized duplication in the real category databases.
+ * Similar emotional narratives can describe different dates or promises. */
+export async function isDuplicate(proj: string, text: string, memType: string, subject: 'user' | 'self' | 'environment' = 'user'): Promise<boolean> {
+  const normalized = normalizeMarkdown(text, memType).trim();
+  for (const mt of listMemTypeDirs(proj)) {
+    const rows = DatabaseManager.getInstance(proj, mt).prepare(`
+      SELECT text FROM memory WHERE is_active = 1 AND project = ? AND mem_type = ?
+        AND (? IS NULL OR subject = ?)
+        AND session_id IS NULL AND COALESCE(source, '') NOT IN ('conversation_log', 'auto_process', 'session_memory')
+    `).all(proj, memType, subject ?? null, subject ?? null) as { text: string }[];
+    if (rows.some(row => row.text.trim() === normalized)) return true;
   }
+  return false;
 }
 
 /**
  * 增量反思(渐进式临时反思)主流程:
- * 取最近 delta(最多 10 条)→ triage 通道调 LLM → 解析 → 晋升(promote+即删)→ 滚动覆盖。
+ * 取完整 delta→ triage 通道调 LLM → 解析 → 晋升(保留滚动快照)→ 滚动覆盖。
  * 无 key / 解析失败 → 静默跳过(console.error),绝不影响主流程。
  * characterId 可选:默认 env CHAR_ID(与 MCP 流程的 auto_process 一致)。
  */
@@ -264,7 +219,7 @@ export async function runIncrementalReflection(
   }
 
   try {
-    const recent = (recentMessages || []).slice(-10);
+    const recent = (recentMessages || []);
     if (recent.length === 0) {
       return { ...base, ok: true, skipped: true, reason: '无最近消息' };
     }
@@ -273,7 +228,7 @@ export async function runIncrementalReflection(
 
     const lines = recent.map(m => {
       const who = m.role === 'user' ? '用户' : m.role === 'assistant' ? '助手' : String(m.role);
-      return `${who}: ${(m.content || '').slice(0, 2000)}`;
+      return `${who}: ${m.content || ''}`;
     }).join('\n');
     const userPrompt = `【会话 ID】${sessionId}
 【该会话旧滚动快照】${oldSnapshot ? `\n${oldSnapshot}` : '\n(无)'}
@@ -283,42 +238,39 @@ ${lines}`;
 
     const llm = await callLlm(INCREMENTAL_REFLECT_PROMPT, userPrompt, channel);
     if (!llm) return { ...base, errors: ['LLM 调用失败'] };
-    const parsed = parseIncrementalReflection(llm.content || llm.reasoning);
+    if (llm.finishReason === 'length') return { ...base, errors: ['LLM 输出被截断(finish_reason=length)，未晋升且保留会话快照'] };
+    const parsed = parseIncrementalReflection(llm.content);
     if (!parsed) return { ...base, errors: ['增量反思输出解析失败'] };
+    if (!Array.isArray(parsed.promoted) || (parsed.sessionMemory !== undefined && typeof parsed.sessionMemory !== 'string')) return { ...base, errors: ['增量反思缺少合法 promoted 数组或快照；保留旧快照'] };
 
     // sessionMemory:滚动状态(可省略)
     const sessionMemory = typeof parsed.sessionMemory === 'string' ? parsed.sessionMemory.trim() : '';
 
     // promoted:校验 memType 白名单(4 种封闭类型,非法丢弃)+ 查重(isDuplicate)+ normalizeMarkdown 包装(4 类强制 Markdown)
-    const promoted: { memType: MemType; text: string; category?: string }[] = [];
+    const promoted: { memType: MemType; text: string; category?: string; subject?: 'user' | 'self' | 'environment' }[] = [];
     let skippedDup = 0;
     if (Array.isArray(parsed.promoted)) {
       for (const item of parsed.promoted) {
-        if (!item || typeof item !== 'object') continue;
+        if (!item || typeof item !== 'object') return { ...base, errors: ['非法晋升项；本轮保留旧快照'] };
         const raw = item as any;
         const mtRaw = typeof raw.memType === 'string' ? raw.memType.trim().toLowerCase() : '';
         const text = typeof raw.text === 'string' ? raw.text.trim() : '';
-        if (!mtRaw || !isClosedMemType(mtRaw) || !text) continue;
-        if (await isDuplicate(proj, text, mtRaw)) { skippedDup++; continue; }
+        if (!mtRaw || !isClosedMemType(mtRaw) || !text) return { ...base, errors: ['非法晋升项；本轮保留旧快照'] };
+        const subject = ['user', 'self', 'environment'].includes(raw.subject || raw.newSubject) ? raw.subject || raw.newSubject : undefined;
+        if (await isDuplicate(proj, text, mtRaw, subject)) { skippedDup++; continue; }
         const catRaw = typeof (raw as any).category === 'string' ? String((raw as any).category).trim().slice(0, 40) : undefined;
-        promoted.push({ memType: mtRaw, text: normalizeMarkdown(text, mtRaw), category: catRaw || undefined });
+        promoted.push({ memType: mtRaw, text: normalizeMarkdown(text, mtRaw), category: catRaw || undefined, subject });
       }
     }
     if (skippedDup > 0) console.log(`[reflect-incremental] 查重跳过 ${skippedDup} 条重复 promoted`);
 
-    // ① 晋升 → 项目级;晋升成功才清会话碎片(晋升即删)
+    // Promotion cannot prove that the rest of a session snapshot was absorbed.
+    // Keep it until the next successful rolling update; never delete on any promoted item.
     let promotedCount = 0;
     if (promoted.length > 0) {
-      try {
-        const ids = promoteToProject(proj, promoted, characterId);
-        promotedCount = ids.length;
-        if (ids.length > 0) {
-          try { deleteSessionFragments(proj, sessionId); }
-          catch (e: any) { console.error('[reflect-incremental] 晋升即删失败:', e.message); }
-        }
-      } catch (e: any) {
-        console.error('[reflect-incremental] 晋升失败:', e.message);
-      }
+      const ids = promoteToProject(proj, promoted, characterId);
+      promotedCount = ids.length;
+      if (ids.length !== promoted.length) return { ...base, promoted: promotedCount, errors: ['部分晋升失败；保留旧快照'] };
     }
 
     // ② sessionMemory 滚动覆盖(upsert 同 session_id)
@@ -328,7 +280,7 @@ ${lines}`;
         upsertSessionMemory(proj, sessionId, sessionMemory);
         sessionMemoryUpdated = true;
       } catch (e: any) {
-        console.error('[reflect-incremental] 会话滚动覆盖失败:', e.message);
+        return { ...base, promoted: promotedCount, errors: [`会话滚动覆盖失败: ${e.message}`] };
       }
     }
 
