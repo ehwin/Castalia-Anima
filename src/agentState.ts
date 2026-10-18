@@ -13,6 +13,7 @@
  *   const snapshot = state.getSnapshot();
  */
 import { DatabaseManager } from './db.js';
+import { normalizeProject } from './env.js';
 import { loadBiasesFromDb } from './bias.js';
 
 export interface AgentStateSnapshot {
@@ -35,6 +36,7 @@ const agentStates = new Map<string, AgentState>();
 
 class AgentState {
   private characterId: string;
+  private project: string;
   private moodHistory: MoodEvent[] = [];
   private currentDesire: string | null = null;
   private energy: number = 100;
@@ -44,8 +46,9 @@ class AgentState {
   private static MOOD_DECAY_RATE = 0.1;
   private static MOOD_HALF_LIFE_HOURS = 7;
 
-  constructor(characterId: string) {
+  constructor(characterId: string, project?: string) {
     this.characterId = characterId;
+    this.project = normalizeProject(project);
     this.loadFromDb();
     // Also load topic biases from existing memory tags
     loadBiasesFromDb(characterId);
@@ -56,7 +59,10 @@ class AgentState {
    */
   private loadFromDb(): void {
     try {
-      const db = DatabaseManager.getInstance();
+      // Mood snapshots belong to Anima's project memory partition.  The
+      // default (general) partition is metadata/shared state and must not
+      // be used here, otherwise agent mood leaks across harnesses.
+      const db = DatabaseManager.getInstance(this.project, 'project');
       const rows = db.prepare(`
         SELECT text, emotional_impact, created_at
         FROM memory
@@ -197,19 +203,20 @@ class AgentState {
    */
   private persistMoodMemory(value: number, reason: string): void {
     try {
-      const db = DatabaseManager.getInstance();
+      // Keep the in-memory state and its persisted snapshots in the same
+      // project partition so Hermes/DSH/general memories stay isolated.
+      const db = DatabaseManager.getInstance(this.project, 'project');
       const id = `mood_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
       const now = new Date().toISOString();
 
       db.prepare(`
-        INSERT INTO memory (id, text, type, category, subcategory, tags, emotional_impact, importance, character_id, source, subject, agent_mood, is_active, created_at, updated_at, last_accessed_at, accessed_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO memory (id, text, project, type, mem_type, category, subcategory, tags, emotional_impact, importance, character_id, source, subject, agent_mood, is_active, created_at, updated_at, last_accessed_at, accessed_count)
+        VALUES (?, ?, ?, ?, 'project', 'mood_snapshot', 'mood_event', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id,
         `[情绪快照] ${reason}，情绪值：${value >= 0 ? '+' : ''}${value}`,
+        this.project,
         'episodic',
-        'agent_mood',
-        'mood_event',
         JSON.stringify(['mood', 'self-reflection', value > 0 ? 'positive' : 'negative']),
         value,
         0.4,  // Low importance — moods are transient
@@ -229,16 +236,17 @@ class AgentState {
 /**
  * Get or create AgentState for a character.
  */
-export function getAgentState(characterId: string): AgentState {
-  if (!agentStates.has(characterId)) {
-    agentStates.set(characterId, new AgentState(characterId));
+export function getAgentState(characterId: string, project?: string): AgentState {
+  const key = `${normalizeProject(project)}|${characterId}`;
+  if (!agentStates.has(key)) {
+    agentStates.set(key, new AgentState(characterId, project));
   }
-  return agentStates.get(characterId)!;
+  return agentStates.get(key)!;
 }
 
 /**
  * Get formatted prompt string for a character's current state.
  */
-export function getAgentPrompt(characterId: string): string {
-  return getAgentState(characterId).toPromptString();
+export function getAgentPrompt(characterId: string, project?: string): string {
+  return getAgentState(characterId, project).toPromptString();
 }

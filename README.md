@@ -6,6 +6,8 @@ Neutral core stays in Castalia; Anima feeds emotional features back upstream —
 
 > **Emotional edition (this repo).** For the neutral single-instance edition see **[Castalia](https://github.com/ehwin/Castalia)**; for the neutral full edition with cross-library federation (`reflect_all` / `memory_search_all` over `FEDERATION_DIRS`) see **[Castalia-Full](https://github.com/ehwin/Castalia-Full)**.
 
+Anima owns its bank, emotional state, and reflection pipeline. Its `memory_search` only returns Anima records and has no Full dependency. A consumer such as AIRI may independently read both Anima and Full's aggregate output; configure that integration in the consumer, not inside Anima. Full reads source banks without writing back to them.
+
 > 📖 详细技术设计见 [docs/TECHNICAL.md](docs/TECHNICAL.md)。
 
 ---
@@ -67,6 +69,10 @@ Copy `memory/config.json` from the template (or create it) to wire the two LLM c
 ---
 
 ## Features
+
+### SillyTavern integration
+
+The optional [SillyTavern adapter](integrations/sillytavern/README.md) adds a default-off switch for each chat, isolated user/chat projects, selected-message synchronization (including edits, swipes and deletions), and generation-time recall with a token budget. It uses a separate bank and does not enable the emotion/profile/reflection pipelines. Build Anima first, then install the adapter's frontend extension and server plugin.
 
 ### Personality layer (Anima-only)
 

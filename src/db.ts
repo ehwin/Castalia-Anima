@@ -191,6 +191,7 @@ export function initProjectSchema(db: Database.Database) {
       category TEXT DEFAULT 'general',
       subcategory TEXT,
       tags TEXT DEFAULT '[]',
+      emotional_impact REAL DEFAULT 0,
       importance REAL DEFAULT 0.5,
       character_id TEXT,
       source TEXT,
@@ -202,7 +203,8 @@ export function initProjectSchema(db: Database.Database) {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       last_accessed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       accessed_count INTEGER DEFAULT 0,
-      reference_count INTEGER DEFAULT 0
+      reference_count INTEGER DEFAULT 0,
+      metadata TEXT
     );
 
     CREATE TABLE IF NOT EXISTS edges (
@@ -253,6 +255,13 @@ export function initProjectSchema(db: Database.Database) {
   const migrations = [
     `ALTER TABLE memory ADD COLUMN tier TEXT DEFAULT 'standard'`,
     `ALTER TABLE memory ADD COLUMN expires_at DATETIME`,
+    `ALTER TABLE memory ADD COLUMN agent_mood TEXT`,
+    `ALTER TABLE memory ADD COLUMN agent_desire TEXT`,
+    `ALTER TABLE memory ADD COLUMN vad_valence REAL`,
+    `ALTER TABLE memory ADD COLUMN vad_arousal REAL`,
+    `ALTER TABLE memory ADD COLUMN vad_dominance REAL`,
+    `ALTER TABLE memory ADD COLUMN tsundere_level REAL DEFAULT 0`,
+    `ALTER TABLE memory ADD COLUMN metadata TEXT`,
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch (_e) { /* already exists */ }
@@ -273,6 +282,7 @@ export function initProjectSchema(db: Database.Database) {
 
   // v1.8: mem_type column — 用途维度(Claude Code 4 种封闭类型),默认 general
   try { db.exec(`ALTER TABLE memory ADD COLUMN mem_type TEXT DEFAULT 'general'`); } catch (_e) { /* already exists */ }
+  try { db.exec(`ALTER TABLE memory ADD COLUMN emotional_impact REAL DEFAULT 0`); } catch (_e) { /* already exists */ }
   try { db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_mem_type ON memory(mem_type, is_active)`); } catch (_e) {}
 
   // Unique index for fact dedup (per-project: same SPO allowed across projects)
@@ -360,6 +370,33 @@ export class DatabaseManager {
       console.error('[db] register project failed:', e.message);
     }
     return db;
+  }
+
+  /**
+   * 项目下**实际存在**的分类库(不创建空库)。
+   * 只读工具用它遍历,避免 stats_get/context 在项目目录不存在时凭空造出 5 个 sqlite。
+   */
+  public static existingMemTypes(project?: string): string[] {
+    const proj = normalizeProject(project);
+    if (isLegacyMode()) return ['general'];
+    return listMemTypeDirs(proj).filter((mt) =>
+      fs.existsSync(path.join(memDir(), safeFilePart(proj), memTypeDir(mt), 'memory.sqlite')));
+  }
+
+  /**
+   * 跨分类库查询:对项目下每个已存在的 memType 库执行同一条 SQL,合并结果。
+   * 调用方负责跨库排序/截断(每个库的 LIMIT 各自生效,不能直接当全局 LIMIT)。
+   */
+  public static queryAll<T = any>(project: string | undefined, sql: string, params: any[] = []): T[] {
+    const proj = normalizeProject(project);
+    if (isLegacyMode()) return DatabaseManager.getInstance(proj).prepare(sql).all(...params) as T[];
+    const out: T[] = [];
+    for (const mt of DatabaseManager.existingMemTypes(proj)) {
+      try {
+        out.push(...(DatabaseManager.getInstance(proj, mt).prepare(sql).all(...params) as T[]));
+      } catch { /* 单个分类库损坏不阻断其它库 */ }
+    }
+    return out;
   }
 
   /** 全局库(global.sqlite):L1/L2 指令 + rule 规则组 + 项目注册表。兼容模式下返回单库。 */

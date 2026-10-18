@@ -24,7 +24,7 @@ export async function autoProcess(args) {
         details: [],
     };
     if (args.moodValue !== undefined) {
-        const state = getAgentState(cid);
+        const state = getAgentState(cid, proj);
         state.addMood(args.moodValue, args.moodReason || '');
         results.moodProcessed = true;
         results.details.push('mood=' + args.moodValue + ' (' + args.moodReason + ')');

@@ -70,24 +70,28 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
 
   // ═══ 精确去重：完全相同的文本不重复存(仅限同项目) ═══
   const exactDup = db.prepare(`
-    SELECT id FROM memory
-    WHERE is_active = 1 AND project = ? AND LOWER(TRIM(text)) = LOWER(TRIM(?))
+    SELECT * FROM memory
+    WHERE is_active = 1 AND project = ? AND TRIM(text) = TRIM(?)
+      AND session_id IS ? AND subject = ?
     LIMIT 1
-  `).get(project, text?.trim() || '') as any;
+  `).get(project, text?.trim() || '', params.sessionId ?? null, params.subject ?? 'user') as any;
 
   if (exactDup) {
     db.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(exactDup.id);
+    let storedTags: string[] = [];
+    try { storedTags = JSON.parse(exactDup.tags || '[]'); } catch { /* keep empty */ }
     return {
-      id: exactDup.id, text, project,
-      sessionId: null,
-      type: params.type ?? 'episodic', memType, category: params.category ?? 'general',
-      subcategory: params.subcategory ?? null, tags: params.tags ?? [],
-      emotionalImpact: params.emotionalImpact ?? 0, importance: params.importance ?? 0.5,
-      characterId: params.characterId ?? null, source: params.source ?? null,
-      subject: params.subject ?? 'user',
-      tier: params.tier ?? 'standard', expiresAt: null,
+      id: exactDup.id, text: exactDup.text, project: exactDup.project,
+      sessionId: exactDup.session_id ?? null,
+      type: exactDup.type, memType: exactDup.mem_type || memType, category: exactDup.category,
+      subcategory: exactDup.subcategory ?? null, tags: storedTags,
+      emotionalImpact: exactDup.emotional_impact ?? 0, importance: exactDup.importance ?? 0.5,
+      characterId: exactDup.character_id ?? null, source: exactDup.source ?? null,
+      subject: exactDup.subject ?? 'user',
+      tier: exactDup.tier ?? 'standard', expiresAt: exactDup.expires_at ?? null,
       isActive: true,
-      createdAt: now, updatedAt: now, lastAccessedAt: now, accessedCount: 0,
+      createdAt: exactDup.created_at, updatedAt: exactDup.updated_at, lastAccessedAt: exactDup.last_accessed_at,
+      accessedCount: exactDup.accessed_count ?? 0,
     } as MemoryRecord;
     }
 
@@ -194,6 +198,10 @@ export function findDbByMemoryId(id: string, project?: string): { db: Database.D
   const proj = normalizeProject(project);
   for (const mt of listMemTypeDirs(proj)) {
     const db = DatabaseManager.getInstance(proj, mt);
+    if (db.prepare('SELECT id FROM memory WHERE id = ? AND is_active = 1').get(id)) return { db, memType: mt };
+  }
+  for (const mt of listMemTypeDirs(proj)) {
+    const db = DatabaseManager.getInstance(proj, mt);
     if (db.prepare('SELECT id FROM memory WHERE id = ?').get(id)) return { db, memType: mt };
   }
   return null;
@@ -225,8 +233,8 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>): P
     const tags = updates.tags !== undefined ? JSON.stringify(updates.tags) : (existing.tags ?? '[]');
     const now = new Date().toISOString();
     newDb.prepare(`
-      INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, emotional_impact)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       text,
@@ -246,7 +254,11 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>): P
       existing.created_at, now, now,
       existing.accessed_count, existing.reference_count ?? 0,
       existing.locked ?? 0,
+      updates.emotionalImpact ?? existing.emotional_impact ?? 0,
     );
+    const emotionFields = ['metadata', 'agent_mood', 'agent_desire', 'vad_valence', 'vad_arousal', 'vad_dominance', 'tsundere_level'];
+    newDb.prepare(`UPDATE memory SET ${emotionFields.map(name => `${name} = ?`).join(', ')} WHERE id = ?`)
+      .run(...emotionFields.map(name => existing[name] ?? null), id);
     // 向量一并搬移(若有)
     try {
       const srcVec = db.prepare('SELECT embedding FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id = ?)').get(id) as any;
@@ -322,7 +334,8 @@ export async function saveConversationTurn(
     moodPrefix += ']\n';
   }
 
-  const text = `${moodPrefix}用户: ${userMsg}\n助手: ${assistantMsg}`;
+  const assistantName = (process.env.CASTALIA_ASSISTANT_NAME || '助手').trim() || '助手';
+  const text = `${moodPrefix}用户: ${userMsg}\n${assistantName}: ${assistantMsg}`;
 
   db.prepare(`
     INSERT INTO memory (id, text, project, type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
@@ -611,7 +624,7 @@ export function upsertSessionMemory(
  */
 export function promoteToProject(
   project: string,
-  items: { memType: MemType; text: string; category?: string }[],
+  items: { memType: MemType; text: string; category?: string; subject?: 'user' | 'self' | 'environment' }[],
   characterId?: string,
 ): string[] {
   const cid = characterId || CHAR_ID;
@@ -627,15 +640,15 @@ export function promoteToProject(
     const md = normalizeMarkdown(text, mt);
     const dup = db.prepare(`
       SELECT id FROM memory
-      WHERE is_active = 1 AND project = ? AND session_id IS NULL AND LOWER(TRIM(text)) = LOWER(TRIM(?))
+      WHERE is_active = 1 AND project = ? AND session_id IS NULL AND TRIM(text) = TRIM(?) AND subject = ?
       LIMIT 1
-    `).get(proj, md) as any;
+    `).get(proj, md, item.subject || 'user') as any;
     if (dup) { ids.push(dup.id); continue; }
     const id = generateId();
     db.prepare(`
       INSERT INTO memory (id, text, project, session_id, type, mem_type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
-      VALUES (?, ?, ?, NULL, 'semantic', ?, ?, '[]', 0.6, ?, 'session_promoted', 'user', 'standard', 1, ?, ?, ?, 0, 0)
-    `).run(id, md, proj, mt, (item.category && String(item.category).trim().slice(0, 40)) || 'knowledge', cid, now, now, now);
+      VALUES (?, ?, ?, NULL, 'semantic', ?, ?, '[]', 0.6, ?, 'session_promoted', ?, 'standard', 1, ?, ?, ?, 0, 0)
+    `).run(id, md, proj, mt, (item.category && String(item.category).trim().slice(0, 40)) || 'knowledge', cid, item.subject || 'user', now, now, now);
     ids.push(id);
   }
   return ids;

@@ -1,0 +1,7 @@
+{
+  "name": "sillytavern-castalia-anima",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.mjs",
+  "engines": { "node": ">=20" }
+}

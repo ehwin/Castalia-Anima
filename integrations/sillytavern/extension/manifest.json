@@ -1,0 +1,12 @@
+{
+  "display_name": "Castalia Anima · 聊天记忆",
+  "loading_order": 110,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "version": "0.1.0",
+  "author": "Castalia",
+  "generate_interceptor": "castaliaAnimaRecall",
+  "hooks": { "activate": "init" }
+}
