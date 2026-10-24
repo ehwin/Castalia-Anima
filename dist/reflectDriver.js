@@ -557,6 +557,7 @@ export async function runConsolidate(charId = 'default', project, threshold, lim
         factRows = DatabaseManager.getInstance(proj).prepare(`
       SELECT id, subject, predicate, object, confidence FROM facts
       WHERE is_active = 1 AND project = ? AND confidence >= 0.6
+        AND (valid_to IS NULL OR valid_to = '')
       ORDER BY updated_at DESC LIMIT 80
     `).all(proj);
     }

@@ -30,6 +30,12 @@ export const CONSOLIDATE_BUCKET_PAIRS = (() => {
   return Number.isFinite(v) && v >= 0 ? v : 3;
 })();
 
+/** v1.23.1: 给结构兜底候选预留名额，避免语义候选占满 limit 后同表头重复永远进不了裁决。 */
+export const CONSOLIDATE_BUCKET_RESERVE = (() => {
+  const v = parseInt(process.env.CONSOLIDATE_BUCKET_RESERVE || '15', 10);
+  return Number.isFinite(v) && v >= 0 ? v : 15;
+})();
+
 /** 候选对数上限,防止相似爆炸 */
 export const CONSOLIDATE_MAX_PAIRS = (() => {
   const v = parseInt(process.env.CONSOLIDATE_MAX_PAIRS || '50', 10);
@@ -53,6 +59,8 @@ function scanVectorPairs(db: any, proj: string, threshold: number, limit: number
   const mems = db.prepare(`
     SELECT m.rowid, m.id FROM memory m
     WHERE m.is_active = 1 AND m.project = ? AND (m.locked IS NULL OR m.locked = 0)
+      AND COALESCE(m.tier, 'standard') <> 'critical'
+      AND COALESCE(m.status, '') NOT IN ('cold', 'superseded')
     ORDER BY m.created_at DESC
     LIMIT 500
   `).all(proj) as any[];
@@ -120,6 +128,8 @@ function scanStructPairs(db: any, proj: string, limit: number, seen: Set<string>
       rows2 = db.prepare(`
         SELECT id, text, mem_type FROM memory
         WHERE is_active = 1 AND project = ? AND (locked IS NULL OR locked = 0)
+          AND COALESCE(tier, 'standard') <> 'critical'
+          AND COALESCE(status, '') NOT IN ('cold', 'superseded')
         ORDER BY created_at DESC LIMIT 500
       `).all(proj) as any[];
     } catch { rows2 = []; }
@@ -166,9 +176,12 @@ export async function findSimilarCandidates(
   // "报告式"重复(带 # 表头的成组记录)完全够不到,LLM 也就无从裁决。
   // 逐库扫描并把候选并起来;两阶段(先全库语义 → 再全库结构)是为了让表头对不挤占语义候选的名额。
   const dirs = listMemTypeDirs(proj);
+  // 语义预筛给结构兜底预留名额（v1.23.1）
+  const structReserve = Math.min(CONSOLIDATE_BUCKET_RESERVE, limit);
+  const vecLimit = Math.max(1, limit - structReserve);
   for (const mt of dirs) {
-    if (pairs.length >= limit) break;
-    scanVectorPairs(DatabaseManager.getInstance(project, mt), proj, threshold, limit, seen, pairs);
+    if (pairs.length >= vecLimit) break;
+    scanVectorPairs(DatabaseManager.getInstance(project, mt), proj, threshold, vecLimit, seen, pairs);
   }
   if (CONSOLIDATE_BUCKET_PAIRS > 0) {
     for (const mt of dirs) {

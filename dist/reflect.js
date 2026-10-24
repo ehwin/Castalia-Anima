@@ -593,7 +593,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         continue;
                     }
                     // v1.23: critical 核心记忆不得被自动反思删除
-                    const _delR = memDbFor(action.targetId, project, db).prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical'").run(action.targetId);
+                    const _delR = memDbFor(action.targetId, project, db).prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical'").run(action.targetId);
                     receipt.rowsAffected = _delR.changes;
                     if (_delR.changes === 0) {
                         receipt.status = 'failed';

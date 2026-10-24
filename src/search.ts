@@ -616,7 +616,8 @@ export async function searchFacts(
     rowidMap.set(Number(r.rowid), r.distance);
   }
 
-  const conditions = ['f.is_active = 1', 'f.project = ?', `f.rowid IN (${knnRows.map(() => '?').join(',')})`];
+  // v1.23.1: 已失效（valid_to 有值）的旧事实不进检索结果
+  const conditions = ['f.is_active = 1', 'f.project = ?', "(f.valid_to IS NULL OR f.valid_to = '')", `f.rowid IN (${knnRows.map(() => '?').join(',')})`];
   const params: any[] = [proj, ...knnRows.map(r => Number(r.rowid))];
   if (options.subject) { conditions.push('f.subject = ?'); params.push(options.subject); }
 

@@ -513,7 +513,8 @@ export async function saveFacts(facts, sourceMemoryId = null, characterId = 'air
 export function getFactsBySubject(subject, characterId, project) {
     const db = DatabaseManager.getInstance(project);
     const proj = normalizeProject(project);
-    let query = 'SELECT * FROM facts WHERE subject = ? AND is_active = 1 AND project = ?';
+    // v1.23.1: 默认只返回当前有效事实；历史版本留在表里（valid_to 有值）供按需追溯
+    let query = "SELECT * FROM facts WHERE subject = ? AND is_active = 1 AND project = ? AND (valid_to IS NULL OR valid_to = '')";
     const params = [subject, proj];
     if (characterId) {
         query += ' AND character_id = ?';

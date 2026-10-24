@@ -26,7 +26,7 @@ Object.assign(process.env, {
 
 const load = name => import(pathToFileURL(path.join(root, 'dist', name + '.js')).href);
 const { DatabaseManager } = await load('db');
-const { saveMemory, saveFacts, markColdMemories, findDbByMemoryId } = await load('store');
+const { saveMemory, saveFacts, markColdMemories, findDbByMemoryId, getFactsBySubject } = await load('store');
 const { searchMemory, getRecentMemories, hydrateParentExcerpts } = await load('search');
 const { applyReflectResult, applyReflectActions, listAllMemories } = await load('reflect');
 const { runConsolidate, runAutoReflect, shouldAutoReflect } = await load('reflectDriver');
@@ -354,6 +354,21 @@ check(!listed.includes(sup.id), 'listAllMemories skips superseded memories');
   const cond2 = shouldAutoReflect('airi', BP);
   check(!/退避/.test(cond2.reason), 'a successful run clears the backoff: ' + JSON.stringify(cond2));
 }
+
+// ══════════════════════════════════════════════════════════════
+// 13) 读侧只返回当前有效事实 + identity_locked 删除保护
+// ══════════════════════════════════════════════════════════════
+await saveFacts([{ subject: 'user', predicate: '居住地', object: '北京', confidence: 0.9 }], null, 'airi', P);
+await saveFacts([{ subject: 'user', predicate: '居住地', object: '上海', confidence: 0.9 }], null, 'airi', P);
+const currentHome = getFactsBySubject('user', undefined, P).filter(f => f.predicate === '居住地');
+check(currentHome.length === 1 && currentHome[0].object === '上海',
+  'fact read path hides invalidated values: ' + JSON.stringify(currentHome.map(f => f.object)));
+const lockMem = await saveMemory({ project: P, text: '身份锁删除保护测试' });
+setMem(lockMem.id, 'UPDATE memory SET identity_locked = 1 WHERE id = ?');
+const delRes = await applyReflectActions([{ action: 'delete', targetId: lockMem.id }], 'airi', P,
+  { allowedSourceIds: new Set([lockMem.id]) });
+check(delRes.receipts[0]?.status === 'failed' && memRow(lockMem.id).is_active === 1,
+  'identity-locked memory cannot be deleted by reflection');
 
 check(embedCalls === 0, 'no embedding/network calls were made');
 

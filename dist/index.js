@@ -418,9 +418,11 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         ORDER BY created_at DESC LIMIT 9
       `, [proj]).sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))).slice(0, 9);
         // 4. 关键事实(高置信度)
+        // v1.23.1: 只注入当前有效事实；被新值推翻的旧事实保留在库里（valid_to 有值）但不再进 prompt
         const facts = db.prepare(`
         SELECT subject, predicate, object, confidence FROM facts
         WHERE is_active = 1 AND project = ? AND confidence >= 0.7
+          AND (valid_to IS NULL OR valid_to = '')
         ORDER BY confidence DESC, created_at DESC LIMIT 5
       `).all(proj);
         // 4.5 记忆索引层(4 种封闭类型,轻量摘要 — 对应 Claude Code MEMORY.md,先索引后详情)
