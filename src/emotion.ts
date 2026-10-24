@@ -652,6 +652,8 @@ export async function batchClassifyAndTag(texts: string[]): Promise<number> {
     let { DatabaseManager } = await import('./db.js');
     const db = DatabaseManager.getInstance();
 
+    // 注意：这里是“最近 N 条 conversation_log”与队列做位置对齐，队列本身不带 id，
+    // 多项目/多条日志时仍可能错位（待改成按 id 回写）。DESC 至少保证只动最近的行。
     const recentIds = db.prepare(`
       SELECT id FROM memory
       WHERE source = 'conversation_log' AND is_active = 1
@@ -665,7 +667,7 @@ export async function batchClassifyAndTag(texts: string[]): Promise<number> {
       const imp = clamp(r.importance || 0.5, 0, 1);
       const tier = imp >= 0.7 ? 'critical' : (imp <= 0.3 ? 'temporary' : 'standard');
       const cat = validCategories.includes(r.category) ? r.category : 'general';
-      const tags = Array.isArray(r.tags) ? r.tags.slice(0, 5).join(',') : '';
+      const tags = JSON.stringify(Array.isArray(r.tags) ? r.tags.slice(0, 5) : []);
 
       db.prepare(`UPDATE memory SET category = ?, importance = ?, tier = ?, tags = ? WHERE id = ?`)
         .run(cat, imp, tier, tags, recentIds[i]);

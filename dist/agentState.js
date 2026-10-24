@@ -51,7 +51,7 @@ class AgentState {
         LIMIT 20
       `).all(this.characterId);
             this.moodHistory = rows.reverse().map(r => ({
-                value: r.emotional_impact,
+                value: Math.max(-10, Math.min(10, Number(r.emotional_impact) || 0)),
                 reason: r.text.replace(/^\[情绪快照\] /, '').replace(/，情绪值：[+-]?\d+$/, ''),
                 timestamp: new Date(r.created_at).getTime(),
             }));
@@ -64,8 +64,9 @@ class AgentState {
      * Add a mood event. Automatically aggregates with decay.
      */
     addMood(value, reason) {
+        const clamped = Math.max(-10, Math.min(10, Number.isFinite(Number(value)) ? Number(value) : 0));
         this.moodHistory.push({
-            value: Math.max(-10, Math.min(10, value)),
+            value: clamped,
             reason,
             timestamp: Date.now(),
         });
@@ -75,8 +76,8 @@ class AgentState {
         }
         this.lastUpdated = Date.now();
         // Persist significant mood events as long-term memory
-        if (Math.abs(value) >= 7) {
-            this.persistMoodMemory(value, reason);
+        if (Math.abs(clamped) >= 7) {
+            this.persistMoodMemory(clamped, reason);
         }
     }
     /**
@@ -170,6 +171,7 @@ class AgentState {
      */
     persistMoodMemory(value, reason) {
         try {
+            value = Math.max(-10, Math.min(10, Number.isFinite(Number(value)) ? Number(value) : 0));
             // Keep the in-memory state and its persisted snapshots in the same
             // project partition so Hermes/DSH/general memories stay isolated.
             const db = DatabaseManager.getInstance(this.project, 'project');

@@ -22,6 +22,18 @@ const WEIGHT_CONSISTENCY = parseFloat(process.env.WEIGHT_CONSISTENCY || '0.30');
 const WEIGHT_EMOTION = parseFloat(process.env.WEIGHT_EMOTION || '0.45'); // 情感强度 — 主锚
 const WEIGHT_TIME = parseFloat(process.env.WEIGHT_TIME || '0.15'); // 时间衰减
 const WEIGHT_DEVIATION = parseFloat(process.env.WEIGHT_DEVIATION || '0.10'); // "不像她"的珍贵瞬间
+/** v1.23.1-fix: tags 列出现过被写成逗号串的历史数据；单条脏行不能让整个检索库失败。 */
+function parseTagsSafe(raw) {
+    if (Array.isArray(raw))
+        return raw;
+    try {
+        const v = JSON.parse(String(raw ?? '[]'));
+        return Array.isArray(v) ? v : [];
+    }
+    catch {
+        return [];
+    }
+}
 // minScore 阈值可配;harness 可用 SEARCH_MIN_SCORE 覆盖
 const SEARCH_PROFILES = {
     quick: { topK: 3, minScore: 0.6 },
@@ -41,7 +53,7 @@ function computeEmotionalIntensity(row) {
     const tsundereLvl = row.tsundere_level || 0;
     const hoursSinceCreated = (Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60);
     const decayed = computeDecay(storedVAD, hoursSinceCreated, tsundereLvl, isNightTime());
-    const baseIntensity = storedVAD ? computeBaseIntensity(storedVAD) : Math.abs(row.emotional_impact || 0) / 10;
+    const baseIntensity = storedVAD ? computeBaseIntensity(storedVAD) : Math.min(1, Math.abs(Number(row.emotional_impact) || 0) / 10);
     const emotionalIntensity = storedVAD ? decayed.intensity : baseIntensity;
     return { emotionalIntensity, baseIntensity, isHighEmotion: baseIntensity >= 0.7 };
 }
@@ -55,7 +67,7 @@ function computeScore(row, similarity) {
     const tierBoost = row.tier === 'critical' ? 3.0 : (row.tier === 'temporary' ? 0.5 : 1.0);
     const importanceMult = 0.5 + (row.importance || 0.5);
     const accessBoost = 1 + Math.min(0.5, Math.log2(1 + (row.accessed_count || 0)) * 0.1);
-    const memTags = Array.isArray(row.tags) ? row.tags : JSON.parse(row.tags || '[]');
+    const memTags = parseTagsSafe(row.tags);
     const biasBoost = computeBiasBoost(row.character_id || '', memTags);
     const rawScore = WEIGHT_CONSISTENCY * consistency
         + WEIGHT_EMOTION * emotionalIntensity
@@ -236,7 +248,7 @@ function tagSearch(db, options) {
     LIMIT ?
   `).all(...params, topK * 3);
     return rows.map(row => {
-        const memTags = JSON.parse(row.tags || '[]');
+        const memTags = parseTagsSafe(row.tags);
         const matchedTags = keywords.filter(k => memTags.some((t) => t.toLowerCase().includes(k.toLowerCase()))).length;
         const tagScore = Math.min(1.0, matchedTags / Math.max(1, keywords.length));
         const { score, biasBoost } = computeScore(row, tagScore);
@@ -314,7 +326,7 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
         if (score >= minScore) {
             results.push({
                 id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
-                subcategory: row.subcategory, tags: JSON.parse(row.tags || '[]'),
+                subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
                 emotionalImpact: row.emotional_impact ?? 0,
                 importance: row.importance,
                 characterId: row.character_id, source: row.source,
@@ -375,7 +387,7 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
         const { score, biasBoost } = computeScore(row, 0.3);
         return {
             id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
-            subcategory: row.subcategory, tags: JSON.parse(row.tags || '[]'),
+            subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
             emotionalImpact: row.emotional_impact ?? 0,
             importance: row.importance,
             characterId: row.character_id, source: row.source,
@@ -507,7 +519,7 @@ export function getRecentMemories(characterId, limit = 5, hoursBack = 24, projec
       `).all(...params);
             all.push(...rows.map(row => ({
                 id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
-                subcategory: row.subcategory, tags: JSON.parse(row.tags || '[]'),
+                subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
                 importance: row.importance,
                 emotionalImpact: row.emotional_impact ?? 0,
                 agentMood: null, agentDesire: null, biasBoost: 0,

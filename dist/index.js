@@ -229,7 +229,7 @@ register('memory_save', 'harness', 'Store a new memory or update existing one by
     memType: z.enum(MEM_TYPES).optional().describe('用途维度:user=AI对用户画像,feedback=行为纠正,project=情感记忆(情感分区),reference=外部链接,general=默认;非general强制Markdown结构'),
     category: z.string().optional().default('general'),
     tags: z.array(z.string()).optional().default([]),
-    emotionalImpact: z.number().optional().describe('Anima: emotional impact scalar (0-10). The VAD three-dimensional layer is written back separately by the emotion pipeline.'),
+    emotionalImpact: z.number().min(0).max(10).optional().describe('Anima: emotional impact scalar (0-10). The VAD three-dimensional layer is written back separately by the emotion pipeline.'),
     importance: z.number().optional().default(0.5),
     tier: z.enum(['temporary', 'standard', 'critical']).optional().default('standard'),
     source: z.string().optional(),
@@ -305,7 +305,7 @@ register('memory_log', 'harness', 'Log a cognitive entry (decision/pattern/mista
 register('auto_process', 'harness', '[Internal] Process a conversation turn: save to log, update agent mood, observe user, queue VAD analysis. Called automatically after each LLM response.', {
     userMessage: z.string(),
     assistantMessage: z.string(),
-    moodValue: z.number().optional(),
+    moodValue: z.number().min(-10).max(10).optional(),
     moodReason: z.string().optional(),
     sessionId: z.string().optional().describe('Session identifier for progressive in-session reflection (rolls session memory, promotes long-term facts). Omit to keep the legacy behavior (no session buffer).'),
     characterId: z.string().optional().describe('AI persona charId (optional; defaults to the persona resolved from project, falling back to CHAR_ID). Explicit value takes priority.'),
@@ -335,7 +335,7 @@ register('digest_run', 'harness', '[Internal] Run the digest cycle: flush VAD qu
 register('conversation_save', 'harness', '[Internal] Save a raw conversation turn to the log (no analysis, no embedding).', {
     userMessage: z.string(),
     assistantMessage: z.string(),
-    moodValue: z.number().optional(),
+    moodValue: z.number().min(-10).max(10).optional(),
     moodReason: z.string().optional(),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {

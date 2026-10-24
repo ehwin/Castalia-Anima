@@ -1,6 +1,6 @@
 {
   "name": "castalia-anima",
-  "version": "1.23.1",
+  "version": "1.23.2",
   "description": "Castalia Anima — emotional memory MCP server: Castalia core + agent state, bias layer, user learning, emotion-weighted search",
   "type": "module",
   "main": "dist/index.js",

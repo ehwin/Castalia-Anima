@@ -370,6 +370,16 @@ const delRes = await applyReflectActions([{ action: 'delete', targetId: lockMem.
 check(delRes.receipts[0]?.status === 'failed' && memRow(lockMem.id).is_active === 1,
   'identity-locked memory cannot be deleted by reflection');
 
+// ══════════════════════════════════════════════════════════════
+// 14) 脏 tags 不炸检索 + 情绪值 clamp
+// ══════════════════════════════════════════════════════════════
+const dirty = await saveMemory({ project: P, text: '脏 tags 检索测试 3318', tags: ['正常'] });
+memDb(dirty.id).prepare("UPDATE memory SET tags='不是JSON,逗号串' WHERE id=?").run(dirty.id);
+const dirtyHits = await searchMemory({ query: '脏 tags 检索', topK: 5, project: P });
+check(dirtyHits.some(h => h.id === dirty.id), 'a row with non-JSON tags does not break search');
+const over = await saveMemory({ project: P, text: '情绪上限 clamp 测试', emotionalImpact: 99 });
+check(Number(memRow(over.id).emotional_impact) <= 10, 'emotionalImpact is clamped to the 0-10 range');
+
 check(embedCalls === 0, 'no embedding/network calls were made');
 
 DatabaseManager.close();

@@ -142,7 +142,7 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
     category: params.category ?? 'general',
     subcategory: params.subcategory ?? null,
     tags: params.tags ?? [],
-    emotionalImpact: params.emotionalImpact ?? 0,
+    emotionalImpact: Math.max(0, Math.min(10, Number(params.emotionalImpact) || 0)),
     importance: params.importance ?? 0.5,
     characterId: params.characterId ?? null,
     source: params.source ?? null,
