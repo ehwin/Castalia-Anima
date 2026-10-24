@@ -299,9 +299,24 @@ export function initProjectSchema(db: Database.Database) {
   try { db.exec(`ALTER TABLE facts ADD COLUMN valid_to DATETIME`); } catch (_e) { /* already exists */ }
   try { db.exec(`ALTER TABLE facts ADD COLUMN evidence TEXT`); } catch (_e) { /* already exists */ }
 
+  // v1.23.2: 衰减基线 + 向量化失败计数（与 Castalia 核心同步）
+  try { db.exec(`ALTER TABLE memory ADD COLUMN base_importance REAL`); } catch (_e) { /* already exists */ }
+  try { db.exec(`ALTER TABLE memory ADD COLUMN embed_fail_count INTEGER DEFAULT 0`); } catch (_e) { /* already exists */ }
+  try { db.exec(`UPDATE memory SET base_importance = importance WHERE base_importance IS NULL`); } catch (_e) {}
+  try {
+    db.exec(`CREATE TRIGGER IF NOT EXISTS trg_memory_base_importance AFTER INSERT ON memory
+             WHEN NEW.base_importance IS NULL
+             BEGIN UPDATE memory SET base_importance = NEW.importance WHERE id = NEW.id; END`);
+  } catch (_e) { /* trigger 已存在 */ }
+
   // Unique index for fact dedup (per-project: same SPO allowed across projects)
-  try { db.exec(`DROP INDEX IF EXISTS idx_facts_spo`); } catch (_e) {}
-  try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_spo ON facts(subject, predicate, object, project)`); } catch (_e) {}
+  // v1.23.2-fix: 不再每次启动 DROP 再重建（重建失败会让 facts 的 ON CONFLICT 直接不可用）
+  try {
+    const idx = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_facts_spo'").get() as any;
+    if (!idx) db.exec(`CREATE UNIQUE INDEX idx_facts_spo ON facts(subject, predicate, object, project)`);
+  } catch (e: any) {
+    console.error(`[db] facts 唯一索引未建立（存在重复 SPO 或旧库）: ${e.message}`);
+  }
   try { db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject, is_active)`); } catch (_e) {}
 
   // 指令表(保持原 schema:项目库也建;三层指令路由在 instructions.ts 决定)

@@ -212,9 +212,13 @@ export async function consolidate(): Promise<ConsolidateResult> {
     const db = DatabaseManager.getInstance(proj, mt);
 
     // ═══ Phase 1: sigmoid 时间衰减 ═══
+    // v1.23.2-fix: 从 base_importance 基线算（否则衰减取决于 consolidate 运行次数）；
+    // identity_locked 与 forgetMemory 同款保护，不参与自动剪枝。
     const activeRecords = db.prepare(`
-      SELECT id, importance, last_accessed_at
-      FROM memory WHERE is_active = 1 AND COALESCE(source, '') != 'manual_lore' AND tier != 'critical' AND (locked IS NULL OR locked = 0)
+      SELECT id, importance, COALESCE(base_importance, importance) AS base_importance, last_accessed_at
+      FROM memory WHERE is_active = 1 AND COALESCE(source, '') != 'manual_lore'
+        AND COALESCE(tier, 'standard') != 'critical' AND (locked IS NULL OR locked = 0)
+        AND COALESCE(identity_locked, 0) = 0
     `).all() as any[];
 
     const decayTx = db.transaction(() => {
@@ -224,15 +228,16 @@ export async function consolidate(): Promise<ConsolidateResult> {
         const hoursSince = (now - ts) / 3600000;
         const daysSince = hoursSince / 24;
         const decay = 1.0 / (1.0 + Math.exp(0.04 * (daysSince - 90)));
-        const newImportance = Math.round(mem.importance * decay * 1000) / 1000;
+        const base = Number(mem.base_importance ?? mem.importance) || 0;
+        const newImportance = Math.round(base * decay * 1000) / 1000;
 
         if (newImportance < ACTIVATION_THRESHOLD && daysSince > 60) {
           db.prepare('UPDATE memory SET is_active = 0, importance = ? WHERE id = ?')
             .run(newImportance, mem.id);
           prunedCount++;
         } else {
-          db.prepare('UPDATE memory SET importance = ? WHERE id = ?')
-            .run(newImportance, mem.id);
+          db.prepare('UPDATE memory SET importance = ?, base_importance = ? WHERE id = ?')
+            .run(newImportance, base, mem.id);
           updatedCount++;
         }
       }
@@ -246,7 +251,10 @@ export async function consolidate(): Promise<ConsolidateResult> {
 
     for (const dup of dupes) {
       db.prepare(
-        'UPDATE memory SET reference_count = 0, importance = MIN(0.95, importance + 0.1) WHERE id = ?'
+        `UPDATE memory SET reference_count = 0,
+           importance = MIN(0.95, COALESCE(base_importance, importance) + 0.1),
+           base_importance = MIN(0.95, COALESCE(base_importance, importance) + 0.1)
+         WHERE id = ?`
       ).run(dup.id);
       consolidateCount++;
     }

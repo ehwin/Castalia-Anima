@@ -155,12 +155,12 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
 
   const storeTx = db.transaction(() => {
     db.prepare(`
-      INSERT INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, emotional_impact, importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, emotional_impact, importance, base_importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       record.id, record.text, record.project, record.sessionId, record.type, record.memType, record.category, record.subcategory,
       JSON.stringify(record.tags), record.emotionalImpact,
-      record.importance,
+      record.importance, record.importance,
       record.characterId, record.source, record.subject,
       record.tier, record.expiresAt, 1,
       record.createdAt, record.updatedAt, record.lastAccessedAt, 0, 0
@@ -233,8 +233,8 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>): P
     const tags = updates.tags !== undefined ? JSON.stringify(updates.tags) : (existing.tags ?? '[]');
     const now = new Date().toISOString();
     newDb.prepare(`
-      INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, emotional_impact)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, base_importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, emotional_impact)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       text,
@@ -246,6 +246,7 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>): P
       updates.subcategory !== undefined ? updates.subcategory : existing.subcategory,
       tags,
       updates.importance !== undefined ? updates.importance : existing.importance,
+      updates.importance !== undefined ? updates.importance : (existing.base_importance ?? existing.importance),
       updates.characterId !== undefined ? updates.characterId : existing.character_id,
       updates.source !== undefined ? updates.source : existing.source,
       updates.subject !== undefined ? updates.subject : existing.subject,
@@ -288,7 +289,10 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>): P
   if (updates.category !== undefined) { fields.push('category = ?'); values.push(updates.category); }
   if (updates.subcategory !== undefined) { fields.push('subcategory = ?'); values.push(updates.subcategory); }
   if (updates.tags !== undefined) { fields.push('tags = ?'); values.push(JSON.stringify(updates.tags)); }
-  if (updates.importance !== undefined) { fields.push('importance = ?'); values.push(updates.importance); }
+  if (updates.importance !== undefined) {
+    fields.push('importance = ?, base_importance = ?');
+    values.push(updates.importance, updates.importance);
+  }
 
   if (fields.length === 0) return existing;
 
@@ -463,6 +467,7 @@ export async function batchEmbedPending(characterId: string = 'airi', project?: 
   const conditions = [
     'm.is_active = 1',
     'm.rowid NOT IN (SELECT rowid FROM vec_memory)',
+    'COALESCE(m.embed_fail_count, 0) < 3',
   ];
   const params: any[] = [];
   if (characterId !== 'any') {
@@ -477,7 +482,7 @@ export async function batchEmbedPending(characterId: string = 'airi', project?: 
   const pending = db.prepare(`
     SELECT m.id, m.text, m.rowid FROM memory m
     WHERE ${conditions.join(' AND ')}
-    ORDER BY m.created_at ASC
+    ORDER BY COALESCE(m.embed_fail_count, 0) ASC, m.created_at ASC
     LIMIT 200
   `).all(...params) as any[];
 
@@ -485,8 +490,10 @@ export async function batchEmbedPending(characterId: string = 'airi', project?: 
     try {
       const vec = new Float32Array(await embed(row.text, project));
       db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(BigInt(row.rowid), vec);
+      db.prepare('UPDATE memory SET embed_fail_count = 0 WHERE rowid = ?').run(row.rowid);
       embedded++;
     } catch (e: any) {
+      try { db.prepare('UPDATE memory SET embed_fail_count = COALESCE(embed_fail_count, 0) + 1 WHERE rowid = ?').run(row.rowid); } catch { /* 旧库无列 */ }
       errors.push(`${row.id}: ${e.message}`);
     }
   }

@@ -30,6 +30,7 @@ const { saveMemory, saveFacts, markColdMemories, findDbByMemoryId, getFactsBySub
 const { searchMemory, getRecentMemories, hydrateParentExcerpts } = await load('search');
 const { applyReflectResult, applyReflectActions, listAllMemories } = await load('reflect');
 const { runConsolidate, runAutoReflect, shouldAutoReflect } = await load('reflectDriver');
+const { consolidate } = await load('consolidate');
 
 let checks = 0;
 const check = (value, message) => { assert.ok(value, message); checks++; };
@@ -379,6 +380,20 @@ const dirtyHits = await searchMemory({ query: '脏 tags 检索', topK: 5, projec
 check(dirtyHits.some(h => h.id === dirty.id), 'a row with non-JSON tags does not break search');
 const over = await saveMemory({ project: P, text: '情绪上限 clamp 测试', emotionalImpact: 99 });
 check(Number(memRow(over.id).emotional_impact) <= 10, 'emotionalImpact is clamped to the 0-10 range');
+
+// ══════════════════════════════════════════════════════════════
+// 15) 衰减幂等：重复 consolidate 不再按运行次数叠加衰减
+// ══════════════════════════════════════════════════════════════
+{
+  const old = new Date(Date.now() - 61 * 86400000).toISOString();
+  const dec = await saveMemory({ project: P, text: '衰减幂等 3318', importance: 0.9 });
+  memDb(dec.id).prepare('UPDATE memory SET base_importance=0.9, importance=0.9, last_accessed_at=?, created_at=? WHERE id=?').run(old, old, dec.id);
+  await consolidate();
+  const a = Number(memRow(dec.id).importance);
+  await consolidate();
+  const b = Number(memRow(dec.id).importance);
+  check(Math.abs(a - b) < 1e-9, `repeated consolidation is idempotent (${a} vs ${b})`);
+}
 
 check(embedCalls === 0, 'no embedding/network calls were made');
 
