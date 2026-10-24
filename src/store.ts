@@ -353,6 +353,39 @@ export async function saveConversationTurn(
 // 访问次数 ≥ HEAT_PROMOTE_THRESHOLD 的 temporary 记忆自动升 standard(免清理)
 const HEAT_PROMOTE_THRESHOLD = parseInt(process.env.HEAT_PROMOTE_THRESHOLD || '5', 10);
 
+// ═══ v1.23 冷存分层：长期不用的低价值记忆退出"新沉淀"，但不删除、仍可检索 ═══
+// 判定：非 critical / 非 locked / 非 superseded，importance < 0.6，无引用，且
+//       last_accessed_at（没有则 created_at）超过 N 天（默认 60）。
+const COLD_AFTER_DAYS = (() => { const v = parseFloat(process.env.COLD_AFTER_DAYS || '60'); return Number.isFinite(v) && v > 0 ? v : 60; })();
+const COLD_MAX_IMPORTANCE = (() => { const v = parseFloat(process.env.COLD_MAX_IMPORTANCE || '0.6'); return Number.isFinite(v) && v > 0 ? v : 0.6; })();
+
+export function markColdMemories(project?: string): number {
+  const proj = normalizeProject(project);
+  const cutoff = new Date(Date.now() - COLD_AFTER_DAYS * 86400000).toISOString();
+  let marked = 0;
+  for (const mt of listMemTypeDirs(proj)) {
+    try {
+      const db = DatabaseManager.getInstance(proj, mt);
+      // v1.23-fix: last_accessed_at/created_at 同时存在 ISO "T…Z" 与 SQLite "YYYY-MM-DD HH:MM:SS"
+      // 两种格式，直接做字符串比较会把同一天不同时刻判错（' ' < 'T'），差一天。
+      // 统一过 datetime() 归一化后再比。
+      const r = db.prepare(`
+        UPDATE memory SET status = 'cold'
+        WHERE project = ? AND is_active = 1
+          AND COALESCE(status, '') NOT IN ('cold', 'superseded')
+          AND COALESCE(tier, 'standard') = 'standard'
+          AND (locked IS NULL OR locked = 0)
+          AND importance < ?
+          AND COALESCE(reference_count, 0) = 0
+          AND datetime(COALESCE(last_accessed_at, created_at)) < datetime(?)
+      `).run(proj, COLD_MAX_IMPORTANCE, cutoff);
+      marked += r.changes;
+    } catch { /* 单库失败不影响其它库 */ }
+  }
+  if (marked > 0) console.error(`[cold] ${marked} 条记忆转为冷存（>${COLD_AFTER_DAYS} 天未访问且 importance<${COLD_MAX_IMPORTANCE}）`);
+  return marked;
+}
+
 export function promoteByAccess(project?: string): number {
   const proj = normalizeProject(project);
   const now = new Date().toISOString();
@@ -484,7 +517,7 @@ export interface FactRecord {
  *   - 不同 S-P-O → 正常插入
  */
 export async function saveFacts(
-  facts: { subject: string; predicate: string; object: string; confidence: number }[],
+  facts: { subject: string; predicate: string; object: string; confidence: number; evidence?: string; validFrom?: string; validTo?: string }[],
   sourceMemoryId: string | null = null,
   characterId: string = 'airi',
   project?: string,  // v1.5: 项目隔离
@@ -498,12 +531,15 @@ export async function saveFacts(
   let updated = 0;
 
   const upsert = db.prepare(`
-    INSERT INTO facts (id, subject, predicate, object, project, confidence, source_memory_id, character_id, is_active, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+    INSERT INTO facts (id, subject, predicate, object, project, confidence, source_memory_id, character_id, is_active, created_at, updated_at, evidence, valid_from, valid_to)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
     ON CONFLICT(subject, predicate, object, project) DO UPDATE SET
       confidence = MAX(confidence, excluded.confidence),
       updated_at = excluded.updated_at,
       is_active = 1,
+      evidence = COALESCE(NULLIF(excluded.evidence, ''), facts.evidence),
+      valid_from = COALESCE(excluded.valid_from, facts.valid_from),
+      valid_to = excluded.valid_to,
       accessed_count = facts.accessed_count
   `);
 
@@ -513,7 +549,10 @@ export async function saveFacts(
       'SELECT id, confidence FROM facts WHERE subject=? AND predicate=? AND object=? AND project=?'
     ).get(f.subject, f.predicate, f.object, proj) as any;
 
-    upsert.run(id, f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId, characterId, now, now);
+    upsert.run(
+      id, f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId, characterId, now, now,
+      f.evidence ?? null, f.validFrom ?? null, f.validTo ?? null,
+    );
 
     if (before) {
       updated++;
@@ -521,6 +560,36 @@ export async function saveFacts(
       inserted++;
     }
   }
+
+  // v1.23 冲突失效（Graphiti 式）：功能性关系（一个主体只能有一个值）出现新值时，
+  // 旧事实只打 valid_to 保留，不删除 —— 历史版本可查，当前值以最新为准。
+  const FUNCTIONAL_PREDICATES = new Set([
+    '姓名', '名字', '年龄', '职业', '居住地', '工作单位', '生日', '称呼', '昵称',
+    'name', 'age', 'job', 'occupation', 'residence', 'birthday',
+  ]);
+  try {
+    // v1.23-fix: 同一批里出现 姓名=张三 和 姓名=李四 时，两条都是"本批的新值"，不能互相打 valid_to。
+    // 先按 (subject,predicate) 收集本批 objects，失效 UPDATE 时整体排除。
+    const batchObjects = new Map<string, Set<string>>();
+    for (const f of facts) {
+      if (!FUNCTIONAL_PREDICATES.has(String(f.predicate).trim())) continue;
+      const key = `${f.subject}\u0000${String(f.predicate).trim()}`;
+      const set = batchObjects.get(key) || new Set<string>();
+      set.add(f.object);
+      batchObjects.set(key, set);
+    }
+    for (const f of facts) {
+      if (!FUNCTIONAL_PREDICATES.has(String(f.predicate).trim())) continue;
+      const keep = [...(batchObjects.get(`${f.subject}\u0000${String(f.predicate).trim()}`) || new Set([f.object]))];
+      if (keep.length === 0) continue;
+      db.prepare(`
+        UPDATE facts SET valid_to = ?, updated_at = ?
+        WHERE project = ? AND subject = ? AND predicate = ? AND object <> ?
+          AND is_active = 1 AND (valid_to IS NULL OR valid_to = '')
+          AND object NOT IN (${keep.map(() => '?').join(',')})
+      `).run(now, now, proj, f.subject, f.predicate, f.object, ...keep);
+    }
+  } catch { /* 列未迁移时静默跳过 */ }
 
   // 为新增 / 更新的事实生成 embedding 并写入 vec_facts
   if (!isEmbedEnabled()) return { inserted, updated };

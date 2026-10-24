@@ -6,6 +6,7 @@ export function makeLlmChannel(prefix) {
         return v && v.trim().length > 0 ? v.trim() : fallback;
     };
     return {
+        name: String(prefix || 'reflect').toLowerCase(),
         url: get('LLM_URL', process.env.REFLECT_LLM_URL || 'https://api.deepseek.com/v1').replace(/\/+$/, ''),
         apiKey: get('LLM_API_KEY', process.env.REFLECT_LLM_API_KEY || ''),
         model: get('LLM_MODEL', process.env.REFLECT_LLM_MODEL || 'deepseek-chat'),
@@ -68,6 +69,7 @@ export async function callLlm(systemPrompt, userPrompt, channel, maxTokens = 819
     const ch = channel ?? makeLlmChannel('reflect');
     if (!ch.apiKey)
         return null;
+    const startedAt = Date.now();
     try {
         const resp = await fetch(`${ch.url}/chat/completions`, {
             method: 'POST',
@@ -86,10 +88,22 @@ export async function callLlm(systemPrompt, userPrompt, channel, maxTokens = 819
             throw new Error(`LLM ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
         const data = await resp.json();
         const msg = data?.choices?.[0]?.message || {};
+        const finishReason = data?.choices?.[0]?.finish_reason || undefined;
+        // 每次调用都要能看到账：usage 此前被丢弃，导致"pro 开销大"无从归因。
+        const usage = data?.usage || {};
+        const reasoning = usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+        const cached = usage?.prompt_tokens_details?.cached_tokens ?? usage?.prompt_cache_hit_tokens ?? 0;
+        console.error(`[llm] ts=${new Date().toISOString()} channel=${ch.name || 'reflect'} model=${ch.model}` +
+            ` prompt=${usage.prompt_tokens ?? '?'} completion=${usage.completion_tokens ?? '?'}` +
+            ` reasoning=${reasoning} cached=${cached}` +
+            ` finish=${finishReason || 'n/a'} ms=${Date.now() - startedAt}`);
+        if (finishReason === 'length') {
+            console.error(`[llm] 警告：输出撞到 max_tokens=${maxTokens} 被截断，prompt+completion 仍全额计费`);
+        }
         return {
             content: msg.content || '',
             reasoning: msg.reasoning_content || '',
-            finishReason: data?.choices?.[0]?.finish_reason || undefined,
+            finishReason,
         };
     }
     catch (e) {

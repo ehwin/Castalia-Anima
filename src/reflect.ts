@@ -79,6 +79,12 @@ export interface ReflectAction {
   tier?: string;
   newSubject?: 'user' | 'self' | 'environment';
   newMemType?: string;  // v1.8: 提取/重分类时分类到 4 种封闭类型(user/feedback/project/reference)
+  /** v1.23 原文逐字引用（子串校验，编造的丢弃） */
+  quotes?: string[];
+  /** v1.23 结构化三元组 + evidence，直接进 facts 表（不经过自然语言） */
+  hardFacts?: { subject: string; predicate: string; object: string; confidence?: number; evidence?: string; validFrom?: string; validTo?: string }[];
+  /** v1.23 与旧记忆同主题/接续时只挂链接（metadata.supersededBy + status=superseded），不覆盖旧记忆 */
+  linkedMemoryIds?: string[];
   // delete: 软删除
   // boost/decay: 调整 importance
   delta?: number;
@@ -100,6 +106,8 @@ export function listAllMemories(characterId: string = 'airi', limit: number = 20
                subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked
         FROM memory
         WHERE is_active = 1 AND project = ?
+          -- v1.23: 冷存与被接管的旧记忆不参加新一轮沉淀（否则深反思会反复处理同一批死记忆）
+          AND COALESCE(status, '') NOT IN ('cold', 'superseded')
         ORDER BY importance DESC, created_at DESC
         LIMIT ?
       `).all(proj, limit) as any[];
@@ -182,7 +190,91 @@ function memDbFor(id: string, project: string | undefined, fallback: any): any {
   return findDbByMemoryId(id, project)?.db ?? fallback;
 }
 
-export interface ReflectApplyOptions { automatic?: boolean; allowedSourceIds?: Set<string>; }
+// ═══ v1.23 证据附录：硬事实覆盖率闸门 ═══
+// 背景：实测提取只保住 ~75% 的硬事实（路径/端口/版本/日期/数字）。这些是"复核所需"的锚点，
+// 用程序算覆盖率比让模型自觉可靠；不够就把没覆盖到的原句**原样**补进去（纯字符串操作，零额外调用）。
+const HARD_TOKEN_PATTERNS: RegExp[] = [
+  /[A-Za-z]:\\[^\s，。；、）)】"'`]+/g,
+  /\b\d{1,3}(?:\.\d{1,3}){3}\b/g,
+  /\b\d{2,5}\s*(?:B|KB|MB|GB|文件|条|帧|事件|个|秒|分钟|小时)\b/g,
+  /\b\d+\.\d+(?:\.\d+)?\b/g,
+  /\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?/g,
+  /\b\d{1,5}\b/g,
+  /[A-Z]{2,}-\d+/g,
+];
+
+/** 覆盖率闸门：低于该值就补证据附录。 */
+const HARD_COVERAGE_MIN = 0.9;
+
+function hardTokens(text: string): string[] {
+  const out = new Set<string>();
+  for (const re of HARD_TOKEN_PATTERNS) {
+    for (const m of String(text || '').match(re) || []) {
+      if (m.length > 3) out.add(m);
+    }
+  }
+  return [...out];
+}
+
+function splitSentences(text: string): string[] {
+  return String(text || '')
+    .split(/(?<=[。！？!?；;\n])/)
+    .map(s => s.replace(/^[\s>]+/, '').trim())
+    .filter(s => s.length >= 8);
+}
+
+function hardCoverage(sourceText: string, outputText: string): { total: number; ratio: number; missing: string[] } {
+  const tokens = hardTokens(sourceText);
+  if (!tokens.length) return { total: 0, ratio: 1, missing: [] };
+  const haystack = String(outputText || '');
+  const missing = tokens.filter(t => !haystack.includes(t));
+  return { total: tokens.length, ratio: (tokens.length - missing.length) / tokens.length, missing };
+}
+
+/**
+ * 提取完成后按来源检查硬事实覆盖：不达标就把"含缺失 token 的原句"追加到该来源第一条 extract 上。
+ * 多主题拆条时按来源汇总判断，避免每条都被误判为低覆盖而重复补。
+ */
+function attachEvidenceAppendix(result: any, project: string | undefined, warnings: string[]): void {
+  const actions = Array.isArray(result.actions) ? result.actions : [];
+  const bySource = new Map<string, any[]>();
+  for (const a of actions) {
+    if (!a || a.action !== 'extract' || typeof a.sourceId !== 'string') continue;
+    const list = bySource.get(a.sourceId) || [];
+    list.push(a);
+    bySource.set(a.sourceId, list);
+  }
+  for (const [sourceId, list] of bySource) {
+    const target = resolveReflectTarget(sourceId, project, true);
+    if (!target) continue;
+    let sourceText = '';
+    try {
+      sourceText = (target.db.prepare('SELECT text FROM memory WHERE id = ?').get(target.id) as any)?.text || '';
+    } catch { continue; }
+    if (!sourceText) continue;
+    const merged = list.map((a: any) => String(a.newText || '')).join('\n');
+    const { total, ratio, missing } = hardCoverage(sourceText, merged);
+    if (!total || !missing.length || ratio >= HARD_COVERAGE_MIN) continue;
+    const missingSet = new Set(missing);
+    const sentences = [...new Set(splitSentences(sourceText).filter(s => hardTokens(s).some(t => missingSet.has(t))))].slice(0, 12);
+    if (!sentences.length) continue;
+    const appendix = `\n\n【证据附录·原文】\n${sentences.map(s => `> ${s}`).join('\n')}`;
+    list[0].newText = String(list[0].newText || '') + appendix;
+    warnings.push(`证据附录：来源 ${String(sourceId).slice(0, 8)} 硬事实覆盖 ${(ratio * 100).toFixed(0)}%，补 ${sentences.length} 句原文`);
+  }
+}
+
+export interface ReflectApplyOptions {
+  automatic?: boolean;
+  allowedSourceIds?: Set<string>;
+  /**
+   * v1.23-fix: 整合(consolidate)模式。整合的任务就是"合并重复"：merge 先生成合并结果、
+   * 再把源标 is_active=0（行仍在、可恢复），与反思阶段的"销毁证据"不同 —— 保真策略若一律
+   * 禁 merge，整合就永远只能 extract，等于每次运行都在重复摘要（merged 恒 0）。
+   * 这里只放行 merge，delete/split 仍然禁止；逐字库的 merge 拒绝保持不动。
+   */
+  consolidation?: boolean;
+}
 
 export async function applyReflectActions(actions: ReflectAction[], characterId: string = 'airi', project?: string, options: ReflectApplyOptions = {}): Promise<{
   applied: number;
@@ -203,7 +295,9 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
     };
     try {
       action = { ...action };
-      if (options.automatic && (['merge', 'delete', 'split'].includes(action.action) || (action.action === 'reclassify' && action.newText !== undefined))) throw new Error('emotional fidelity forbids destructive automatic reflection');
+      // v1.23-fix: 整合模式放行 merge（合并结果落库后再软删源，内容可回查）；其余破坏性动作照旧禁止。
+      const mergeAllowedByConsolidation = options.consolidation === true && action.action === 'merge';
+      if (options.automatic && !mergeAllowedByConsolidation && (['merge', 'delete', 'split'].includes(action.action) || (action.action === 'reclassify' && action.newText !== undefined))) throw new Error('emotional fidelity forbids destructive automatic reflection');
       if (action.action === 'reclassify') { action.newTypeSingle ??= action.newType; action.newCategorySingle ??= action.newCategory; }
       const ids = action.action === 'merge' ? action.sourceIds :
         [action.targetId, action.sourceId, action.targetIdRelate].filter((id): id is string => !!id);
@@ -235,8 +329,8 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           let mergeInvalid: string | null = null;
           for (const id of action.sourceIds!) {
             const sdb = memDbFor(id, project, db);
-            const src = sdb.prepare('SELECT id FROM memory WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0)').get(id) as any;
-            if (!src) { mergeInvalid = `source not found or locked: ${id}`; break; }
+            const src = sdb.prepare("SELECT id FROM memory WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical'").get(id) as any;
+            if (!src) { mergeInvalid = `source not found, locked or critical: ${id}`; break; }
             mergeSources.push({ db: sdb, id: src.id });
           }
           if (mergeInvalid) {
@@ -264,7 +358,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           // 所有源均已确认 active 且合并结果已落库后，才软删除并清理向量。
           for (const src of mergeSources) {
             if (src.id === merged.id) continue;
-            src.db.prepare('UPDATE memory SET is_active = 0 WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0)').run(src.id);
+            src.db.prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical'").run(src.id);
             try {
               const row = src.db.prepare('SELECT rowid FROM memory WHERE id = ?').get(src.id) as any;
               if (row) src.db.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(row.rowid);
@@ -426,8 +520,18 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           const { saveMemory } = await import('./store.js');
           const sourceTarget = resolveReflectTarget(action.sourceId, project, true)!;
           const sourceRow = sourceTarget.db.prepare('SELECT * FROM memory WHERE id = ?').get(action.sourceId) as any;
+          // v1.23: 引用校验 —— 只有能在原文子串命中的引用才保留（防编造原话）
+          const sourceText = String(sourceRow?.text || '');
+          const quoteClean = (q: string) => String(q).replace(/^[「『"']+|[」』"']+$/g, '').trim();
+          const validQuotes = (Array.isArray(action.quotes) ? action.quotes : [])
+            .map(quoteClean)
+            .filter((q: string) => q.length >= 4 && (!sourceText || sourceText.includes(q)))
+            .slice(0, 6);
+          const textWithQuotes = validQuotes.length
+            ? `${String(action.newText).trimEnd()}\n\n【原文引用】\n${validQuotes.map((q: string) => `> ${q}`).join('\n')}`
+            : action.newText;
           const extracted = await saveMemory({
-            text: action.newText,
+            text: textWithQuotes,
             type: validType as any,
             memType: validMemType,
             category: validCat,
@@ -447,10 +551,54 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           try { meta = JSON.parse(oldMeta?.metadata || '{}'); } catch {}
           meta.reflection = { ...meta.reflection, project: normalizeProject(project), sourceIds: [...new Set([...(meta.reflection?.sourceIds || []), action.sourceId])] };
           extractedDb.prepare('UPDATE memory SET metadata = ? WHERE id = ?').run(JSON.stringify(meta), extracted.id);
+          // v1.23 Parent-Child：leaf 指回对话原文，检索时按 parent_id 回捞
+          try { extractedDb.prepare('UPDATE memory SET parent_id = ? WHERE id = ?').run(action.sourceId, extracted.id); } catch { /* 旧库未迁移 */ }
           if (validMemType === 'project') {
             const fields = ['agent_mood', 'agent_desire', 'vad_valence', 'vad_arousal', 'vad_dominance', 'tsundere_level'];
             extractedDb.prepare(`UPDATE memory SET ${fields.map(f => `${f} = ?`).join(', ')} WHERE id = ?`).run(...fields.map(f => sourceRow[f] ?? null), extracted.id);
           }
+
+          // v1.23 hardFacts 直接进 facts 表（带证据与时间有效性）。这一步替代"把事实写进散文"。
+          if (Array.isArray(action.hardFacts) && action.hardFacts.length) {
+            try {
+              const { saveFacts } = await import('./store.js');
+              // Anima 的 facts 表恒在 general 库;extract 可能落到 project/user/feedback/reference 库,
+              // 跨库挂 source_memory_id 会触发 FOREIGN KEY。故来源恒为 NULL —— 溯源由 extract 记忆承担。
+              const facts = action.hardFacts
+                .filter((f: any) => f && typeof f === 'object' && f.subject && f.predicate && f.object)
+                .slice(0, 15)
+                .map((f: any) => ({
+                  subject: String(f.subject).trim(),
+                  predicate: String(f.predicate).trim(),
+                  object: String(f.object).trim(),
+                  confidence: Number.isFinite(Number(f.confidence)) ? Math.min(1, Math.max(0, Number(f.confidence))) : 0.7,
+                  evidence: typeof f.evidence === 'string' ? f.evidence : undefined,
+                  validFrom: typeof f.validFrom === 'string' ? f.validFrom : undefined,
+                  validTo: typeof f.validTo === 'string' ? f.validTo : undefined,
+                }));
+              if (facts.length) await saveFacts(facts, null, characterId, project);
+            } catch (e: any) {
+              // 事实是"提取之外的富化"：失败只记在回执里，绝不能把整批打回重跑。
+              console.error('[reflect] hardFacts skipped:', e.message);
+              receipt.reason = `facts: ${e.message}`;
+            }
+          }
+
+          // v1.23 同主题/接续：只建链接、不覆盖旧记忆（mem0 linked_memory_ids 思路）
+          for (const linkedId of (Array.isArray(action.linkedMemoryIds) ? action.linkedMemoryIds : []).slice(0, 10)) {
+            if (typeof linkedId !== 'string' || linkedId === action.sourceId) continue;
+            const target = resolveReflectTarget(linkedId, project, false);
+            if (!target) continue;
+            try {
+              const row = target.db.prepare('SELECT metadata, locked, tier FROM memory WHERE id = ?').get(target.id) as any;
+              if (!row || row.locked || row.tier === 'critical') continue;
+              let meta: any = {};
+              try { meta = JSON.parse(row.metadata || '{}'); } catch { /* 自由格式 metadata 忽略 */ }
+              meta.supersededBy = [...new Set([...(Array.isArray(meta.supersededBy) ? meta.supersededBy : []), extracted.id])];
+              target.db.prepare("UPDATE memory SET metadata = ?, status = 'superseded' WHERE id = ?").run(JSON.stringify(meta), target.id);
+            } catch { /* 链接失败不影响提取 */ }
+          }
+
           receipt.rowsAffected = 1;
           // 给源记忆 +reference_count（v5.1: LIKE 匹配短ID）
           memDbFor(action.sourceId, project, db).prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(action.sourceId);
@@ -467,7 +615,8 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             result.receipts.push(receipt);
             continue;
           }
-          const _delR = memDbFor(action.targetId, project, db).prepare('UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0)').run(action.targetId);
+          // v1.23: critical 核心记忆不得被自动反思删除
+          const _delR = memDbFor(action.targetId, project, db).prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical'").run(action.targetId);
           receipt.rowsAffected = _delR.changes;
           if (_delR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found or locked: ${action.targetId}`; }
           if (receipt.status === 'applied') result.applied++;
@@ -527,8 +676,11 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
     if (batchResult.embedded > 0) {
       result.details.push(`batch embedded ${batchResult.embedded} pending memories`);
     }
-    if (batchResult.errors.length > 0) {
-      result.errors.push(...batchResult.errors);
+    // Embedding 是可选增强：离线/EMBED_MODE=none 时不能把已成功落库的反思判成失败
+    // （否则新的失败退避会把整轮反思拦 1h，且游标看起来永远不前进）。
+    if (batchResult.errors.length > 0 && batchResult.errors.some(e => !e.includes('embedding disabled'))) {
+      console.error('[reflect] batch embed (optional):', batchResult.errors.join('; '));
+      result.details.push('batch embed warnings: ' + batchResult.errors.join('; '));
     }
   } catch (e: any) {
     result.errors.push(`batch embed: ${e.message}`);
@@ -629,6 +781,8 @@ export interface ReflectResult {
   insights: string[];
   actions?: ReflectAction[];
   processedSourceIds?: string[];
+  /** 形状不合规而被丢弃的 facts 条数（见 reflectDriver.normalizeReflectResult）。 */
+  factsDropped?: number;
 }
 
 /**
@@ -652,6 +806,7 @@ export async function applyReflectResult(
   insightsCount: number;
   actionsApplied: number;
   errors: string[];
+  warnings: string[];
   receipts: ReflectReceipt[];
 }> {
   const out = {
@@ -662,8 +817,12 @@ export async function applyReflectResult(
     actionsApplied: 0,
     applied: 0,
     errors: [] as string[],
+    warnings: [] as string[],
     receipts: [] as ReflectReceipt[],
   };
+
+  // v1.23: 落库前先按来源算硬事实覆盖，不达标就把缺失的原句补成"证据附录"。
+  attachEvidenceAppendix(result, project, out.warnings);
 
   // 4. 应用记忆整理 actions + 逐动作回执落盘
   if (result.actions && result.actions.length > 0) {
@@ -704,6 +863,9 @@ export async function applyReflectResult(
   if (out.errors.length) return out;
 
   // 1. 存 summary
+  // 注意：1~3 都是**提取成功之后的富化**。提取已落库并写了回执，富化失败若升级成 error，
+  // 驱动会在 markConversationsReflected 之前 break，同一批来源永远重跑（2026-10-23 事故：
+  // facts 形状不符 → NOT NULL → 无限重复提取）。所以富化失败只记 warning，不阻断游标。
   if (result.summary) {
     try {
       const mem = await saveMemory({
@@ -720,18 +882,25 @@ export async function applyReflectResult(
       });
       out.summaryId = mem.id;
     } catch (e: any) {
-      out.errors.push(`summary: ${e.message}`);
+      out.warnings.push(`summary: ${e.message}`);
     }
   }
 
   // 2. 存 facts（自动去重，confidence 取 MAX）
-  if (result.facts && result.facts.length > 0) {
+  // facts 表是 SPO 三元组；模型偶尔给字符串或 {sourceId,text}，saveFacts 不接受。
+  const facts = (result.facts || []).filter(
+    (f: any) => f && typeof f === 'object' && f.subject && f.predicate && f.object,
+  );
+  if (facts.length > 0) {
     try {
-      const fr = await saveFacts(result.facts, out.summaryId, characterId, project);
+      // Anima 的 summary 落在 project 分类库，facts 落在 general 库；facts.source_memory_id
+      // 有 FK 指向 memory(id)，跨库引用会 FOREIGN KEY 失败（历史上 facts 因此一直没写进去）。
+      // 这里不挂 summary 做来源，facts 的溯源由 extract 记忆承担。
+      const fr = await saveFacts(facts, null, characterId, project);
       out.factsInserted = fr.inserted;
       out.factsUpdated = fr.updated;
     } catch (e: any) {
-      out.errors.push(`facts: ${e.message}`);
+      out.warnings.push(`facts: ${e.message}`);
     }
   }
 
@@ -751,7 +920,7 @@ export async function applyReflectResult(
         });
         out.insightsCount++;
       } catch (e: any) {
-        out.errors.push(`insight: ${e.message}`);
+        out.warnings.push(`insight: ${e.message}`);
       }
     }
   }

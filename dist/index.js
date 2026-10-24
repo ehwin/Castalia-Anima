@@ -16,8 +16,8 @@ import './configLoader.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { searchMemory, searchFacts, getRecentMemories, searchMemoryAcross } from './search.js';
-import { saveMemory, forgetMemory, updateMemory, saveConversationTurn, cleanupExpiredMemories, batchEmbedPending } from './store.js';
+import { searchMemory, searchFacts, getRecentMemories, searchMemoryAcross, hydrateParentExcerpts } from './search.js';
+import { saveMemory, forgetMemory, updateMemory, saveConversationTurn, cleanupExpiredMemories, batchEmbedPending, markColdMemories } from './store.js';
 import { consolidate } from './consolidate.js';
 import { DatabaseManager, listProjectNames, listMemTypeDirs, safeFilePart, currentMemDir, sweepExpiredSessionMemories } from './db.js';
 import { runDigest, getRecentConversations, maybeDigest } from './digest.js';
@@ -402,8 +402,14 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         let related = [];
         if (args.query) {
             const r = await searchMemory({ query: args.query, topK: relatedLimit, profile: 'balanced', characterId: charFor(args.project), project: proj });
-            related = r.map(m => ({ text: m.text, category: m.category, importance: m.importance, score: m.score, createdAt: m.createdAt }));
+            related = r.map(m => ({ id: m.id, text: m.text, category: m.category, importance: m.importance, score: m.score, createdAt: m.createdAt, parentId: m.parentId || null }));
         }
+        // 2.5 v1.23 Parent-Child 原文回捞：命中的是提炼记忆(leaf)，按 parent_id 取对话原文。
+        //     策略照 llama_index AutoMergingRetriever：同父命中比例 > 50% 或 parent 短 → 整段；
+        //     否则按 leaf 正文锚点截窗口（pre-400/post-800），总预算 3k 字符 / 最多 3 个 parent。
+        const hydrated = related.length > 0
+            ? hydrateParentExcerpts(proj, related, { budget: 3000, maxParents: 3 })
+            : [];
         // 3. 认知记录(决策/错误/模式)—— 跨分类库聚合(decision/mistake 可能落在 project 库)
         const cognitives = DatabaseManager.queryAll(proj, `
         SELECT text, category, importance, created_at FROM memory
@@ -484,6 +490,10 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
                     sections.push(`  ${warn}`);
             });
         }
+        if (hydrated.length > 0) {
+            sections.push(`\n■ 原文回捞（上面命中的是提炼记忆，以下是它对应的对话原文，用于核对细节）:`);
+            hydrated.forEach((h, i) => sections.push(`${i + 1}. (来源 ${h.parentId.slice(0, 8)}，命中比 ${h.ratio}${h.mode === 'full' ? '，整段' : h.mode === 'head' ? '，锚点未命中取开头' : '，命中片段'}) ${h.excerpt}`));
+        }
         if (cognitives.length > 0) {
             sections.push(`\n■ 经验沉淀(决策/错误/模式):`);
             cognitives.forEach((m, i) => {
@@ -509,6 +519,7 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
             instructions,
             recent: recent.map(m => ({ text: m.text, category: m.category, importance: m.importance, createdAt: m.createdAt })),
             related,
+            hydrated,
             cognitives: cognitives.map(m => ({ text: m.text, category: m.category })),
             facts,
             index: indexLayer,
@@ -872,7 +883,8 @@ register('consolidate_deep', 'admin', 'Run memory consolidation: vector pre-scre
     limit: z.number().optional().describe('Max candidate pairs (default 50)'),
 }, async (args) => {
     try {
-        const r = await runConsolidate(charFor(args.project), args.project, args.threshold, args.limit);
+        // 手动/工具调用 = 显式意图,绕过"最小间隔"闸门(启动自动整合才受限)
+        const r = await runConsolidate(charFor(args.project), args.project, args.threshold, args.limit, { force: true });
         return ok({ op: 'consolidate_deep', ...r });
     }
     catch (e) {
@@ -1201,8 +1213,15 @@ async function main() {
                     return;
                 }
                 console.error(`[consolidate-startup] 记忆 ${cond.count} 条超阈值 ${cond.min},自动整合...`);
+                // v1.23: 整合前先做冷存分层（长期不用的低价值记忆退出整合窗口，但不删除、仍可检索）
+                try {
+                    markColdMemories(PROJECT_ID);
+                }
+                catch (e) {
+                    console.error('[cold] error:', e.message);
+                }
                 const r = await runConsolidate(CHAR_ID);
-                console.error(`[consolidate-startup] 完成: ok=${r.ok}, scanned=${r.scanned}, candidates=${r.candidates}, merged=${r.merged}, deleted=${r.deleted}, kept=${r.kept}, errors=${r.errors.length}${r.skipped ? ', skipped' : ''}`);
+                console.error(`[consolidate-startup] 完成: ok=${r.ok}, scanned=${r.scanned}, candidates=${r.candidates}, merged=${r.merged}, deleted=${r.deleted}, kept=${r.kept}, actions=${r.actions}, applied=${r.applied}, invalidated=${r.invalidated ?? 0}, errors=${r.errors.length}${r.skipped ? ', skipped' : ''}`);
                 if (r.errors.length > 0)
                     console.error(`[consolidate-startup] errors: ${r.errors.join('; ')}`);
             }

@@ -199,7 +199,8 @@ function tagSearch(db, options) {
     const tagParams = keywords.map(k => `%"${k}"%`);
     const looseCond = keywords.map(() => `m.tags LIKE ?`).join(' OR ');
     const looseParams = keywords.map(k => `%${k}%`);
-    const conditions = ['m.is_active = 1', 'm.project = ?'];
+    // v1.23-fix: superseded 在三条检索路径上一致排除（被接管的旧记忆不该再被检索命中）
+    const conditions = ['m.is_active = 1', 'm.project = ?', "COALESCE(m.status, '') <> 'superseded'"];
     const params = [project];
     conditions.push(`((${tagCond}) OR (${looseCond}))`);
     params.push(...tagParams, ...looseParams);
@@ -227,7 +228,7 @@ function tagSearch(db, options) {
     SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
       m.emotional_impact, m.importance, m.character_id, m.source,
       m.subject, m.agent_mood, m.agent_desire, m.tier,
-      m.created_at, m.last_accessed_at, m.accessed_count,
+      m.created_at, m.last_accessed_at, m.accessed_count, m.parent_id,
       m.vad_valence, m.vad_arousal, m.vad_dominance, m.tsundere_level
     FROM memory m
     WHERE ${conditions.join(' AND ')}
@@ -247,6 +248,7 @@ function tagSearch(db, options) {
             characterId: row.character_id, source: row.source,
             subject: row.subject || 'user', agentMood: row.agent_mood, agentDesire: row.agent_desire,
             tier: row.tier || 'standard',
+            parentId: row.parent_id || null,
             score, similarity: Math.round(tagScore * 1000) / 1000,
             createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
             accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
@@ -276,7 +278,7 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
         rowidMap.set(Number(r.rowid), r.distance);
     const rowidPlaceholders = knnRows.map(() => '?').join(',');
     const rowidParams = knnRows.map(r => Number(r.rowid));
-    const conditions = [`m.rowid IN (${rowidPlaceholders})`, 'm.is_active = 1', 'm.project = ?'];
+    const conditions = [`m.rowid IN (${rowidPlaceholders})`, 'm.is_active = 1', 'm.project = ?', "COALESCE(m.status, '') <> 'superseded'"];
     const params = [...rowidParams, project];
     if (options.type) {
         conditions.push('m.type = ?');
@@ -298,7 +300,7 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
     SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
       m.emotional_impact, m.importance, m.character_id, m.source,
       m.subject, m.agent_mood, m.agent_desire, m.tier,
-      m.created_at, m.last_accessed_at, m.accessed_count, m.rowid,
+      m.created_at, m.last_accessed_at, m.accessed_count, m.rowid, m.parent_id,
       m.vad_valence, m.vad_arousal, m.vad_dominance, m.tsundere_level
     FROM memory m WHERE ${conditions.join(' AND ')}
   `).all(...params);
@@ -318,6 +320,7 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
                 characterId: row.character_id, source: row.source,
                 subject: row.subject || 'user', agentMood: row.agent_mood, agentDesire: row.agent_desire,
                 tier: row.tier || 'standard',
+                parentId: row.parent_id || null,
                 score, similarity: Math.round(similarity * 1000) / 1000,
                 createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
                 accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
@@ -334,7 +337,7 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
     const project = normalizeProject(options.project);
     const likeConditions = terms.map(() => 'm.text LIKE ?').join(' OR ');
     const likeParams = terms.map(t => `%${t}%`);
-    const conds = [`m.is_active = 1`, `m.project = ?`, `(${likeConditions})`];
+    const conds = [`m.is_active = 1`, `m.project = ?`, "COALESCE(m.status, '') <> 'superseded'", `(${likeConditions})`];
     const params = [project, ...likeParams];
     if (options.memType) {
         conds.push('m.mem_type = ?');
@@ -360,7 +363,7 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
     SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
       m.emotional_impact, m.importance, m.character_id, m.source,
       m.subject, m.agent_mood, m.agent_desire, m.tier,
-      m.created_at, m.last_accessed_at, m.accessed_count,
+      m.created_at, m.last_accessed_at, m.accessed_count, m.parent_id,
       m.vad_valence, m.vad_arousal, m.vad_dominance, m.tsundere_level
     FROM memory m
     WHERE ${conds.join(' AND ')}
@@ -378,6 +381,7 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
             characterId: row.character_id, source: row.source,
             subject: row.subject || 'user', agentMood: row.agent_mood, agentDesire: row.agent_desire,
             tier: row.tier || 'standard',
+            parentId: row.parent_id || null,
             score, similarity: 0.3,
             createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
             accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
@@ -389,13 +393,88 @@ function updateAccessed(db, results) {
     if (results.length === 0)
         return;
     try {
-        const stmt = db.prepare('UPDATE memory SET accessed_count = accessed_count + 1, last_accessed_at = ? WHERE id = ?');
+        // v1.23 冷存回温：被检索命中即回到工作集（清掉 status='cold'）。
+        // 否则"冷"会变成永久标记 —— 经常被用的记忆反而永远被排除在新沉淀之外。
+        const stmt = db.prepare("UPDATE memory SET accessed_count = accessed_count + 1, last_accessed_at = ?, status = CASE WHEN status = 'cold' THEN NULL ELSE status END WHERE id = ?");
         const now = new Date().toISOString();
         const tx = db.transaction((ids) => { for (const id of ids)
             stmt.run(now, id); });
         tx(results.map(r => r.id));
     }
     catch { }
+}
+/**
+ * v1.23 Parent-Child 原文回捞 —— 命中的是提炼记忆(leaf)，按 parent_id 取对话原文。
+ * 合并策略照 llama_index AutoMergingRetriever：同父命中比例 > 50% 或 parent 本来就短 → 整段；
+ * 否则只给命中片段。总预算 3000 字符 / 最多 3 个 parent，避免把上下文吃满。
+ *
+ * 与 Full 现网实现的差异（修其"永远从 0 截断"缺陷）：excerpt 先用该 leaf 的 text 前 40 字符
+ * 在 parent 里 indexOf 定位锚点，窗口取锚点前 400 后 800；定位失败才退回开头并标 mode='head'。
+ */
+export function hydrateParentExcerpts(project, related, opts = {}) {
+    const proj = normalizeProject(project);
+    if (!related || related.length === 0)
+        return [];
+    let budget = opts.budget ?? 3000;
+    const maxParents = opts.maxParents ?? 3;
+    const out = [];
+    try {
+        // 每个 parent 收集命中次数 + 可用于定位的样本（leaf 正文）
+        const hitsByParent = new Map();
+        for (const m of related) {
+            if (!m.parentId)
+                continue;
+            const entry = hitsByParent.get(m.parentId) || { hits: 0, samples: [] };
+            entry.hits++;
+            if (entry.samples.length < 3 && m.text)
+                entry.samples.push(String(m.text));
+            hitsByParent.set(m.parentId, entry);
+        }
+        for (const [pid, hit] of [...hitsByParent.entries()].slice(0, maxParents)) {
+            if (budget <= 0)
+                break;
+            const row = DatabaseManager.queryAll(proj, 'SELECT id, text FROM memory WHERE id = ? AND project = ?', [pid, proj])[0];
+            if (!row || !row.text)
+                continue;
+            const parentText = String(row.text);
+            // 分母只算活跃 leaf：已停用/被接管的 leaf 不该把"同父命中比"拉低
+            const totalLeaves = DatabaseManager.queryAll(proj, 'SELECT COUNT(*) AS c FROM memory WHERE parent_id = ? AND project = ? AND is_active = 1', [pid, proj])
+                .reduce((n, r) => n + (Number(r.c) || 0), 0) || 1;
+            const ratio = hit.hits / totalLeaves;
+            const full = ratio > 0.5 || parentText.length <= 1800;
+            let excerpt;
+            let mode;
+            if (full) {
+                excerpt = parentText.slice(0, Math.min(2500, budget));
+                mode = 'full';
+            }
+            else {
+                let anchor = -1;
+                for (const sample of hit.samples) {
+                    const probe = String(sample || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+                    if (probe.length < 8)
+                        continue;
+                    anchor = parentText.indexOf(probe);
+                    if (anchor >= 0)
+                        break;
+                }
+                if (anchor < 0) {
+                    excerpt = parentText.slice(0, Math.min(1600, budget));
+                    mode = 'head';
+                }
+                else {
+                    const start = Math.max(0, anchor - 400);
+                    const end = Math.min(parentText.length, anchor + 800, start + Math.max(0, budget));
+                    excerpt = parentText.slice(start, Math.max(start, end));
+                    mode = 'excerpt';
+                }
+            }
+            out.push({ parentId: pid, excerpt, mode, ratio: Math.round(ratio * 100) / 100 });
+            budget -= excerpt.length;
+        }
+    }
+    catch { /* 回捞失败不影响主流程 */ }
+    return out;
 }
 /**
  * 快速获取近期重要记忆(用于请求前注入，<5ms)
@@ -410,7 +489,7 @@ export function getRecentMemories(characterId, limit = 5, hoursBack = 24, projec
     for (const mt of dirs) {
         try {
             const db = DatabaseManager.getInstance(proj, mt);
-            const conds = ['is_active = 1', 'character_id = ?', 'project = ?', 'created_at > ?'];
+            const conds = ['is_active = 1', 'character_id = ?', 'project = ?', 'created_at > ?', "COALESCE(status, '') <> 'superseded'"];
             const params = [characterId, proj, since];
             if (memType) {
                 conds.push('mem_type = ?');
