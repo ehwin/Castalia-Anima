@@ -392,9 +392,14 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
 }, async (args) => {
     try {
         const db = DatabaseManager.getInstance(args.project);
-        const hoursBack = args.hoursBack ?? 48;
-        const recentLimit = args.recentLimit ?? 5;
-        const relatedLimit = args.relatedLimit ?? 5;
+        // v1.23.2-fix: 限幅（负数 LIMIT 在 SQLite 里等于无上限）
+        const clampInt = (v, def, min, max) => {
+            const n = Math.floor(Number(v));
+            return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def;
+        };
+        const hoursBack = clampInt(args.hoursBack ?? 48, 48, 1, 8760);
+        const recentLimit = clampInt(args.recentLimit ?? 5, 5, 1, 50);
+        const relatedLimit = clampInt(args.relatedLimit ?? 5, 5, 1, 50);
         const proj = normalizeProject(args.project);
         // 1. 近期重要记忆
         const recent = getRecentMemories(charFor(args.project), recentLimit, hoursBack, proj);
@@ -516,8 +521,14 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
             });
         }
         sections.push(`\n【要求】以上记忆来自用户的真实历史,与当前任务相关时请直接使用,不要重新询问用户已知信息。`);
+        // v1.23.2-fix: 总预算封顶
+        const PROMPT_BUDGET = 24000;
+        let promptText = sections.join('\n');
+        if (promptText.length > PROMPT_BUDGET) {
+            promptText = promptText.slice(0, PROMPT_BUDGET) + `\n…（已截断，原始 ${sections.join('\n').length} 字，必要时用 memory_get/memory_search 精确取）`;
+        }
         const bundle = {
-            prompt: sections.join('\n'),
+            prompt: promptText,
             instructions,
             recent: recent.map(m => ({ text: m.text, category: m.category, importance: m.importance, createdAt: m.createdAt })),
             related,
