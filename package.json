@@ -1,18 +1,18 @@
 {
   "name": "castalia-anima",
-  "version": "1.0.0",
+  "version": "1.23.1",
   "description": "Castalia Anima — emotional memory MCP server: Castalia core + agent state, bias layer, user learning, emotion-weighted search",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node scripts/gen_version.mjs && tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
     "fed-server": "node dist/fedServer.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
     "better-sqlite3": "^11.10.0",
-    "picomatch": "^2.3.1",
+    "picomatch": "^4.0.5",
     "sqlite-vec": "^0.1.9",
     "zod": "^4.4.3"
   },

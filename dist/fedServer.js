@@ -29,10 +29,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { fedSearchAll, describeAll } from './federation/index.js';
+import { SERVER_VERSION } from './env.js';
 // stdout 归 MCP 协议独占,任何日志必须走 stderr
 console.log = console.error;
 const SERVER_NAME = 'castalia-federation';
-const SERVER_VERSION = '1.14.0';
 const OWN_DIR = process.env.MEMORY_DB_DIR || '';
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 function ok(data) {
