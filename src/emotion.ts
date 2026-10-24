@@ -10,6 +10,8 @@
  * 情感提取不再用正则 → 全部走 Ollama 本地模型
  */
 
+import { normalizeProject } from './env.js';
+
 // ═══════════════════════════════════════════════════════════════════
 // Types
 // ═══════════════════════════════════════════════════════════════════
@@ -425,70 +427,142 @@ export function formatVADForPrompt(analysis: VADAnalysis): string {
 
 /** 队列配置 */
 const VAD_QUEUE_MAX_SIZE = 15;
+const VAD_QUEUE_MIN_BATCH = 5;
 const VAD_QUEUE_MAX_AGE_MS = 10 * 60 * 1000;
 const EMOTION_SMOOTH_ALPHA = 0.3;
 
-let vadQueue: { text: string; timestamp: number }[] = [];
+/**
+ * 队列条目必须带 project。
+ * v1.23.2 审计第 1 组：模块级队列只存 text 时，flush 后按“进程默认库 + created_at DESC”
+ * 做位置对齐，会写脏别的项目的 conversation_log，且顺序错位。
+ * memoryId 由调用方在落库后回填，flush 时优先按 id 精确回写。
+ */
+export interface VadQueueEntry {
+  text: string;
+  timestamp: number;
+  project: string;
+  memoryId?: string;
+}
+
+let vadQueue: VadQueueEntry[] = [];
 let lastFlushTime = 0;
 
-let _smoothedVAD: VADVector = { ...AIRI_BASELINE.vad };
-let _smoothedTsundere = 0;
+/** 平滑状态按 project 分区：A 项目的情绪不该被 B 项目的对话带动。 */
+const smoothedByProject = new Map<string, { vad: VADVector; tsundere: number }>();
 
-export function queueForVad(text: string): void {
-  vadQueue.push({ text, timestamp: Date.now() });
-  if (vadQueue.length >= VAD_QUEUE_MAX_SIZE) {
-    flushVadQueue().catch(e => console.warn('[emotion] auto-flush failed:', e.message));
+function smoothedFor(project?: string): { vad: VADVector; tsundere: number } {
+  const proj = normalizeProject(project);
+  let s = smoothedByProject.get(proj);
+  if (!s) {
+    s = { vad: { ...AIRI_BASELINE.vad }, tsundere: 0 };
+    smoothedByProject.set(proj, s);
+  }
+  return s;
+}
+
+export function queueForVad(text: string, project?: string, memoryId?: string): void {
+  const proj = normalizeProject(project);
+  const entry: VadQueueEntry = { text, timestamp: Date.now(), project: proj };
+  if (memoryId) entry.memoryId = memoryId;
+  vadQueue.push(entry);
+
+  // 只按本项目的待处理条数触发自动 flush，避免被别的项目撑爆
+  const pending = vadQueue.filter(q => q.project === proj).length;
+  if (pending >= VAD_QUEUE_MAX_SIZE) {
+    flushVadQueue(proj, { force: true }).catch(e => console.warn('[emotion] auto-flush failed:', e.message));
   }
 }
 
-export async function flushVadQueue(): Promise<VADAnalysis | null> {
+/**
+ * 消费 VAD 队列（按 project 分组，不同 project 永不进同一批 prompt）。
+ * - 传 project：只处理该项目的分组；默认立即处理，opts.force=false 时才应用
+ *   “攒够 5 条或最老 10 分钟”的批量阈值（digest 周期调用走这条）。
+ * - 不传 project：显式全量 flush，逐组分析；管理/测试入口。
+ */
+export async function flushVadQueue(
+  project?: string,
+  opts: { force?: boolean } = {},
+): Promise<VADAnalysis | null> {
   if (vadQueue.length === 0) return null;
-  const now = Date.now();
-  const oldestAge = now - (vadQueue[0]?.timestamp || now);
-  if (vadQueue.length < 5 && oldestAge < VAD_QUEUE_MAX_AGE_MS) {
-    return null;
-  }
 
-  const batch = [...vadQueue];
-  vadQueue = [];
+  const scoped = typeof project === 'string' && project.trim().length > 0;
+  const target = scoped ? normalizeProject(project) : null;
+  const now = Date.now();
+
+  const groups = new Map<string, VadQueueEntry[]>();
+  for (const entry of vadQueue) {
+    if (target !== null && entry.project !== target) continue;
+    const list = groups.get(entry.project) || [];
+    list.push(entry);
+    groups.set(entry.project, list);
+  }
+  if (groups.size === 0) return null;
+
+  // 显式调用 flush = 立即处理；只有 digest 显式传 force:false 才保留批量阈值。
+  const force = opts.force !== false;
+  const batches: Array<{ project: string; entries: VadQueueEntry[] }> = [];
+  for (const [proj, entries] of groups) {
+    const oldestAge = now - Math.min(...entries.map(e => e.timestamp));
+    if (!force && entries.length < VAD_QUEUE_MIN_BATCH && oldestAge < VAD_QUEUE_MAX_AGE_MS) continue;
+    batches.push({ project: proj, entries });
+  }
+  if (batches.length === 0) return null;
+
+  // 只摘掉本次真正要处理的条目；未达阈值/别的项目的条目留在队列里
+  const taken = new Set<VadQueueEntry>();
+  for (const b of batches) for (const e of b.entries) taken.add(e);
+  vadQueue = vadQueue.filter(e => !taken.has(e));
   lastFlushTime = now;
 
-  const lines = batch.map((q, i) => '[' + (i + 1) + '] ' + q.text).join('\n');
-  const batchText = 'Analyze the emotional trajectory across these ' + batch.length
-    + ' recent messages:\n' + lines
-    + '\n\nOutput a SINGLE VAD and tsundere_level representing the current overall emotional state.';
+  let lastResult: VADAnalysis | null = null;
+  let processed = 0;
+  for (const batch of batches) {
+    const lines = batch.entries.map((q, i) => '[' + (i + 1) + '] ' + q.text).join('\n');
+    const batchText = 'Analyze the emotional trajectory across these ' + batch.entries.length
+      + ' recent messages:\n' + lines
+      + '\n\nOutput a SINGLE VAD and tsundere_level representing the current overall emotional state.';
 
-  const result = await ollamaDetectVAD(batchText);
-  if (result.confidence < 0.3) return result;
+    const result = await ollamaDetectVAD(batchText);
+    lastResult = result;
+    if (result.confidence < 0.3) continue;
 
-  _smoothedVAD = {
-    valence:  _smoothedVAD.valence  + EMOTION_SMOOTH_ALPHA * (result.vad.valence  - _smoothedVAD.valence),
-    arousal:  _smoothedVAD.arousal  + EMOTION_SMOOTH_ALPHA * (result.vad.arousal  - _smoothedVAD.arousal),
-    dominance: _smoothedVAD.dominance + EMOTION_SMOOTH_ALPHA * (result.vad.dominance - _smoothedVAD.dominance),
-  };
-  _smoothedTsundere = _smoothedTsundere + EMOTION_SMOOTH_ALPHA * (result.tsundereLevel - _smoothedTsundere);
+    const smoothed = smoothedFor(batch.project);
+    smoothed.vad = {
+      valence: smoothed.vad.valence + EMOTION_SMOOTH_ALPHA * (result.vad.valence - smoothed.vad.valence),
+      arousal: smoothed.vad.arousal + EMOTION_SMOOTH_ALPHA * (result.vad.arousal - smoothed.vad.arousal),
+      dominance: smoothed.vad.dominance + EMOTION_SMOOTH_ALPHA * (result.vad.dominance - smoothed.vad.dominance),
+    };
+    smoothed.tsundere = smoothed.tsundere + EMOTION_SMOOTH_ALPHA * (result.tsundereLevel - smoothed.tsundere);
 
-  // 批量分类 + 回写标签到每条消息
-  batchClassifyAndTag(batch.map(q => q.text)).catch(() => {});
+    // 批量分类 + 回写标签/VAD 到每条消息。必须 await：调用方 flush 完就能读到更新。
+    processed += await batchClassifyAndTag(batch.entries, batch.project);
+  }
 
-  return result;
+  if (processed > 0) {
+    console.warn(`[emotion] VAD flush: ${batches.length} project batch(es), ${processed} memories tagged`);
+  }
+  return lastResult;
 }
 
-export function getSmoothedVAD(): { vad: VADVector; tsundereLevel: number } {
+export function getSmoothedVAD(project?: string): { vad: VADVector; tsundereLevel: number } {
+  const s = smoothedFor(project);
   return {
-    vad: { ..._smoothedVAD },
-    tsundereLevel: Math.round(_smoothedTsundere),
+    vad: { ...s.vad },
+    tsundereLevel: Math.round(s.tsundere),
   };
 }
 
-export function vadQueueStatus(): { size: number; oldestAgeSec: number; smoothed: string } {
+export function vadQueueStatus(project?: string): { size: number; oldestAgeSec: number; smoothed: string } {
   const now = Date.now();
-  const oldest = vadQueue[0]?.timestamp || now;
-  const ts = Math.round(_smoothedTsundere);
+  const scoped = typeof project === 'string' && project.trim().length > 0;
+  const pending = scoped ? vadQueue.filter(q => q.project === normalizeProject(project)) : vadQueue;
+  const oldest = pending[0]?.timestamp || now;
+  const s = smoothedFor(scoped ? project : undefined);
+  const ts = Math.round(s.tsundere);
   return {
-    size: vadQueue.length,
+    size: pending.length,
     oldestAgeSec: Math.round((now - oldest) / 1000),
-    smoothed: 'v=' + _smoothedVAD.valence.toFixed(2) + ' a=' + _smoothedVAD.arousal.toFixed(2) + ' tsun=' + ts,
+    smoothed: 'v=' + s.vad.valence.toFixed(2) + ' a=' + s.vad.arousal.toFixed(2) + ' tsun=' + ts,
   };
 }
 
@@ -584,19 +658,41 @@ export async function ollamaClassify(text: string): Promise<{
 // 批量分类 — 一次 Ollama 调用处理 N 条消息，结果回写 DB
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * 一批消息 → 一条 Ollama prompt → N 个分类结果
- * 不阻塞，每条消息获得独立的 category/importance/tags
- */
-export async function batchClassifyAndTag(texts: string[]): Promise<number> {
-  if (texts.length === 0) return 0;
+/** 把模型返回的 vad 对象解析成 [-1,1] 三维；三个维度都必须是有限数字，否则整条视为“没返回 VAD”。 */
+function parseVadResult(raw: any): VADVector | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const nums = [raw.valence, raw.arousal, raw.dominance].map((v: any): number | null => {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Number(v);
+    return null;
+  });
+  if (nums.some(n => n === null)) return null;
+  return {
+    valence: clamp(nums[0] as number, -1, 1),
+    arousal: clamp(nums[1] as number, -1, 1),
+    dominance: clamp(nums[2] as number, -1, 1),
+  };
+}
 
-  const systemPrompt = 'Classify each numbered message. For EACH, output: importance (0-1), category, tags (Chinese).\n' +
+/**
+ * 一批消息 → 一条 Ollama prompt → N 个分类结果。
+ * 回写按 memoryId 精确 UPDATE；没有 id 的条目才回退到“本项目 + created_at DESC”的位置对齐。
+ * 模型返回 vad 时同时写入 vad_valence/arousal/dominance（clamp 到 [-1,1]，与 search.ts 读取约定一致）。
+ */
+export async function batchClassifyAndTag(
+  entries: Array<{ text: string; memoryId?: string; timestamp?: number }>,
+  project?: string,
+): Promise<number> {
+  if (entries.length === 0) return 0;
+  const proj = normalizeProject(project);
+
+  const systemPrompt = 'Classify each numbered message. For EACH, output: importance (0-1), category, tags (Chinese), and vad.\n' +
     'importance: identity/job/name → 0.8+. milestones/promises → 0.7+. preferences/knowledge → 0.4-0.6. trivial → 0.1-0.3.\n' +
     'category: identity|milestone|emotional|knowledge|preference|plan|relationship|general\n' +
-    'Output ONLY a JSON array, one object per message: [{"importance":0.8,"category":"identity","tags":["标签1"]}, ...]';
+    'vad: {"valence":-1..1,"arousal":-1..1,"dominance":-1..1} — emotional tone of THAT message; 0 for neutral/factual. Omit "vad" entirely if you cannot judge it.\n' +
+    'Output ONLY a JSON array, one object per message: [{"importance":0.8,"category":"identity","tags":["标签1"],"vad":{"valence":0.4,"arousal":0.2,"dominance":0.1}}, ...]';
 
-  const lines = texts.map((t, i) => '[' + (i + 1) + '] ' + t).join('\n');
+  const lines = entries.map((e, i) => '[' + (i + 1) + '] ' + e.text).join('\n');
   const userPrompt = 'Classify each message:\n' + lines;
 
   try {
@@ -648,30 +744,46 @@ export async function batchClassifyAndTag(texts: string[]): Promise<number> {
 
     const validCategories = ['identity', 'milestone', 'emotional', 'knowledge', 'preference', 'plan', 'relationship', 'general'];
 
-    // 导入 DB 模块回写标签到最近的 conversation_log
+    // 导入 DB 模块回写；conversation_log 落在项目的 general 库
     let { DatabaseManager } = await import('./db.js');
-    const db = DatabaseManager.getInstance();
+    const db = DatabaseManager.getInstance(proj);
 
-    // 注意：这里是“最近 N 条 conversation_log”与队列做位置对齐，队列本身不带 id，
-    // 多项目/多条日志时仍可能错位（待改成按 id 回写）。DESC 至少保证只动最近的行。
-    const recentIds = db.prepare(`
+    // ── 没有 memoryId 的条目：仅作为旧调用方的兜底，按“本项目 + created_at DESC”位置对齐。
+    // 队列顺序是旧→新，而 SQL 是 DESC（新→旧），所以先把无 id 条目按 timestamp 倒序再配对，
+    // 避免整体错位一条。有 id 的条目绝不走这条路径（审计第 1 组要求 c）。
+    const noId = entries
+      .map((entry, index) => ({ entry, index }))
+      .filter(x => !x.entry.memoryId)
+      .sort((a, b) => (b.entry.timestamp ?? 0) - (a.entry.timestamp ?? 0));
+    const fallbackIds: string[] = noId.length === 0 ? [] : db.prepare(`
       SELECT id FROM memory
-      WHERE source = 'conversation_log' AND is_active = 1
-      ORDER BY created_at DESC
-      LIMIT ${texts.length}
-    `).all().map((r: any) => r.id);
+      WHERE source = 'conversation_log' AND project = ? AND is_active = 1
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT ?
+    `).all(proj, noId.length).map((r: any) => r.id);
+    const fallbackIdByIndex = new Map<number, string | undefined>();
+    noId.forEach((x, k) => fallbackIdByIndex.set(x.index, fallbackIds[k]));
 
     let updated = 0;
-    for (let i = 0; i < results.length && i < recentIds.length; i++) {
+    for (let i = 0; i < results.length && i < entries.length; i++) {
       const r = results[i];
+      const targetId = entries[i].memoryId || fallbackIdByIndex.get(i);
+      if (!targetId) continue;
+
       const imp = clamp(r.importance || 0.5, 0, 1);
       const tier = imp >= 0.7 ? 'critical' : (imp <= 0.3 ? 'temporary' : 'standard');
       const cat = validCategories.includes(r.category) ? r.category : 'general';
       const tags = JSON.stringify(Array.isArray(r.tags) ? r.tags.slice(0, 5) : []);
+      const vad = parseVadResult(r.vad);
 
-      db.prepare(`UPDATE memory SET category = ?, importance = ?, tier = ?, tags = ? WHERE id = ?`)
-        .run(cat, imp, tier, tags, recentIds[i]);
-      updated++;
+      // 有 VAD 才写三列；没有就保持 NULL（检索的 VAD 衰减分支才不会误判）
+      const res = vad
+        ? db.prepare(`UPDATE memory SET category = ?, importance = ?, tier = ?, tags = ?,
+            vad_valence = ?, vad_arousal = ?, vad_dominance = ? WHERE id = ? AND project = ?`)
+            .run(cat, imp, tier, tags, vad.valence, vad.arousal, vad.dominance, targetId, proj)
+        : db.prepare(`UPDATE memory SET category = ?, importance = ?, tier = ?, tags = ? WHERE id = ? AND project = ?`)
+            .run(cat, imp, tier, tags, targetId, proj);
+      if (res.changes > 0) updated++;
     }
 
     return updated;

@@ -58,7 +58,7 @@ function computeEmotionalIntensity(row) {
     return { emotionalIntensity, baseIntensity, isHighEmotion: baseIntensity >= 0.7 };
 }
 /** 统一评分:一致性 + 情感强度(主锚) + 时间衰减 + 偏离加成,乘 bias/importance/tier/access */
-function computeScore(row, similarity) {
+function computeScore(row, similarity, project) {
     const hoursSinceCreated = (Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60);
     const { emotionalIntensity, isHighEmotion } = computeEmotionalIntensity(row);
     const consistency = Math.min(Math.max(similarity, 0), 0.7); // 上限 0.7,避免过度拟合人设
@@ -68,7 +68,7 @@ function computeScore(row, similarity) {
     const importanceMult = 0.5 + (row.importance || 0.5);
     const accessBoost = 1 + Math.min(0.5, Math.log2(1 + (row.accessed_count || 0)) * 0.1);
     const memTags = parseTagsSafe(row.tags);
-    const biasBoost = computeBiasBoost(row.character_id || '', memTags);
+    const biasBoost = computeBiasBoost(row.character_id || '', memTags, project);
     const rawScore = WEIGHT_CONSISTENCY * consistency
         + WEIGHT_EMOTION * emotionalIntensity
         + WEIGHT_TIME * timeDecay
@@ -251,7 +251,7 @@ function tagSearch(db, options) {
         const memTags = parseTagsSafe(row.tags);
         const matchedTags = keywords.filter(k => memTags.some((t) => t.toLowerCase().includes(k.toLowerCase()))).length;
         const tagScore = Math.min(1.0, matchedTags / Math.max(1, keywords.length));
-        const { score, biasBoost } = computeScore(row, tagScore);
+        const { score, biasBoost } = computeScore(row, tagScore, project);
         return {
             id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
             subcategory: row.subcategory, tags: memTags,
@@ -322,7 +322,7 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
             continue;
         const dist = rowidMap.get(row.rowid) ?? 1.0;
         const similarity = Math.max(0, 1.0 - dist);
-        const { score, biasBoost } = computeScore(row, similarity);
+        const { score, biasBoost } = computeScore(row, similarity, project);
         if (score >= minScore) {
             results.push({
                 id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
@@ -384,7 +384,7 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
     return rows
         .filter(row => !excludeIds.has(row.id))
         .map(row => {
-        const { score, biasBoost } = computeScore(row, 0.3);
+        const { score, biasBoost } = computeScore(row, 0.3, project);
         return {
             id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
             subcategory: row.subcategory, tags: parseTagsSafe(row.tags),

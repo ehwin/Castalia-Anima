@@ -31,8 +31,8 @@ class AgentState {
         this.characterId = characterId;
         this.project = normalizeProject(project);
         this.loadFromDb();
-        // Also load topic biases from existing memory tags
-        loadBiasesFromDb(characterId);
+        // Also load topic biases from existing memory tags (per project partition)
+        loadBiasesFromDb(characterId, this.project);
     }
     /**
      * Load recent mood events from SQLite on startup.

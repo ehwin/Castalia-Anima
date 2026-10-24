@@ -12,6 +12,7 @@
  * - Language preference (zh/en/mixed)
  */
 import { DatabaseManager } from './db.js';
+import { normalizeProject } from './env.js';
 
 interface UserProfile {
   characterId: string;
@@ -27,8 +28,12 @@ interface UserProfile {
 
 const profiles = new Map<string, UserProfile>();
 
-function profileKey(characterId: string, userId: string): string {
-  return `${characterId}:${userId}`;
+/**
+ * v1.23.2 审计第 3 组：画像键必须带 project。
+ * 之前只用 charId:userId，同一 charId 在不同项目下会共用一份画像（串味）。
+ */
+function profileKey(characterId: string, userId: string, project?: string): string {
+  return `${normalizeProject(project)}|${characterId}:${userId}`;
 }
 
 /**
@@ -37,9 +42,10 @@ function profileKey(characterId: string, userId: string): string {
 export function observeUserMessage(
   characterId: string,
   userId: string,
-  message: string
+  message: string,
+  project?: string
 ): void {
-  const key = profileKey(characterId, userId);
+  const key = profileKey(characterId, userId, project);
   if (!profiles.has(key)) {
     profiles.set(key, {
       characterId,
@@ -94,8 +100,8 @@ export function observeUserMessage(
 /**
  * Get user profile summary for prompt injection.
  */
-export function getUserProfilePrompt(characterId: string, userId: string): string {
-  const key = profileKey(characterId, userId);
+export function getUserProfilePrompt(characterId: string, userId: string, project?: string): string {
+  const key = profileKey(characterId, userId, project);
   const profile = profiles.get(key);
   if (!profile || profile.interactionCount < 3) return '';
 
@@ -137,28 +143,29 @@ export function getUserProfilePrompt(characterId: string, userId: string): strin
 /**
  * Get raw profile data.
  */
-export function getUserProfile(characterId: string, userId: string): UserProfile | null {
-  return profiles.get(profileKey(characterId, userId)) || null;
+export function getUserProfile(characterId: string, userId: string, project?: string): UserProfile | null {
+  return profiles.get(profileKey(characterId, userId, project)) || null;
 }
 
 /**
  * Load user profiles from memory on startup.
  */
-export function loadUserProfilesFromDb(characterId: string): void {
+export function loadUserProfilesFromDb(characterId: string, project?: string): void {
+  const proj = normalizeProject(project);
   try {
-    const db = DatabaseManager.getInstance();
+    const db = DatabaseManager.getInstance(proj);
     const rows = db.prepare(`
       SELECT text, tags, emotional_impact, created_at
       FROM memory
-      WHERE subject = 'user' AND type = 'preference' AND character_id = ? AND is_active = 1
+      WHERE project = ? AND subject = 'user' AND type = 'preference' AND character_id = ? AND is_active = 1
       ORDER BY created_at DESC
       LIMIT 50
-    `).all(characterId) as any[];
+    `).all(proj, characterId) as any[];
 
     for (const row of rows) {
       try {
         const tags = JSON.parse(row.tags || '[]');
-        const key = profileKey(characterId, 'default');
+        const key = profileKey(characterId, 'default', proj);
         if (!profiles.has(key)) {
           profiles.set(key, {
             characterId,

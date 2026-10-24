@@ -117,7 +117,7 @@ export async function saveMemory(params) {
     storeTx();
     // 记录 tags 到 bias(bias 学习:兴趣权重积累,随记忆沉淀人格)
     if (record.tags.length > 0 && record.characterId) {
-        recordTopics(record.characterId, record.tags);
+        recordTopics(record.characterId, record.tags, record.project);
     }
     // 定期整理
     saveCount++;
@@ -347,13 +347,17 @@ export function cleanupExpiredMemories(project) {
  * v5.0: 重新向量化单条记忆 — reflect 后调用
  * 删旧向量 + embed 新文本 + 插入新向量
  */
-export async function reEmbedMemory(id) {
-    const db = DatabaseManager.getInstance();
+export async function reEmbedMemory(id, project) {
+    // v1.23.2-fix: 按 id 定位真实分类库（旧实现只查默认 general 库，跨库记忆永远重嵌失败）
+    const found = findDbByMemoryId(id, project);
+    if (!found)
+        return false;
+    const db = found.db;
     const mem = db.prepare('SELECT rowid, text FROM memory WHERE id = ? AND is_active = 1').get(id);
     if (!mem)
         return false;
     try {
-        const vec = new Float32Array(await embed(mem.text));
+        const vec = new Float32Array(await embed(mem.text, project));
         db.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(BigInt(mem.rowid));
         db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(BigInt(mem.rowid), vec);
         return true;

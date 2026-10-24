@@ -12,15 +12,20 @@
  * - Language preference (zh/en/mixed)
  */
 import { DatabaseManager } from './db.js';
+import { normalizeProject } from './env.js';
 const profiles = new Map();
-function profileKey(characterId, userId) {
-    return `${characterId}:${userId}`;
+/**
+ * v1.23.2 审计第 3 组：画像键必须带 project。
+ * 之前只用 charId:userId，同一 charId 在不同项目下会共用一份画像（串味）。
+ */
+function profileKey(characterId, userId, project) {
+    return `${normalizeProject(project)}|${characterId}:${userId}`;
 }
 /**
  * Observe a user message and update profile.
  */
-export function observeUserMessage(characterId, userId, message) {
-    const key = profileKey(characterId, userId);
+export function observeUserMessage(characterId, userId, message, project) {
+    const key = profileKey(characterId, userId, project);
     if (!profiles.has(key)) {
         profiles.set(key, {
             characterId,
@@ -72,8 +77,8 @@ export function observeUserMessage(characterId, userId, message) {
 /**
  * Get user profile summary for prompt injection.
  */
-export function getUserProfilePrompt(characterId, userId) {
-    const key = profileKey(characterId, userId);
+export function getUserProfilePrompt(characterId, userId, project) {
+    const key = profileKey(characterId, userId, project);
     const profile = profiles.get(key);
     if (!profile || profile.interactionCount < 3)
         return '';
@@ -109,26 +114,27 @@ export function getUserProfilePrompt(characterId, userId) {
 /**
  * Get raw profile data.
  */
-export function getUserProfile(characterId, userId) {
-    return profiles.get(profileKey(characterId, userId)) || null;
+export function getUserProfile(characterId, userId, project) {
+    return profiles.get(profileKey(characterId, userId, project)) || null;
 }
 /**
  * Load user profiles from memory on startup.
  */
-export function loadUserProfilesFromDb(characterId) {
+export function loadUserProfilesFromDb(characterId, project) {
+    const proj = normalizeProject(project);
     try {
-        const db = DatabaseManager.getInstance();
+        const db = DatabaseManager.getInstance(proj);
         const rows = db.prepare(`
       SELECT text, tags, emotional_impact, created_at
       FROM memory
-      WHERE subject = 'user' AND type = 'preference' AND character_id = ? AND is_active = 1
+      WHERE project = ? AND subject = 'user' AND type = 'preference' AND character_id = ? AND is_active = 1
       ORDER BY created_at DESC
       LIMIT 50
-    `).all(characterId);
+    `).all(proj, characterId);
         for (const row of rows) {
             try {
                 const tags = JSON.parse(row.tags || '[]');
-                const key = profileKey(characterId, 'default');
+                const key = profileKey(characterId, 'default', proj);
                 if (!profiles.has(key)) {
                     profiles.set(key, {
                         characterId,

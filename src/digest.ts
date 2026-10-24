@@ -21,7 +21,8 @@ import { cleanupExpiredMemories } from './store.js';
 import { getAgentState } from './agentState.js';
 
 const MIN_DIGEST_GAP_MS = 60 * 1000;
-let lastDigestTime = 0;
+// v1.23.2-fix: 按 project 节流（旧实现全局单值，一个项目跑 digest 会压制其它项目 60s）
+const lastDigestTimes = new Map<string, number>();
 
 export interface DigestResult {
   success: boolean;
@@ -42,9 +43,11 @@ export async function runDigest(characterId: string = 'airi', project?: string):
     errors: [],
   };
 
-  // 1. 消费 VAD 队列 — 批量情感分析 + 批量贴标签
+  // 1. 消费 VAD 队列 — 只处理本项目分组（不同 project 不混批）。
+  //    显式 normalize：不传 project 时也固定落到默认项目，避免一次 digest 把别人的队列全消费掉。
+  //    force:false = 保留周期批量的“攒够 5 条 / 最老 10 分钟”阈值，避免每条消息一次 LLM 调用。
   try {
-    const vadResult = await flushVadQueue();
+    const vadResult = await flushVadQueue(normalizeProject(project), { force: false });
     if (vadResult) {
       result.vadUpdated = true;
       result.details = result.details || [];
@@ -82,7 +85,8 @@ export async function runDigest(characterId: string = 'airi', project?: string):
 
 export function maybeDigest(characterId: string = 'airi', project?: string): Promise<DigestResult> | null {
   const now = Date.now();
-  if (now - lastDigestTime < MIN_DIGEST_GAP_MS) return null;
+  const projKey = normalizeProject(project);
+  if (now - (lastDigestTimes.get(projKey) || 0) < MIN_DIGEST_GAP_MS) return null;
 
   const db = DatabaseManager.getInstance(project);
   const unanalyzed = (db.prepare(`
@@ -93,7 +97,7 @@ export function maybeDigest(characterId: string = 'airi', project?: string): Pro
 
   if (unanalyzed === 0) return null;
 
-  lastDigestTime = now;
+  lastDigestTimes.set(projKey, now);
   return runDigest(characterId, project);
 }
 

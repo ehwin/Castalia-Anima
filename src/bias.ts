@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Anima Bias Layer — topic weight accumulation
  * Inspired by the emotional-variant design: letting memory shape personality over time
  *
@@ -10,6 +10,7 @@
  * Bias weights are EMERGENT — they accumulate from conversation patterns.
  */
 import { DatabaseManager } from './db.js';
+import { normalizeProject } from './env.js';
 
 interface TopicWeight {
   topic: string;
@@ -18,8 +19,24 @@ interface TopicWeight {
   mentionCount: number; // how many times this topic appeared
 }
 
-// In-memory topic weights per character
+// In-memory topic weights per (project, character) — v1.23.2 审计第 3 组：
+// 只按 characterId 做键会让不同项目的兴趣权重互相污染。
 const biasMaps = new Map<string, Map<string, TopicWeight>>();
+
+/** 偏差层键：project 前缀 + charId；project 缺省走 normalizeProject。 */
+function biasKey(characterId: string, project?: string): string {
+  return `${normalizeProject(project)}|${characterId || ''}`;
+}
+
+function biasMapFor(characterId: string, project?: string): Map<string, TopicWeight> {
+  const key = biasKey(characterId, project);
+  let map = biasMaps.get(key);
+  if (!map) {
+    map = new Map();
+    biasMaps.set(key, map);
+  }
+  return map;
+}
 
 // Decay: topics not mentioned for 30 days lose half their weight
 const BIAS_DECAY_HALF_LIFE_DAYS = 30;
@@ -29,11 +46,8 @@ const BIAS_DECAY_RATE = Math.LN2 / (BIAS_DECAY_HALF_LIFE_DAYS * 24);
  * Record topic mentions from a conversation.
  * Call this after each conversation turn.
  */
-export function recordTopics(characterId: string, topics: string[]): void {
-  if (!biasMaps.has(characterId)) {
-    biasMaps.set(characterId, new Map());
-  }
-  const map = biasMaps.get(characterId)!;
+export function recordTopics(characterId: string, topics: string[], project?: string): void {
+  const map = biasMapFor(characterId, project);
   const now = Date.now();
 
   for (const topic of topics) {
@@ -59,8 +73,8 @@ export function recordTopics(characterId: string, topics: string[]): void {
 /**
  * Get current topic biases with time decay applied.
  */
-export function getBiases(characterId: string, limit: number = 10): TopicWeight[] {
-  const map = biasMaps.get(characterId);
+export function getBiases(characterId: string, limit: number = 10, project?: string): TopicWeight[] {
+  const map = biasMaps.get(biasKey(characterId, project));
   if (!map) return [];
 
   const now = Date.now();
@@ -84,8 +98,8 @@ export function getBiases(characterId: string, limit: number = 10): TopicWeight[
 /**
  * Get top topics as a simple string for prompt injection.
  */
-export function getBiasPrompt(characterId: string): string {
-  const biases = getBiases(characterId, 5);
+export function getBiasPrompt(characterId: string, project?: string): string {
+  const biases = getBiases(characterId, 5, project);
   if (biases.length === 0) return '';
 
   const topicStr = biases.map(b => `${b.topic}(${b.weight.toFixed(1)})`).join('、');
@@ -96,8 +110,8 @@ export function getBiasPrompt(characterId: string): string {
  * Adjust memory search scores based on topic biases.
  * Memories matching high-bias topics get a score boost.
  */
-export function computeBiasBoost(characterId: string, memoryTags: string[]): number {
-  const map = biasMaps.get(characterId);
+export function computeBiasBoost(characterId: string, memoryTags: string[], project?: string): number {
+  const map = biasMaps.get(biasKey(characterId, project));
   if (!map || memoryTags.length === 0) return 1.0;
 
   const now = Date.now();
@@ -120,27 +134,33 @@ export function computeBiasBoost(characterId: string, memoryTags: string[]): num
 /**
  * Load topic biases from existing memory tags on startup.
  */
-let _biasesLoaded = false;
+const _biasesLoaded = new Set<string>();
 
-export function loadBiasesFromDb(characterId: string): void {
-  if (_biasesLoaded) return; // v5.3: prevent double-load from AgentState
-  _biasesLoaded = true;
+export function loadBiasesFromDb(characterId: string, project?: string): void {
+  const proj = normalizeProject(project);
+  const key = biasKey(characterId, proj);
+  if (_biasesLoaded.has(key)) return; // v5.3: prevent double-load from AgentState (now per project)
+  _biasesLoaded.add(key);
   try {
-    const db = DatabaseManager.getInstance();
-    const rows = db.prepare(`
-      SELECT tags FROM memory WHERE character_id = ? AND is_active = 1
-    `).all(characterId) as any[];
-
     const allTags: string[] = [];
-    for (const row of rows) {
+    // v1.23.2-fix: 冷启动回填所有已存在的分类库（此前只看 general，user/project 里的 tags 丢了）
+    for (const mt of DatabaseManager.existingMemTypes(proj)) {
       try {
-        const tags = JSON.parse(row.tags || '[]');
-        allTags.push(...tags);
-      } catch {}
+        const db = DatabaseManager.getInstance(proj, mt);
+        const rows = db.prepare(`
+          SELECT tags FROM memory WHERE project = ? AND character_id = ? AND is_active = 1
+        `).all(proj, characterId) as any[];
+        for (const row of rows) {
+          try {
+            const tags = JSON.parse(row.tags || '[]');
+            if (Array.isArray(tags)) allTags.push(...tags);
+          } catch { /* 脏 tags 忽略 */ }
+        }
+      } catch { /* 单库失败不影响其它库 */ }
     }
 
     if (allTags.length > 0) {
-      recordTopics(characterId, allTags);
+      recordTopics(characterId, allTags, proj);
     }
   } catch (e) {
     // DB not ready yet

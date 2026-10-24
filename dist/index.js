@@ -146,9 +146,10 @@ register('tavern_sync', 'harness', 'Synchronize the selected SillyTavern chat sn
         text: z.string().min(1).max(100000),
         createdAt: z.string().optional(),
     })).max(5000),
+    replace: z.boolean().optional().describe('Allow a smaller snapshot to replace (soft-delete) the existing chat history. Without it a windowed subset is rejected.'),
 }, async (args) => {
     try {
-        return ok({ op: 'tavern_sync', ...syncTavernChat(args.project, args.messages) });
+        return ok({ op: 'tavern_sync', ...syncTavernChat(args.project, args.messages, { replace: args.replace }) });
     }
     catch (e) {
         return err(e instanceof Error ? e.message : String(e), 'TAVERN_SYNC_FAILED');
@@ -355,8 +356,8 @@ register('context_get', 'admin', 'Get agent state (mood/energy/desire), bias lay
         const proj = normalizeProject(args.project);
         const p = getPersona(args.project);
         const state = getAgentState(charFor(args.project), args.project);
-        const bias = getBiasPrompt(charFor(args.project));
-        const profile = getUserProfilePrompt(charFor(args.project), 'default');
+        const bias = getBiasPrompt(charFor(args.project), args.project);
+        const profile = getUserProfilePrompt(charFor(args.project), 'default', args.project);
         const recent = getRecentMemories(charFor(args.project), 5, 24, proj);
         // memdir 分库:总数跨 user/feedback/project/reference/general 聚合
         const total = DatabaseManager.queryAll(args.project, 'SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?', [proj])
@@ -589,7 +590,7 @@ register('user_observe', 'harness', '[Internal] Observe a user message for commu
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
-        observeUserMessage(charFor(args.project), 'default', args.message);
+        observeUserMessage(charFor(args.project), 'default', args.message, args.project);
         return ok({ observed: true });
     }
     catch (e) {

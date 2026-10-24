@@ -1,12 +1,22 @@
 import crypto from 'node:crypto';
 import { DatabaseManager, safeFilePart } from './db.js';
 /** Synchronize the selected chat snapshot. No reflection, persona or user-profile side effects. */
-export function syncTavernChat(project, messages) {
+export function syncTavernChat(project, messages, opts = {}) {
     if (!/^st_[a-f0-9]{40}$/.test(project) || safeFilePart(project) !== project) {
         throw new Error('SillyTavern requires an isolated st_<sha1> project');
     }
+    // 空数组不是“同步”，是清空；直接拒绝，任何删除都不执行。
+    if (!Array.isArray(messages) || messages.length === 0) {
+        throw new Error('Tavern snapshot is empty; refusing to clear the existing chat history (send the full snapshot)');
+    }
     const db = DatabaseManager.getInstance(project);
     const now = new Date().toISOString();
+    // 窗口化子集保护：只有显式 replace:true 才允许“本次条数 < 已有条数”的收缩。
+    const previousActive = db.prepare("SELECT COUNT(*) AS c FROM memory WHERE project=? AND source='sillytavern_chat' AND is_active=1").get(project)?.c || 0;
+    if (messages.length < previousActive && opts.replace !== true) {
+        throw new Error(`Tavern snapshot has ${messages.length} message(s) but ${previousActive} active message(s) already exist; `
+            + 'this looks like a windowed subset. Pass replace:true to confirm deleting the missing messages.');
+    }
     const ids = new Set();
     const rows = messages.map(message => {
         if (ids.has(message.id))
@@ -18,6 +28,13 @@ export function syncTavernChat(project, messages) {
             createdAt: message.createdAt && Number.isFinite(Date.parse(message.createdAt)) ? new Date(message.createdAt).toISOString() : now,
         };
     });
+    // v1.23.2-fix: 条数相同但内容整体换了一批（swipe 全替换/切到另一段）也要显式 replace
+    const prevActiveIds = new Set(db.prepare("SELECT id FROM memory WHERE project=? AND source='sillytavern_chat' AND is_active=1").all(project).map(r => r.id));
+    const overlap = rows.reduce((n, r) => n + (prevActiveIds.has(r.id) ? 1 : 0), 0);
+    if (prevActiveIds.size > 0 && opts.replace !== true && overlap === 0 && rows.length <= prevActiveIds.size) {
+        throw new Error(`Tavern snapshot shares no message with the ${prevActiveIds.size} active message(s); `
+            + 'this looks like a different/truncated window. Pass replace:true to confirm replacing the chat history.');
+    }
     let changed = 0;
     let deleted = 0;
     db.transaction(() => {
