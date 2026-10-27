@@ -16,15 +16,223 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
-import { normalizeProject } from './env.js';
+import { normalizeProject, CHAR_ID, isEmbedEnabled } from './env.js';
 import { normalizeMemType } from './memType.js';
+import { backfillEntities, reclassifyEntities } from './entities.js';
 /** memdir 分类文件夹名(memType → 目录名,general 为默认/元数据) */
 export function memTypeDir(memType) {
     return normalizeMemType(memType);
 }
-export const VEC_DIM = 1024; // Yuan-EB 2.0-zh
+/** 默认向量维度(Yuan-EB 2.0-zh)。实际取值见 vecDim():可由 config.json 的 embedding.dim / env EMBEDDING_DIM 覆盖。 */
+const DEFAULT_VEC_DIM = 1024;
+let _vecDim;
+/**
+ * 当前向量维度(v1.25 起不再是常量)。
+ *
+ * 惰性读取环境变量,这样 configLoader 在本模块 import 之后注入 EMBEDDING_DIM 也能生效
+ * (config.json 的 embedding.dim → EMBEDDING_DIM)。非法/越界值回退默认 1024。
+ */
+export function vecDim() {
+    if (_vecDim !== undefined)
+        return _vecDim;
+    const raw = (process.env.EMBEDDING_DIM || process.env.VEC_DIM || '').trim();
+    const n = raw ? Number.parseInt(raw, 10) : Number.NaN;
+    _vecDim = Number.isFinite(n) && n > 0 && n <= 65536 ? n : DEFAULT_VEC_DIM;
+    return _vecDim;
+}
+/** 默认维度(历史常量,保留导出做兼容;运行时维度请用 vecDim()) */
+export const VEC_DIM = DEFAULT_VEC_DIM;
+/** 目标维度是否来自显式配置(env EMBEDDING_DIM/VEC_DIM,含 config.json 注入)。未设置 = 只是内置默认值。 */
+function vecDimIsExplicit() {
+    return !!((process.env.EMBEDDING_DIM || process.env.VEC_DIM || '').trim());
+}
+/** 当前嵌入模型名(惰性读取,configLoader 注入 EMBEDDING_MODEL 后也能生效) */
+export function embedModelName() {
+    return (process.env.EMBEDDING_MODEL || 'yuan-embedding-2.0-zh').trim();
+}
+/**
+ * 嵌入空间指纹(v1.28-fix,移植自 Lite 修 E4)。
+ *
+ * 为什么不能只看维度:换模型时维度**常常相同**(同为 1024),但两个模型的向量属于
+ * 不同语义空间,混在一起会让"相似度"失去意义 —— 实测同一文本的自相似度会从 1.000
+ * 掉到 0.000,而毫不相关的文本反而 1.000。所以指纹取 sha256(model|dim)。
+ */
+export function embedSpaceHash() {
+    return crypto.createHash('sha256').update(`${embedModelName()}|${vecDim()}`).digest('hex');
+}
+/**
+ * 嵌入空间对齐(修 E4):库内指纹与当前 model|dim 不一致时,清空向量索引与嵌入缓存,
+ * 让 batchEmbedPending 按新空间重嵌。
+ *
+ * 安全性:vec_memory / vec_facts 只是索引,原文在 memory / facts,清掉不丢数据;
+ * embedding_cache 是纯派生数据。EMBED_MODE=none 时**不动**(无法重嵌,清了只会让检索变差),
+ * 只告警,等下次带嵌入开库时再对齐。
+ */
+export function ensureEmbedSpace(db) {
+    const to = embedSpaceHash();
+    try {
+        db.exec(`CREATE TABLE IF NOT EXISTS _embed_space (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      model TEXT, dim INTEGER, space_hash TEXT, updated_at TEXT
+    )`);
+        const row = db.prepare('SELECT model, dim, space_hash FROM _embed_space WHERE id = 1').get();
+        if (!row) {
+            // 首次记录指纹:不销毁任何既有向量(旧库升级路径,假定现有向量属于当前空间)
+            db.prepare('INSERT OR REPLACE INTO _embed_space (id, model, dim, space_hash, updated_at) VALUES (1, ?, ?, ?, ?)')
+                .run(embedModelName(), vecDim(), to, new Date().toISOString());
+            return { changed: false, to };
+        }
+        if (row.space_hash === to)
+            return { changed: false, to };
+        if (!isEmbedEnabled()) {
+            console.warn(`[db] 嵌入空间变化(库内 ${row.model}/${row.dim} → 配置 ${embedModelName()}/${vecDim()}),但 EMBED_MODE=none 无法重嵌,暂不改动向量与缓存`);
+            return { changed: false, to };
+        }
+        console.warn(`[db] 嵌入空间变化: ${row.model}/${row.dim} → ${embedModelName()}/${vecDim()}(维度可能相同,旧向量属于另一语义空间),清空向量索引与嵌入缓存,稍后按新空间重嵌`);
+        try {
+            db.exec('DELETE FROM vec_memory');
+        }
+        catch (_e) { }
+        try {
+            db.exec('DELETE FROM vec_facts');
+        }
+        catch (_e) { }
+        try {
+            db.exec('DELETE FROM embedding_cache');
+        }
+        catch (_e) { }
+        db.prepare('UPDATE _embed_space SET model = ?, dim = ?, space_hash = ?, updated_at = ? WHERE id = 1')
+            .run(embedModelName(), vecDim(), to, new Date().toISOString());
+        return { changed: true, to };
+    }
+    catch (e) {
+        console.error(`[db] 嵌入空间对齐失败(不阻断开库): ${e.message}`);
+        return { changed: false, to };
+    }
+}
+/** 读出某个 vec0 虚表当前的维度(如 `float[1024]`);表不存在或解析不出 → null */
+function vecTableDim(db, name) {
+    try {
+        const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name=?").get(name);
+        const m = row && row.sql ? /float\[(\d+)\]/.exec(String(row.sql)) : null;
+        return m ? Number.parseInt(m[1], 10) : null;
+    }
+    catch (_e) {
+        return null;
+    }
+}
+/**
+ * 维度对齐(v1.25):库内 vec 表维度与当前配置不一致时重建。
+ *
+ * 为什么必须重建:sqlite-vec 的 vec0 表把维度写在建表语句里(`embedding float[N]`),
+ * 换嵌入模型常常同时换维度(BAAI/bge-m3 = 1024,qwen3-embedding:8b = 4096…)。
+ * 数据不丢:memory / facts 的原文与关系都在普通表,vec 表只是索引;
+ * 重建后 vec 表为空,batchEmbedPending 会把缺向量的行重新嵌入
+ * (EMBED_MODE=none 时保持"待嵌"状态,下次开嵌入再补)。
+ */
+function reconcileVecDim(db) {
+    const want = vecDim();
+    const dims = [vecTableDim(db, 'vec_memory'), vecTableDim(db, 'vec_facts')];
+    const existing = dims.filter((d) => d !== null);
+    if (existing.length === 0)
+        return; // 从未建过 → 首次建表
+    if (existing.every(d => d === want))
+        return; // 已是目标维度
+    // v1.28-fix(移植自 Lite 修 E2):目标维度只是**内置默认值**(既没有 env,也没有 config.json 的
+    // embedding.dim)时,绝不因为它与库内不同就销毁索引。控制台把注入的默认 dim=1024
+    // 写回 config.json 后,曾让 4096 维库被静默降维 + DROP 索引 + 清空 embedding_cache;
+    // 连 config.json 都不存在的纯默认场景同样会清库。此时应沿用库内维度。
+    if (!vecDimIsExplicit()) {
+        const adopted = existing[0];
+        _vecDim = adopted;
+        console.warn(`[db] 库内向量维度 ${[...new Set(existing)].join('/')} 与内置默认 ${want} 不同;因未显式配置维度,沿用库内维度 ${adopted}(不重建、不清索引)。若确实要换维度,请显式设置 EMBEDDING_DIM 或 config.json 的 embedding.dim`);
+        return;
+    }
+    // 2026-10-27 修复(P2-2,复核提出):EMBED_MODE=none 时**不能**重建 —— 清了也没法重嵌,
+    // 只会把可用索引变成空索引,而且与 ensureEmbedSpace 的 none 语义自相矛盾。
+    if (!isEmbedEnabled()) {
+        console.warn(`[db] 向量维度变化: 库内 ${[...new Set(existing)].join('/')} 维 → 配置 ${want} 维,但 EMBED_MODE=none 无法重嵌,暂不重建(不清索引、不清缓存)`);
+        return;
+    }
+    console.warn(`[db] 向量维度变化: 库内 ${[...new Set(existing)].join('/')} 维 → 配置 ${want} 维,重建 vec 表(重启嵌入后自动补向量)`);
+    try {
+        db.exec(`DROP TABLE IF EXISTS vec_memory`);
+    }
+    catch (_e) { }
+    try {
+        db.exec(`DROP TABLE IF EXISTS vec_facts`);
+    }
+    catch (_e) { }
+    try {
+        db.exec(`DELETE FROM embedding_cache`);
+    }
+    catch (_e) { }
+}
 export function generateId() {
     return crypto.randomUUID();
+}
+/** 表是否存在(用于旧库/半初始化库的安全探测) */
+function tableExists(db, name) {
+    try {
+        return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
+    }
+    catch (_e) {
+        return false;
+    }
+}
+/**
+ * 孤儿向量自愈(v1.28-fix,移植自 Lite `healVecOrphans`)。
+ *
+ * vec_memory / vec_facts 是 vec0 虚表,主键是源表 rowid。任何绕过 store 层的硬删
+ * (手写 SQL、外部工具、历史 bug)都会留下孤儿向量:它既会污染 KNN 结果,又会在
+ * SQLite 复用 rowid 后让下一次 `INSERT INTO vec_memory` 撞
+ * `UNIQUE constraint failed on vec_memory primary key` —— 该条记忆此后永久保存失败。
+ *
+ * 在库 open/init 时(每进程每库一次,不是每次查询)删除 rowid 已不存在于源表的向量。
+ * 幂等:没有孤儿时零删除;只删"源表查不到 rowid"的行,不碰合法行。
+ * 不用 JOIN(vec0 对 KNN 之外的 JOIN 支持受限):先取两侧 rowid 集合,再按主键删。
+ */
+export function healVecOrphans(db) {
+    const healed = { memory: 0, facts: 0 };
+    const pairs = [
+        ['vec_memory', 'memory', 'memory'],
+        ['vec_facts', 'facts', 'facts'],
+    ];
+    for (const [vecTable, srcTable, key] of pairs) {
+        try {
+            if (!tableExists(db, vecTable) || !tableExists(db, srcTable))
+                continue;
+            const alive = new Set();
+            for (const row of db.prepare(`SELECT rowid FROM ${srcTable}`).all()) {
+                alive.add(String(row.rowid));
+            }
+            const orphans = [];
+            for (const row of db.prepare(`SELECT rowid FROM ${vecTable}`).all()) {
+                if (!alive.has(String(row.rowid)))
+                    orphans.push(row.rowid);
+            }
+            if (orphans.length === 0)
+                continue;
+            // 误删保险：孤儿占该表向量总数的一半以上、且超过 50 行时，说明是 rowid 体系
+            // 整体不匹配(例如外部工具用别的表灌过向量)，而不是零星硬删残留。此时只告警
+            // 不删除——宁可留下孤儿被 KNN 过滤，也不能一次性抹掉整库 embedding。
+            const totalVec = Number(db.prepare(`SELECT count(*) AS c FROM ${vecTable}`).get()?.c || 0);
+            if (orphans.length > 50 && orphans.length > totalVec * 0.5) {
+                console.error(`[db] ${vecTable} 孤儿占比异常(${orphans.length}/${totalVec})，判定为 rowid 体系不匹配，跳过自愈以防误删`);
+                continue;
+            }
+            const del = db.prepare(`DELETE FROM ${vecTable} WHERE rowid = ?`);
+            db.transaction((ids) => { for (const id of ids)
+                del.run(id); })(orphans);
+            healed[key] = orphans.length;
+            console.error(`[db] 清理孤儿向量 ${vecTable}: ${orphans.length} 行(rowid 已不在 ${srcTable})`);
+        }
+        catch (e) {
+            // 旧库缺表 / vec0 扩展异常时不能阻断开库
+            console.error(`[db] ${vecTable} 孤儿清理跳过: ${e.message}`);
+        }
+    }
+    return healed;
 }
 /** memory 目录:env MEMORY_DB_DIR 或 <cwd>/memory/ */
 function memDir() {
@@ -367,12 +575,16 @@ export function initProjectSchema(db) {
              BEGIN UPDATE memory SET base_importance = NEW.importance WHERE id = NEW.id; END`);
     }
     catch (_e) { /* trigger 已存在 */ }
-    // Unique index for fact dedup (per-project: same SPO allowed across projects)
-    // v1.23.2-fix: 不再每次启动 DROP 再重建（重建失败会让 facts 的 ON CONFLICT 直接不可用）
+    // Unique index for fact dedup (per-project + per-character: same SPO allowed across projects and roles)
+    // v1.24: 角色隔离 — 唯一键加入 character_id(旧 4 列索引会让同库多角色互相顶掉),
+    // 旧的 idx_facts_spo 必须删除,否则 4 列唯一约束仍然拦住跨角色同 SPO。
     try {
-        const idx = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_facts_spo'").get();
-        if (!idx)
-            db.exec(`CREATE UNIQUE INDEX idx_facts_spo ON facts(subject, predicate, object, project)`);
+        const cur = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_facts_spo_char'").get();
+        if (!cur || !/character_id/.test(String(cur.sql || ''))) {
+            db.exec('DROP INDEX IF EXISTS idx_facts_spo_char');
+            db.exec('DROP INDEX IF EXISTS idx_facts_spo');
+            db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_spo_char ON facts(subject, predicate, object, project, character_id)`);
+        }
     }
     catch (e) {
         console.error(`[db] facts 唯一索引未建立（存在重复 SPO 或旧库）: ${e.message}`);
@@ -381,8 +593,61 @@ export function initProjectSchema(db) {
         db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject, is_active)`);
     }
     catch (_e) { }
+    // v1.24: 角色分区索引(所有检索/统计都按 character_id 过滤)
+    try {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_character ON memory(character_id, is_active)`);
+    }
+    catch (_e) { }
+    try {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_character ON facts(character_id, is_active)`);
+    }
+    catch (_e) { }
     // 指令表(保持原 schema:项目库也建;三层指令路由在 instructions.ts 决定)
     initInstructionsSchema(db);
+    // ═══ v1.27 实体层 ═══
+    // 以前 facts.subject/object 是自由文本,"和某实体相关的事实/记忆"只能 LIKE 扫正文;
+    // 我们不需要图数据库,需要的是一张规范化实体表 + fact/memory 关联表,然后一次 JOIN。
+    try {
+        db.exec(`CREATE TABLE IF NOT EXISTS entities (
+      id TEXT PRIMARY KEY,
+      key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      kind TEXT DEFAULT 'unknown',
+      mention_count INTEGER DEFAULT 0,
+      first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+      last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+        db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_key ON entities(key)`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_entities_mentions ON entities(mention_count DESC)`);
+        db.exec(`CREATE TABLE IF NOT EXISTS fact_entities (
+      fact_id TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      PRIMARY KEY (fact_id, entity_id, role)
+    )`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_fact_entities_entity ON fact_entities(entity_id)`);
+        db.exec(`CREATE TABLE IF NOT EXISTS memory_entities (
+      memory_id TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'fact',
+      PRIMARY KEY (memory_id, entity_id, role)
+    )`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_id)`);
+        // 当前有效事实视图:把散落在各处的 (valid_to IS NULL OR valid_to='') 口径收敛到一处
+        db.exec(`CREATE VIEW IF NOT EXISTS facts_current AS
+      SELECT * FROM facts WHERE is_active = 1 AND (valid_to IS NULL OR valid_to = '')`);
+        // v1.27: valid_from 为空的老行补成 created_at。
+        // 否则"按时刻 T 查有效事实"会把所有未知起点的事实都算成 T 时刻为真 —— 时间层就是假的。
+        // 先探一行再更新:没有空值时这条 UPDATE 不必每次打开都全表扫一遍。
+        const needValidFrom = db.prepare("SELECT 1 x FROM facts WHERE (valid_from IS NULL OR valid_from = '') AND created_at IS NOT NULL LIMIT 1").get();
+        if (needValidFrom) {
+            db.exec(`UPDATE facts SET valid_from = created_at
+               WHERE (valid_from IS NULL OR valid_from = '') AND created_at IS NOT NULL`);
+        }
+    }
+    catch (e) {
+        console.error(`[db] 实体层表未建立: ${e.message}`);
+    }
     // ═══ v5.0 迁移：4096-dim → 1024-dim (Yuan-EB) ═══
     const SCHEMA_VERSION = 5;
     try {
@@ -405,17 +670,28 @@ export function initProjectSchema(db) {
         }
         catch (_e) { }
         db.prepare('INSERT OR REPLACE INTO _schema_version (version) VALUES (?)').run(SCHEMA_VERSION);
-        console.log(`[db] migration complete: vec tables recreated with ${VEC_DIM}-dim`);
+        console.log(`[db] migration complete: vec tables will be created with ${vecDim()}-dim`);
     }
-    // Create vec tables with current dimension
+    // v1.25: 维度按配置对齐(换模型/换维度不必改源码),再按当前维度建表
+    reconcileVecDim(db);
     try {
-        db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory USING vec0(embedding float[${VEC_DIM}])`);
+        db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory USING vec0(embedding float[${vecDim()}])`);
     }
     catch (_e) { }
     try {
-        db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(embedding float[${VEC_DIM}])`);
+        db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(embedding float[${vecDim()}])`);
     }
     catch (_e) { }
+    // v1.28-fix(移植自 Lite 修 E4): 嵌入空间(模型+维度)对齐 —— 换模型但维度不变时,
+    // 旧向量属于另一语义空间,必须失效重嵌。放在建表之后、孤儿自愈与批量嵌入之前;
+    // EMBED_MODE=none 时只告警不动数据。
+    ensureEmbedSpace(db);
+    // v1.28-fix: 孤儿向量自愈(每个库每个进程只在打开时跑一次)。
+    // 硬删记忆时若漏清向量(历史版本/进程外 SQL),vec 表里会留下源表已不存在的 rowid:
+    //   1) SQLite 复用该 rowid → 新记忆 INSERT INTO vec_memory 撞 vec0 主键,整笔回滚,永久保存失败;
+    //   2) 复用前 batchEmbedPending 认为"已有向量"而跳过,新记忆静默持有已删记忆的向量。
+    // 这里把源表里找不到的 rowid 删掉,幂等;只扫一遍 rowid,不参与任何查询路径。
+    healVecOrphans(db);
     // Seed default categories (SynaBun-style hierarchical)
     const defaultCategories = [
         { name: 'episodic', description: '事件记忆 — 发生了什么', is_parent: 1 },
@@ -434,6 +710,61 @@ export function initProjectSchema(db) {
   `);
     for (const cat of defaultCategories) {
         insertCat.run(cat.name, cat.description, cat.parent || null, cat.is_parent || 0);
+    }
+    // v1.24: 角色隔离数据补齐(历史 NULL character_id → 本库唯一角色)
+    backfillCharacterIds(db);
+    // v1.27: 实体层自愈回填 —— 老库里已经有 facts 但没有实体关联,打开时补一批(有上限)。
+    // 幂等且不需要手工迁移;连接有缓存,所以每个库/进程只跑一次。
+    try {
+        const reclassified = reclassifyEntities(db);
+        if (reclassified > 0)
+            console.error(`[db] 实体类别重算: ${reclassified} 行`);
+        // 用两个廉价计数替代相关子查询:大库(几十万 facts)上 NOT EXISTS 全扫会拖慢每次打开。
+        const factRows = db.prepare('SELECT COUNT(*) c FROM facts WHERE is_active = 1').get()?.c ?? 0;
+        const linkedRows = db.prepare('SELECT COUNT(DISTINCT fact_id) c FROM fact_entities').get()?.c ?? 0;
+        if (linkedRows < factRows) {
+            const r = backfillEntities(db);
+            console.error(`[db] 实体层回填: ${r.factsLinked} 条事实 → ${r.entities} 个实体(待补 ${Math.max(0, factRows - linkedRows - r.factsLinked)})`);
+        }
+    }
+    catch { /* 实体表不可用时静默跳过 */ }
+}
+/**
+ * v1.24 角色隔离迁移:把历史遗留的 character_id IS NULL/空 行归到"本库唯一角色"。
+ *
+ * 背景:角色身份改为进程级 CHAR_ID 后,所有读写都按 character_id 过滤;库里旧行的
+ * character_id 为 NULL(早期 session_memory / 单角色时代的行)会从此对任何角色都不可见。
+ * 归并规则(保守,不做猜测):
+ *   - 本库只有一个非空 character_id → NULL 行全部归它(实测各库均如此);
+ *   - 本库没有任何非空 character_id(全新/单角色老库) → 归当前实例 CHAR_ID;
+ *   - 本库存在多个角色 → 不猜,保持 NULL(避免把别的角色的行划给自己)。
+ * 返回补齐行数。仅在库首次打开时执行(连接有缓存)。
+ */
+export function backfillCharacterIds(db, fallback = CHAR_ID) {
+    try {
+        const rows = db.prepare(`
+      SELECT character_id AS cid, COUNT(*) AS n FROM memory
+      WHERE character_id IS NOT NULL AND TRIM(character_id) <> ''
+      GROUP BY cid ORDER BY n DESC
+    `).all();
+        const target = rows.length === 1 ? String(rows[0].cid) : (rows.length === 0 ? fallback : null);
+        if (!target)
+            return 0;
+        let changes = 0;
+        try {
+            changes += db.prepare("UPDATE memory SET character_id = ? WHERE character_id IS NULL OR TRIM(character_id) = ''").run(target).changes;
+        }
+        catch { /* 旧库无列 */ }
+        try {
+            changes += db.prepare("UPDATE facts SET character_id = ? WHERE character_id IS NULL OR TRIM(character_id) = ''").run(target).changes;
+        }
+        catch { /* 旧库无列 */ }
+        if (changes > 0)
+            console.error(`[db] 角色隔离补齐: ${changes} 行 character_id → ${target}`);
+        return changes;
+    }
+    catch {
+        return 0;
     }
 }
 // ═══════════════════════════════════════════════════════════════════
@@ -550,7 +881,7 @@ export class DatabaseManager {
  * 注:updated_at 以 ISO 字符串存储,故用 JS 计算 cutoff 传参,
  *    而非 SQLite datetime('now','-N days')(两种格式文本序不一致)。
  */
-export function sweepExpiredSessionMemories(project) {
+export function sweepExpiredSessionMemories(project, characterId = CHAR_ID) {
     const ttlDays = (() => {
         const v = parseInt(process.env.SESSION_MEMORY_TTL_DAYS || '7', 10);
         return Number.isFinite(v) && v > 0 ? v : 7; // 非法值兜底 7
@@ -558,15 +889,39 @@ export function sweepExpiredSessionMemories(project) {
     const cutoff = new Date(Date.now() - ttlDays * 86400000).toISOString();
     const proj = normalizeProject(project);
     let total = 0;
-    // memdir:会话滚动记忆也可能落在任意 memType 分类库,逐库清扫
+    // memdir:会话滚动记忆也可能落在任意 memType 分类库,逐库清扫;v1.24 只清本角色
     for (const mt of listMemTypeDirs(proj)) {
         const db = DatabaseManager.getInstance(proj, mt);
-        const r = db.prepare(`
-      DELETE FROM memory
-      WHERE source = 'session_memory' AND session_id IS NOT NULL AND is_active = 1
-        AND updated_at < ?
-    `).run(cutoff);
-        total += r.changes;
+        // v1.28-fix: 硬删必须同时清 vec_memory。否则 rowid 会被下一条新记忆复用,
+        // INSERT INTO vec_memory 撞 sqlite-vec 的 vec0 主键 → 该条记忆永久保存失败(粘性);
+        // 复用前孤儿向量还会被 KNN 命中,把已删记忆的内容算到新记忆头上。
+        // 取 rowid 与删除放在同一个事务里:否则 SELECT 之后新写入的过期行会被 DELETE 删掉却没清向量。
+        try {
+            const tx = db.transaction(() => {
+                const rows = db.prepare(`
+          SELECT rowid FROM memory
+          WHERE source = 'session_memory' AND session_id IS NOT NULL AND is_active = 1 AND character_id = ?
+            AND updated_at < ?
+        `).all(characterId, cutoff);
+                if (rows.length === 0)
+                    return 0;
+                const delVec = db.prepare('DELETE FROM vec_memory WHERE rowid = ?');
+                for (const row of rows) {
+                    try {
+                        delVec.run(row.rowid);
+                    }
+                    catch { /* 无 vec 表/未加载扩展 */ }
+                }
+                return db.prepare(`
+          DELETE FROM memory
+          WHERE source = 'session_memory' AND session_id IS NOT NULL AND is_active = 1 AND character_id = ?
+            AND updated_at < ?
+        `).run(characterId, cutoff).changes;
+            });
+            total += tx();
+        }
+        catch { /* 单库失败不影响其它库 */ }
     }
     return total;
 }
+//# sourceMappingURL=db.js.map

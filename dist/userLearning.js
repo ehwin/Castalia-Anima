@@ -13,6 +13,7 @@
  */
 import { DatabaseManager } from './db.js';
 import { normalizeProject } from './env.js';
+import { parseTagsSafe } from './tags.js';
 const profiles = new Map();
 /**
  * v1.23.2 审计第 3 组：画像键必须带 project。
@@ -133,7 +134,7 @@ export function loadUserProfilesFromDb(characterId, project) {
     `).all(proj, characterId);
         for (const row of rows) {
             try {
-                const tags = JSON.parse(row.tags || '[]');
+                const tags = parseTagsSafe(row.tags);
                 const key = profileKey(characterId, 'default', proj);
                 if (!profiles.has(key)) {
                     profiles.set(key, {
@@ -160,3 +161,4 @@ export function loadUserProfilesFromDb(characterId, project) {
     }
     catch { }
 }
+//# sourceMappingURL=userLearning.js.map

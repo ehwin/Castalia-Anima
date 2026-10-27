@@ -100,3 +100,4 @@ main().catch((e) => {
     console.error(`[${SERVER_NAME}] fatal:`, e);
     process.exit(1);
 });
+//# sourceMappingURL=fedServer.js.map

@@ -15,19 +15,22 @@
 import { loadPromptOverride } from './promptFile.js';
 import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { saveFacts, saveMemory, batchEmbedPending, updateMemory, findDbByMemoryId } from './store.js';
-import { normalizeProject } from './env.js';
+import { normalizeProject, CHAR_ID } from './env.js';
 import { isMemType, MEM_TYPES } from './memType.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { currentMemDir } from './db.js';
 import { emotionalReflectPrompt } from './reflectionFidelity.js';
 import { getUnanalyzedConversations } from './reflectionSources.js';
+import { parseTagsSafe, serializeTags } from './tags.js';
 export { getUnanalyzedConversations, markConversationsReflected } from './reflectionSources.js';
 /**
  * 获取所有记忆（供大模型分析）
+ * v1.24: 角色隔离 — 只返回本实例角色(charId='any' 关闭过滤)。
  */
-export function listAllMemories(characterId = 'airi', limit = 200, project) {
+export function listAllMemories(characterId = CHAR_ID, limit = 200, project) {
     const proj = normalizeProject(project);
+    const cid = characterId || CHAR_ID;
     // memdir:聚合项目全部分类库
     const dirs = listMemTypeDirs(proj);
     const all = [];
@@ -39,11 +42,12 @@ export function listAllMemories(characterId = 'airi', limit = 200, project) {
                subject, source, tier, expires_at, created_at, last_accessed_at, accessed_count, reference_count, locked
         FROM memory
         WHERE is_active = 1 AND project = ?
+          AND (? = 'any' OR character_id = ?)
           -- v1.23: 冷存与被接管的旧记忆不参加新一轮沉淀（否则深反思会反复处理同一批死记忆）
           AND COALESCE(status, '') NOT IN ('cold', 'superseded')
         ORDER BY importance DESC, created_at DESC
         LIMIT ?
-      `).all(proj, limit);
+      `).all(proj, cid, cid, limit);
             all.push(...rows);
         }
         catch { /* 单分类库失败不影响其他 */ }
@@ -51,14 +55,7 @@ export function listAllMemories(characterId = 'airi', limit = 200, project) {
     all.sort((a, b) => (b.importance - a.importance) || String(b.created_at || '').localeCompare(String(a.created_at || '')));
     const rows = all.slice(0, limit);
     return rows.map(r => {
-        let tags = [];
-        try {
-            const parsed = JSON.parse(r.tags || '[]');
-            tags = Array.isArray(parsed) ? parsed : [];
-        }
-        catch {
-            tags = [];
-        }
+        const tags = parseTagsSafe(r.tags);
         return {
             id: r.id,
             text: r.text,
@@ -108,14 +105,18 @@ function safeTags(raw) {
  * 顺序:精确 id(store 的 findDbByMemoryId,内部先扫活跃再兜底墓碑)→ 前缀 LIKE(LLM 会给短 ID),先活跃后兜底;
  * 找不到则回退 fallback(默认 general 库),让调用方原本的 "not found" 判断照常生效。
  */
-function resolveReflectTarget(idPrefix, project, allowInactiveConversation = false) {
+function resolveReflectTarget(idPrefix, project, allowInactiveConversation = false, characterId = CHAR_ID) {
     if (!idPrefix || typeof idPrefix !== 'string')
         return null;
+    // v1.24: 角色隔离 — 反思动作只允许命中本实例角色的记忆(防 LLM 幻觉 id 改到别人头上)
+    const cid = characterId || CHAR_ID;
+    const own = cid === 'any' ? '' : " AND character_id = ?";
+    const ownArgs = cid === 'any' ? [] : [cid];
     const matches = [];
     for (const mt of listMemTypeDirs(normalizeProject(project))) {
         const db = DatabaseManager.getInstance(project, mt);
-        const rows = db.prepare(`SELECT id FROM memory WHERE project = ? AND (is_active = 1${allowInactiveConversation ? " OR source = 'conversation_log'" : ''}) AND substr(id, 1, length(?)) = ?`)
-            .all(normalizeProject(project), idPrefix, idPrefix);
+        const rows = db.prepare(`SELECT id FROM memory WHERE project = ? AND (is_active = 1${allowInactiveConversation ? " OR source = 'conversation_log'" : ''})${own} AND substr(id, 1, length(?)) = ?`)
+            .all(normalizeProject(project), ...ownArgs, idPrefix, idPrefix);
         for (const row of rows)
             matches.push({ db, id: row.id });
     }
@@ -124,8 +125,8 @@ function resolveReflectTarget(idPrefix, project, allowInactiveConversation = fal
         return exact[0];
     return matches.length === 1 ? matches[0] : null;
 }
-function memDbFor(id, project, fallback) {
-    return findDbByMemoryId(id, project)?.db ?? fallback;
+function memDbFor(id, project, fallback, characterId = CHAR_ID) {
+    return findDbByMemoryId(id, project, characterId === 'any' ? undefined : characterId)?.db ?? fallback;
 }
 // ═══ v1.23 证据附录：硬事实覆盖率闸门 ═══
 // 背景：实测提取只保住 ~75% 的硬事实（路径/端口/版本/日期/数字）。这些是"复核所需"的锚点，
@@ -205,7 +206,7 @@ function attachEvidenceAppendix(result, project, warnings) {
         warnings.push(`证据附录：来源 ${String(sourceId).slice(0, 8)} 硬事实覆盖 ${(ratio * 100).toFixed(0)}%，补 ${sentences.length} 句原文`);
     }
 }
-export async function applyReflectActions(actions, characterId = 'airi', project, options = {}) {
+export async function applyReflectActions(actions, characterId = CHAR_ID, project, options = {}) {
     const db = DatabaseManager.getInstance(project);
     const result = { applied: 0, errors: [], details: [], receipts: [] };
     for (let action of actions) {
@@ -231,7 +232,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
             if (ids) {
                 if (options.allowedSourceIds && ids.some(id => !options.allowedSourceIds.has(id)))
                     throw new Error('target is outside current reflection input');
-                const resolved = ids.map(id => resolveReflectTarget(id, project, action.action === 'extract'));
+                const resolved = ids.map(id => resolveReflectTarget(id, project, action.action === 'extract', characterId));
                 if (resolved.some(target => !target))
                     throw new Error('target missing, inactive or ambiguous');
                 if (action.action === 'merge') {
@@ -263,7 +264,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                     const mergeSources = [];
                     let mergeInvalid = null;
                     for (const id of action.sourceIds) {
-                        const sdb = memDbFor(id, project, db);
+                        const sdb = memDbFor(id, project, db, characterId);
                         const src = sdb.prepare("SELECT id FROM memory WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical'").get(id);
                         if (!src) {
                             mergeInvalid = `source not found, locked or critical: ${id}`;
@@ -316,7 +317,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         action.fragments.some(f => !f.text?.trim())) {
                         throw new Error('split: need targetId and non-empty fragments');
                     }
-                    const source = resolveReflectTarget(action.targetId, project);
+                    const source = resolveReflectTarget(action.targetId, project, false, characterId);
                     const row = source.db.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(source.id);
                     if (!row || row.locked || row.identity_locked)
                         throw new Error('split: target locked or inactive');
@@ -352,7 +353,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                     // 护栏：规范化 relation type
                     const relType = VALID_RELATIONS.has(action.relationType) ? action.relationType : 'related_to';
                     const edgeId = `edge_reflect_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
-                    const _relR = memDbFor(action.sourceId, project, db).prepare('INSERT OR IGNORE INTO edges (id, source_id, target_id, relation_type) VALUES (?, ?, ?, ?)')
+                    const _relR = memDbFor(action.sourceId, project, db, characterId).prepare('INSERT OR IGNORE INTO edges (id, source_id, target_id, relation_type) VALUES (?, ?, ?, ?)')
                         .run(edgeId, action.sourceId, action.targetIdRelate, relType);
                     receipt.rowsAffected = _relR.changes;
                     if (_relR.changes === 0) {
@@ -420,7 +421,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                             continue;
                         }
                         updates.push('tags = ?');
-                        values.push(JSON.stringify(valid));
+                        values.push(serializeTags(valid));
                     }
                     // v2.0: reclassify 支持 newText — 时间规范化检查把相对时间改写为绝对日期
                     if (action.newText !== undefined && action.newText !== null) {
@@ -435,7 +436,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         values.push(action.newText.trim());
                     }
                     if (updates.length > 0) {
-                        const _tdb = memDbFor(tid, project, db);
+                        const _tdb = memDbFor(tid, project, db, characterId);
                         const existing = _tdb.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(tid);
                         if (!existing || existing.locked || existing.identity_locked)
                             throw new Error('target locked or inactive');
@@ -445,7 +446,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                             const key = field.split(' = ')[0];
                             patch[names[key]] = key === 'tags' ? JSON.parse(values[i]) : values[i];
                         });
-                        const updated = await updateMemory(tid, patch);
+                        const updated = await updateMemory(tid, patch, characterId);
                         const _recR = { changes: updated ? 1 : 0 };
                         receipt.rowsAffected = _recR.changes;
                         if (_recR.changes === 0) {
@@ -484,7 +485,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                     const tier = (action.tier && ['temporary', 'standard', 'critical'].includes(action.tier))
                         ? action.tier : 'standard';
                     const { saveMemory } = await import('./store.js');
-                    const sourceTarget = resolveReflectTarget(action.sourceId, project, true);
+                    const sourceTarget = resolveReflectTarget(action.sourceId, project, true, characterId);
                     const sourceRow = sourceTarget.db.prepare('SELECT * FROM memory WHERE id = ?').get(action.sourceId);
                     // v1.23: 引用校验 —— 只有能在原文子串命中的引用才保留（防编造原话）
                     const sourceText = String(sourceRow?.text || '');
@@ -559,7 +560,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                     for (const linkedId of (Array.isArray(action.linkedMemoryIds) ? action.linkedMemoryIds : []).slice(0, 10)) {
                         if (typeof linkedId !== 'string' || linkedId === action.sourceId)
                             continue;
-                        const target = resolveReflectTarget(linkedId, project, false);
+                        const target = resolveReflectTarget(linkedId, project, false, characterId);
                         if (!target)
                             continue;
                         try {
@@ -578,7 +579,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                     }
                     receipt.rowsAffected = 1;
                     // 给源记忆 +reference_count（v5.1: LIKE 匹配短ID）
-                    memDbFor(action.sourceId, project, db).prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(action.sourceId);
+                    memDbFor(action.sourceId, project, db, characterId).prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(action.sourceId);
                     if (receipt.status === 'applied')
                         result.applied++;
                     result.details.push(`extract: from ${action.sourceId} → ${validType}/${validCat} (${tier})`);
@@ -593,7 +594,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         continue;
                     }
                     // v1.23: critical 核心记忆不得被自动反思删除
-                    const _delR = memDbFor(action.targetId, project, db).prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical'").run(action.targetId);
+                    const _delR = memDbFor(action.targetId, project, db, characterId).prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical'").run(action.targetId);
                     receipt.rowsAffected = _delR.changes;
                     if (_delR.changes === 0) {
                         receipt.status = 'failed';
@@ -612,7 +613,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         result.receipts.push(receipt);
                         continue;
                     }
-                    const _boR = memDbFor(action.targetId, project, db).prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance + ?)) WHERE id = ? AND (locked IS NULL OR locked = 0)')
+                    const _boR = memDbFor(action.targetId, project, db, characterId).prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance + ?)) WHERE id = ? AND (locked IS NULL OR locked = 0)')
                         .run(action.delta, action.targetId);
                     receipt.rowsAffected = _boR.changes;
                     if (_boR.changes === 0) {
@@ -632,7 +633,7 @@ export async function applyReflectActions(actions, characterId = 'airi', project
                         result.receipts.push(receipt);
                         continue;
                     }
-                    const _deR = memDbFor(action.targetId, project, db).prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance - ?)) WHERE id = ? AND (locked IS NULL OR locked = 0)')
+                    const _deR = memDbFor(action.targetId, project, db, characterId).prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance - ?)) WHERE id = ? AND (locked IS NULL OR locked = 0)')
                         .run(action.delta, action.targetId);
                     receipt.rowsAffected = _deR.changes;
                     if (_deR.changes === 0) {
@@ -682,25 +683,27 @@ export async function applyReflectActions(actions, characterId = 'airi', project
 // 导出别名 — 供 proxy.py / _memory_engine.mjs 调用
 // ═══════════════════════════════════════════════════════════
 /** 获取所有记忆（别名，供外部调用） */
-export function getAllMemories(characterId = 'airi', limit = 200, project) {
+export function getAllMemories(characterId = CHAR_ID, limit = 200, project) {
     return listAllMemories(characterId, limit, project);
 }
 /** 获取记忆关联图 */
-export function getMemoryGraph(characterId = 'airi', project) {
+export function getMemoryGraph(characterId = CHAR_ID, project) {
     const db = DatabaseManager.getInstance(project);
     const proj = normalizeProject(project);
     const nodes = listAllMemories(characterId, 500, proj);
     const nodeIds = new Set(nodes.map((n) => n.id));
     let edgeRows = [];
     if (nodeIds.size > 0) {
+        // v1.27-fix: 原来只过滤 source_id IN (...),目标节点在集合里的边会被漏掉(图看着比实际稀疏)。
+        const ph = [...nodeIds].map(() => '?').join(',');
         edgeRows = db.prepare(`
       SELECT e.id, e.source_id, e.target_id, e.relation_type,
              m1.text as source_text, m2.text as target_text
       FROM edges e
       LEFT JOIN memory m1 ON e.source_id = m1.id
       LEFT JOIN memory m2 ON e.target_id = m2.id
-      WHERE e.source_id IN (${[...nodeIds].map(() => '?').join(',')})
-    `).all(...nodeIds);
+      WHERE e.source_id IN (${ph}) OR e.target_id IN (${ph})
+    `).all(...nodeIds, ...nodeIds);
     }
     const edges = edgeRows.map(r => ({
         id: r.id,
@@ -760,11 +763,12 @@ export const REFLECT_SYSTEM_PROMPT = loadPromptOverride('REFLECT_PROMPT_FILE', '
  *   3. insights → 存入 memory（source='reflect_insight'）
  *   4. actions → 调用 applyReflectActions()
  */
-export async function applyReflectResult(result, characterId = 'airi', project, options = {}) {
+export async function applyReflectResult(result, characterId = CHAR_ID, project, options = {}) {
     const out = {
         summaryId: null,
         factsInserted: 0,
         factsUpdated: 0,
+        entitiesLinked: 0,
         insightsCount: 0,
         actionsApplied: 0,
         applied: 0,
@@ -844,6 +848,23 @@ export async function applyReflectResult(result, characterId = 'airi', project, 
             const fr = await saveFacts(facts, null, characterId, project);
             out.factsInserted = fr.inserted;
             out.factsUpdated = fr.updated;
+            // v1.27: 把摘要记忆挂到这批事实的实体上。
+            // facts 落在 general 库、摘要在 project 库,所以不能写 facts.source_memory_id(撞 FK);
+            // 但 memory_entities 没有 FK,用全局 UUID 关联即可 —— 否则"记忆里有实体"的覆盖率只有个位数。
+            if (out.summaryId) {
+                try {
+                    const { DatabaseManager } = await import('./db.js');
+                    const { entityIdsOfFacts, linkMemoryToEntityIds } = await import('./entities.js');
+                    const ids = entityIdsOfFacts(facts);
+                    if (ids.length) {
+                        const db = DatabaseManager.getInstance(project);
+                        out.entitiesLinked = linkMemoryToEntityIds(db, out.summaryId, ids, 'fact');
+                    }
+                }
+                catch (e) {
+                    out.warnings.push(`entity-link: ${e.message}`);
+                }
+            }
         }
         catch (e) {
             out.warnings.push(`facts: ${e.message}`);
@@ -876,10 +897,10 @@ export async function applyReflectResult(result, characterId = 'airi', project, 
 export async function reflect(action, params = {}) {
     switch (action) {
         case 'list':
-            return listAllMemories(params.characterId || 'airi', params.limit || 200, params.project);
+            return listAllMemories(params.characterId || CHAR_ID, params.limit || 200, params.project);
         case 'unanalyzed': {
             // 获取待反思的未分析对话 + prompt
-            const conversations = getUnanalyzedConversations(params.characterId || 'airi', params.since, params.limit || 30, params.project);
+            const conversations = getUnanalyzedConversations(params.characterId || CHAR_ID, params.since, params.limit || 30, params.project);
             const prompt = JSON.stringify(conversations);
             return {
                 conversationCount: conversations.length,
@@ -892,7 +913,7 @@ export async function reflect(action, params = {}) {
             if (!params.actions || params.actions.length === 0) {
                 return { applied: 0, errors: ['no actions to apply'] };
             }
-            return applyReflectResult(params, params.characterId || 'airi', params.project);
+            return applyReflectResult(params, params.characterId || CHAR_ID, params.project);
         }
         case 'merge':
         case 'split':
@@ -901,15 +922,15 @@ export async function reflect(action, params = {}) {
         case 'delete':
         case 'boost':
         case 'decay':
-            return applyReflectActions([{ action, ...params }], params.characterId || 'airi', params.project);
+            return applyReflectActions([{ action, ...params }], params.characterId || CHAR_ID, params.project);
         case 'batch':
             if (!Array.isArray(params.actions)) {
                 return { error: 'batch action requires "actions" array' };
             }
-            return applyReflectActions(params.actions, params.characterId || 'airi', params.project);
+            return applyReflectActions(params.actions, params.characterId || CHAR_ID, params.project);
         case 'auto': {
-            const allMemories = listAllMemories(params.characterId || 'airi', params.limit || 200, params.project);
-            const graph = getMemoryGraph(params.characterId || 'airi', params.project);
+            const allMemories = listAllMemories(params.characterId || CHAR_ID, params.limit || 200, params.project);
+            const graph = getMemoryGraph(params.characterId || CHAR_ID, params.project);
             return {
                 ready: true,
                 memoryCount: allMemories.length,
@@ -923,3 +944,4 @@ export async function reflect(action, params = {}) {
             return { error: `unknown reflect action: "${action}". Valid: list, unanalyzed, apply, merge, split, relate, reclassify, delete, boost, decay, batch, auto` };
     }
 }
+//# sourceMappingURL=reflect.js.map

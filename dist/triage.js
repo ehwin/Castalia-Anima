@@ -16,7 +16,7 @@
 import { callLlm, makeLlmChannel } from './reflectionLlm.js';
 import { isMemType, isClosedMemType, normalizeMarkdown } from './memType.js';
 import { getSessionMemory, upsertSessionMemory, promoteToProject } from './store.js';
-import { normalizeProject } from './env.js';
+import { normalizeProject, CHAR_ID } from './env.js';
 import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { EMOTIONAL_FIDELITY } from './reflectionFidelity.js';
 /** triage 通道:未配置时回退 REFLECT_* 值(由 makeLlmChannel 统一处理) */
@@ -166,15 +166,16 @@ function parseIncrementalReflection(raw) {
     return null;
 }
 /** Exact, Markdown-normalized duplication in the real category databases.
- * Similar emotional narratives can describe different dates or promises. */
-export async function isDuplicate(proj, text, memType, subject = 'user') {
+ * Similar emotional narratives can describe different dates or promises.
+ * v1.24: 角色隔离 — 查重限定 character_id,不把别的角色的同文本当成已有。 */
+export async function isDuplicate(proj, text, memType, subject = 'user', characterId = CHAR_ID) {
     const normalized = normalizeMarkdown(text, memType).trim();
     for (const mt of listMemTypeDirs(proj)) {
         const rows = DatabaseManager.getInstance(proj, mt).prepare(`
-      SELECT text FROM memory WHERE is_active = 1 AND project = ? AND mem_type = ?
+      SELECT text FROM memory WHERE is_active = 1 AND project = ? AND mem_type = ? AND character_id = ?
         AND (? IS NULL OR subject = ?)
         AND session_id IS NULL AND COALESCE(source, '') NOT IN ('conversation_log', 'auto_process', 'session_memory')
-    `).all(proj, memType, subject ?? null, subject ?? null);
+    `).all(proj, memType, characterId, subject ?? null, subject ?? null);
         if (rows.some(row => row.text.trim() === normalized))
             return true;
     }
@@ -200,7 +201,9 @@ export async function runIncrementalReflection(project, sessionId, recentMessage
             return { ...base, ok: true, skipped: true, reason: '无最近消息' };
         }
         const proj = normalizeProject(project);
-        const oldSnapshot = getSessionMemory(proj, sessionId);
+        // v1.24: 角色 = 进程级 CHAR_ID(不再按 project 推导)
+        const cid = characterId || CHAR_ID;
+        const oldSnapshot = getSessionMemory(proj, sessionId, cid);
         const lines = recent.map(m => {
             const who = m.role === 'user' ? '用户' : m.role === 'assistant' ? '助手' : String(m.role);
             return `${who}: ${m.content || ''}`;
@@ -235,7 +238,7 @@ ${lines}`;
                 if (!mtRaw || !isClosedMemType(mtRaw) || !text)
                     return { ...base, errors: ['非法晋升项；本轮保留旧快照'] };
                 const subject = ['user', 'self', 'environment'].includes(raw.subject || raw.newSubject) ? raw.subject || raw.newSubject : undefined;
-                if (await isDuplicate(proj, text, mtRaw, subject)) {
+                if (await isDuplicate(proj, text, mtRaw, subject, cid)) {
                     skippedDup++;
                     continue;
                 }
@@ -249,7 +252,7 @@ ${lines}`;
         // Keep it until the next successful rolling update; never delete on any promoted item.
         let promotedCount = 0;
         if (promoted.length > 0) {
-            const ids = promoteToProject(proj, promoted, characterId);
+            const ids = promoteToProject(proj, promoted, cid);
             promotedCount = ids.length;
             if (ids.length !== promoted.length)
                 return { ...base, promoted: promotedCount, errors: ['部分晋升失败；保留旧快照'] };
@@ -258,7 +261,7 @@ ${lines}`;
         let sessionMemoryUpdated = false;
         if (sessionMemory) {
             try {
-                upsertSessionMemory(proj, sessionId, sessionMemory);
+                upsertSessionMemory(proj, sessionId, sessionMemory, undefined, cid);
                 sessionMemoryUpdated = true;
             }
             catch (e) {
@@ -271,3 +274,4 @@ ${lines}`;
         return { ...base, errors: [e.message] };
     }
 }
+//# sourceMappingURL=triage.js.map

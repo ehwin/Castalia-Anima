@@ -73,7 +73,8 @@ loadEncryptedSecrets();
 
 try {
   if (fs.existsSync(CONFIG_PATH)) {
-    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+    // 容忍 Windows 编辑器/PowerShell 写入的 UTF-8 BOM(否则 JSON.parse 直接失败,整份配置被忽略)
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8').replace(/^\uFEFF+/, ''));
 
     // 记忆库目录配置:config.json 的 db_dir 字段(若有)覆盖环境变量
     if (cfg.db_dir && typeof cfg.db_dir === 'string' && cfg.db_dir.trim()) {
@@ -82,21 +83,37 @@ try {
 
     // 嵌入模型配置
     const emb = cfg.embedding || {};
+    // v1.25: 向量维度可配 —— 换嵌入模型(不同维度)不再需要改源码;
+    // db.ts 的 vecDim() 惰性读取本值,首开库时按需重建 vec 表并标记重嵌。
+    if (emb.dim != null && String(emb.dim).trim()) {
+      // 2026-10-27 修复(E1):本段上方刚声明"显式环境变量优先",这里却无条件覆盖 ——
+      // 于是 `EMBEDDING_DIM=4096` 的运行环境会被 config.json 里的 dim 压回 1024,
+      // 触发 reconcileVecDim 静默降维清库(与控制台 E2 是同一后果的两个入口)。
+      if (process.env.EMBEDDING_DIM || process.env.VEC_DIM) {
+        console.warn(`[config] 已显式设置 EMBEDDING_DIM/VEC_DIM，忽略 config.json 的 embedding.dim=${emb.dim}（显式环境变量优先）`);
+      } else {
+        process.env.EMBEDDING_DIM = String(emb.dim).trim();
+      }
+    }
     if (emb.mode === 'api') {
-      if (emb.api_url) process.env.OLLAMA_URL = emb.api_url.replace(/\/+$/, '');
-      if (emb.api_model) process.env.EMBEDDING_MODEL = emb.api_model;
+      // 2026-10-27 修复(E1 同源,复核提出):与 Lite/Full 对齐 —— 显式环境变量优先,
+      // 不再用 config.json 无条件覆盖 OLLAMA_URL / EMBEDDING_MODEL。
+      if (emb.api_url && !process.env.OLLAMA_URL) process.env.OLLAMA_URL = emb.api_url.replace(/\/+$/, '');
+      if (emb.api_model && !process.env.EMBEDDING_MODEL) process.env.EMBEDDING_MODEL = emb.api_model;
       if (emb.api_key && !process.env.EMBEDDING_API_KEY) process.env.EMBEDDING_API_KEY = emb.api_key;
     } else {
       // 默认 Ollama 模式
-      if (emb.ollama_url) process.env.OLLAMA_URL = emb.ollama_url.replace(/\/+$/, '');
-      if (emb.model) process.env.EMBEDDING_MODEL = emb.model;
+      if (emb.ollama_url && !process.env.OLLAMA_URL) process.env.OLLAMA_URL = emb.ollama_url.replace(/\/+$/, '');
+      if (emb.model && !process.env.EMBEDDING_MODEL) process.env.EMBEDDING_MODEL = emb.model;
     }
 
     // 反思 LLM 配置
     const ref = cfg.reflect || {};
-    if (ref.llm_url) process.env.REFLECT_LLM_URL = ref.llm_url.replace(/\/+$/, '');
+    // 2026-10-27 修复(E1 同源,复核提出):连接目标与模型身份一律"显式 env 优先",
+    // 与 Lite/Full 的守卫集合对齐(此前只有 api_key 有守卫,url/model 会被 config 覆盖)。
+    if (ref.llm_url && !process.env.REFLECT_LLM_URL) process.env.REFLECT_LLM_URL = ref.llm_url.replace(/\/+$/, '');
     if (ref.api_key && !process.env.REFLECT_LLM_API_KEY) process.env.REFLECT_LLM_API_KEY = ref.api_key;
-    if (ref.model) process.env.REFLECT_LLM_MODEL = ref.model;
+    if (ref.model && !process.env.REFLECT_LLM_MODEL) process.env.REFLECT_LLM_MODEL = ref.model;
     if (ref.factExtraction) process.env.REFLECT_FACT_EXTRACTION = String(ref.factExtraction);
     if (ref.maxFacts != null) process.env.REFLECT_MAX_FACTS = String(ref.maxFacts);
     // 重路径(总反思/深度/整合)的输出预算;浅层(triage/reflect_auto)不受影响
@@ -110,9 +127,9 @@ try {
 
     // v1.11: triage(LLM1 入站分拣)配置 — admin 第三个通道
     const tri = cfg.triage || {};
-    if (tri.llm_url) process.env.TRIAGE_LLM_URL = tri.llm_url.replace(/\/+$/, '');
+    if (tri.llm_url && !process.env.TRIAGE_LLM_URL) process.env.TRIAGE_LLM_URL = tri.llm_url.replace(/\/+$/, '');
     if (tri.api_key && !process.env.TRIAGE_LLM_API_KEY) process.env.TRIAGE_LLM_API_KEY = tri.api_key;
-    if (tri.model) process.env.TRIAGE_LLM_MODEL = tri.model;
+    if (tri.model && !process.env.TRIAGE_LLM_MODEL) process.env.TRIAGE_LLM_MODEL = tri.model;
 
     // v1.11 Part2: 渐进式临时反思配置(admin 留路;缺省用 env/默认值)
     if (tri.bufferSize != null) process.env.BUFFER_SIZE = String(tri.bufferSize);

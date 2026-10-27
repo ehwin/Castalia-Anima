@@ -110,3 +110,4 @@ export function buildProviders(ownDir, env = process.env) {
     }
     return providers;
 }
+//# sourceMappingURL=registry.js.map

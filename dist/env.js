@@ -5,7 +5,13 @@
  * 避免散落在各模块里硬编码。
  */
 import { VERSION } from './version.js';
-/** 角色/实例 ID:用于数据分区。默认 'airi'(Anima 血统,与旧版行为一致) */
+/**
+ * 角色/实例 ID:用于数据分区。默认 'airi'(Anima 血统,与旧版行为一致)。
+ *
+ * v1.24: 角色身份 = 进程级 CHAR_ID(与 Castalia 普通版一致:一个实例一个角色),
+ * 不再按 project 推导角色。project 只做记忆库维度(库/项目分区)。
+ * 多角色 = 多实例(各自 CHAR_ID + 各自库目录),同一库里不同角色靠 character_id 列隔离。
+ */
 export const CHAR_ID = process.env.CHAR_ID || 'airi';
 /** 当前项目 ID(对齐 Hermes Project 概念):记忆按项目隔离。默认 'default' 保持向后兼容 */
 export const PROJECT_ID = process.env.CASTALIA_PROJECT || 'default';
@@ -23,42 +29,28 @@ export function normalizeProject(p) {
     return t.length > 0 ? t : PROJECT_ID;
 }
 /**
- * 按项目解析 AI 人格 ID(项目库 = AI 人格:切换项目即切换人格)。
- * 解析优先级:
- *   ① PERSONAS_JSON(configLoader 从 config.json 的 personas 段写入)中 project 命中 → 取 {charId};
- *   ② project 非空 → 项目名即人格名,规范化后返回(项目库天然按人格分区);
- *   ③ 其余(未传/空 project)→ 默认 CHAR_ID(向后兼容)。
- * charId 允许中文。
+ * 角色身份解析 — 与 Castalia 普通版对齐:角色只由进程级 CHAR_ID 决定。
+ *
+ * v1.24 起不再有 project→角色的推导(旧行为:project 名即角色名、personas 按 project 映射)。
+ * 保留该函数只为兼容既有调用点,参数被忽略,恒返回 CHAR_ID。
+ * @deprecated 直接用 CHAR_ID(工具层已全部改为 CHAR_ID)。
  */
-export function charFor(project) {
-    const raw = (project ?? '').trim();
-    if (raw) {
-        try {
-            const personas = JSON.parse(process.env.PERSONAS_JSON || '{}');
-            const entry = personas[raw];
-            if (entry && entry.charId)
-                return entry.charId;
-        }
-        catch { /* PERSONAS_JSON 非 JSON 时忽略,回退项目名 */ }
-        return raw;
-    }
+export function charFor(_project) {
     return CHAR_ID;
 }
 /**
- * 获取项目对应的人格声明(name/persona 取自 PERSONAS_JSON;
- * 无映射时 name=charId、persona 为空)。
+ * 获取当前实例(角色)的人格声明:name/persona 取自 PERSONAS_JSON 中以 CHAR_ID 为键的条目;
+ * 无映射时 name=charId、persona 为空。
+ * 注:v1.24 前 personas 以 project 名为键,若旧配置仍按 project 键书写,请改成 CHAR_ID 键。
  */
-export function getPersona(project) {
-    const charId = charFor(project);
-    const raw = (project ?? '').trim();
+export function getPersona(_project) {
+    const charId = CHAR_ID;
     let entry = null;
-    if (raw) {
-        try {
-            const personas = JSON.parse(process.env.PERSONAS_JSON || '{}');
-            entry = personas[raw] || null;
-        }
-        catch { /* PERSONAS_JSON 非 JSON 时忽略 */ }
+    try {
+        const personas = JSON.parse(process.env.PERSONAS_JSON || '{}');
+        entry = personas[charId] || null;
     }
+    catch { /* PERSONAS_JSON 非 JSON 时忽略 */ }
     return { charId, name: (entry && entry.name) || charId, persona: (entry && entry.persona) || '' };
 }
 /**
@@ -76,3 +68,4 @@ export function isEmbedEnabled() {
 export const SERVER_NAME = process.env.MCP_SERVER_NAME || 'castalia';
 /** 服务器版本号(单一来源:仓库根 VERSION → src/version.ts) */
 export const SERVER_VERSION = process.env.MCP_SERVER_VERSION || VERSION;
+//# sourceMappingURL=env.js.map

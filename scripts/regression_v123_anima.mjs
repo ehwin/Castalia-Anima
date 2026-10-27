@@ -16,6 +16,7 @@ Object.assign(process.env, {
   MEMORY_CONFIG: config,
   EMBED_MODE: 'none',              // 零网络：不调 Ollama / embedding API
   CASTALIA_PROJECT: 'anima-v123',
+  CHAR_ID: 'airi',                 // v1.24: 角色 = 进程级实例 ID(本回归显式钉成 airi)
   COLD_AFTER_DAYS: '60',
   COLD_MAX_IMPORTANCE: '0.6',
   REFLECT_LLM_API_KEY: 'fixture',
@@ -64,7 +65,9 @@ const memRow = (id) => memDb(id).prepare('SELECT * FROM memory WHERE id = ?').ge
 await saveFacts([{ subject: 'user', predicate: '职业', object: '程序员', confidence: 0.9, evidence: '用户说自己是程序员' }], null, 'airi', P);
 let f1 = factRow('user', '职业', '程序员');
 check(!!f1, 'fact inserted');
-check(f1.valid_to == null && f1.valid_from == null, 'new fact is valid (valid_to/valid_from NULL)');
+check(f1.valid_to == null, 'new fact is valid (valid_to NULL)');
+// v1.27: valid_from 默认取写入时间 —— 否则"按时刻查有效事实"会把新事实算成历史任一时刻为真。
+check(!!f1.valid_from && f1.valid_from >= '2020-01-01', 'new fact carries valid_from = write time');
 check(f1.evidence === '用户说自己是程序员', 'evidence column persisted');
 
 await saveFacts([{ subject: 'user', predicate: '职业', object: '设计师', confidence: 0.9 }], null, 'airi', P);

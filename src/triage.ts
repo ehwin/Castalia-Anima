@@ -16,7 +16,7 @@
 import { callLlm, makeLlmChannel, LlmChannel } from './reflectionLlm.js';
 import { isMemType, isClosedMemType, normalizeMarkdown, MemType } from './memType.js';
 import { getSessionMemory, upsertSessionMemory, promoteToProject } from './store.js';
-import { normalizeProject } from './env.js';
+import { normalizeProject, CHAR_ID } from './env.js';
 import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { EMOTIONAL_FIDELITY } from './reflectionFidelity.js';
 
@@ -184,15 +184,16 @@ export interface IncrementalReflectionResult {
 }
 
 /** Exact, Markdown-normalized duplication in the real category databases.
- * Similar emotional narratives can describe different dates or promises. */
-export async function isDuplicate(proj: string, text: string, memType: string, subject: 'user' | 'self' | 'environment' = 'user'): Promise<boolean> {
+ * Similar emotional narratives can describe different dates or promises.
+ * v1.24: 角色隔离 — 查重限定 character_id,不把别的角色的同文本当成已有。 */
+export async function isDuplicate(proj: string, text: string, memType: string, subject: 'user' | 'self' | 'environment' = 'user', characterId: string = CHAR_ID): Promise<boolean> {
   const normalized = normalizeMarkdown(text, memType).trim();
   for (const mt of listMemTypeDirs(proj)) {
     const rows = DatabaseManager.getInstance(proj, mt).prepare(`
-      SELECT text FROM memory WHERE is_active = 1 AND project = ? AND mem_type = ?
+      SELECT text FROM memory WHERE is_active = 1 AND project = ? AND mem_type = ? AND character_id = ?
         AND (? IS NULL OR subject = ?)
         AND session_id IS NULL AND COALESCE(source, '') NOT IN ('conversation_log', 'auto_process', 'session_memory')
-    `).all(proj, memType, subject ?? null, subject ?? null) as { text: string }[];
+    `).all(proj, memType, characterId, subject ?? null, subject ?? null) as { text: string }[];
     if (rows.some(row => row.text.trim() === normalized)) return true;
   }
   return false;
@@ -224,7 +225,9 @@ export async function runIncrementalReflection(
       return { ...base, ok: true, skipped: true, reason: '无最近消息' };
     }
     const proj = normalizeProject(project);
-    const oldSnapshot = getSessionMemory(proj, sessionId);
+    // v1.24: 角色 = 进程级 CHAR_ID(不再按 project 推导)
+    const cid = characterId || CHAR_ID;
+    const oldSnapshot = getSessionMemory(proj, sessionId, cid);
 
     const lines = recent.map(m => {
       const who = m.role === 'user' ? '用户' : m.role === 'assistant' ? '助手' : String(m.role);
@@ -257,7 +260,7 @@ ${lines}`;
         const text = typeof raw.text === 'string' ? raw.text.trim() : '';
         if (!mtRaw || !isClosedMemType(mtRaw) || !text) return { ...base, errors: ['非法晋升项；本轮保留旧快照'] };
         const subject = ['user', 'self', 'environment'].includes(raw.subject || raw.newSubject) ? raw.subject || raw.newSubject : undefined;
-        if (await isDuplicate(proj, text, mtRaw, subject)) { skippedDup++; continue; }
+        if (await isDuplicate(proj, text, mtRaw, subject, cid)) { skippedDup++; continue; }
         const catRaw = typeof (raw as any).category === 'string' ? String((raw as any).category).trim().slice(0, 40) : undefined;
         promoted.push({ memType: mtRaw, text: normalizeMarkdown(text, mtRaw), category: catRaw || undefined, subject });
       }
@@ -268,7 +271,7 @@ ${lines}`;
     // Keep it until the next successful rolling update; never delete on any promoted item.
     let promotedCount = 0;
     if (promoted.length > 0) {
-      const ids = promoteToProject(proj, promoted, characterId);
+      const ids = promoteToProject(proj, promoted, cid);
       promotedCount = ids.length;
       if (ids.length !== promoted.length) return { ...base, promoted: promotedCount, errors: ['部分晋升失败；保留旧快照'] };
     }
@@ -277,7 +280,7 @@ ${lines}`;
     let sessionMemoryUpdated = false;
     if (sessionMemory) {
       try {
-        upsertSessionMemory(proj, sessionId, sessionMemory);
+        upsertSessionMemory(proj, sessionId, sessionMemory, undefined, cid);
         sessionMemoryUpdated = true;
       } catch (e: any) {
         return { ...base, promoted: promotedCount, errors: [`会话滚动覆盖失败: ${e.message}`] };

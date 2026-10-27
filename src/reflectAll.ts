@@ -20,6 +20,8 @@ import { currentMemDir, DatabaseManager, generateId, initProjectSchema, memTypeD
 import { makeLlmChannel, callLlm, REFLECT_DEEP_MAX_TOKENS } from './reflectionLlm.js';
 import { normalizeMemType, MemType } from './memType.js';
 import { EMOTIONAL_FIDELITY, wholeRecordBatches } from './reflectionFidelity.js';
+import { CHAR_ID } from './env.js';
+import { serializeTags } from './tags.js';
 
 export interface ReflectAllOptions {
   maxTotal?: number;   // 总记忆数上限,默认 300
@@ -314,14 +316,15 @@ export async function runReflectAll(opts?: ReflectAllOptions): Promise<ReflectAl
       try {
         const mt = normalizeMemType(ins.memType);
         const db = openReflect(mt);
-        const exists = db.prepare('SELECT 1 FROM memory WHERE is_active = 1 AND text = ?').get(ins.text);
+        const exists = db.prepare('SELECT 1 FROM memory WHERE is_active = 1 AND text = ? AND character_id = ?').get(ins.text, CHAR_ID);
         if (exists) { skipped++; continue; }
         const markers = ins.sources.map(s => `${s.instance}:${s.project}`);
         const tags = [...new Set([...ins.tags, ...markers])];
+        // v1.24: 跨库整合产物打当前实例角色 —— 否则 reflect 总库里它会变成无人可见的孤儿行
         db.prepare(`
-          INSERT INTO memory (id, text, project, type, mem_type, category, tags, importance, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, metadata)
-          VALUES (?, ?, 'reflect', 'semantic', ?, 'general', ?, ?, 'reflect-all', 'user', 'standard', 1, ?, ?, ?, 0, 0, ?)
-        `).run(generateId(), ins.text, mt, JSON.stringify(tags), ins.importance, now, now, now, JSON.stringify({ reflection: { sources: ins.sources } }));
+          INSERT INTO memory (id, text, project, type, mem_type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, metadata)
+          VALUES (?, ?, 'reflect', 'semantic', ?, 'general', ?, ?, ?, 'reflect-all', 'user', 'standard', 1, ?, ?, ?, 0, 0, ?)
+        `).run(generateId(), ins.text, mt, serializeTags(tags), ins.importance, CHAR_ID, now, now, now, JSON.stringify({ reflection: { sources: ins.sources } }));
         saved++;
       } catch (e: any) {
         base.errors.push(`写入洞察失败: ${e.message}`);

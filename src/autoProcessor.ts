@@ -14,18 +14,18 @@ import { getAgentState } from './agentState.js';
 import { observeUserMessage } from './userLearning.js';
 import { queueForVad, ollamaClassify, fallbackClassify, formatVADForPrompt, VADVector } from './emotion.js';
 import { getBuffer } from './buffer.js';
-import { PROJECT_ID, normalizeProject } from './env.js';
+import { PROJECT_ID, CHAR_ID, normalizeProject } from './env.js';
 
-/** 兜底：saveConversationTurn 没返回 id 时，按 (project, 用户原文) 回查最近一条 conversation_log。 */
-function findConversationTurnId(project: string, userMessage: string): string | undefined {
+/** 兜底：saveConversationTurn 没返回 id 时，按 (project, 角色, 用户原文) 回查最近一条 conversation_log。 */
+function findConversationTurnId(project: string, userMessage: string, characterId: string = CHAR_ID): string | undefined {
   try {
     const db = DatabaseManager.getInstance(project);
     const row = db.prepare(`
       SELECT id FROM memory
-      WHERE source = 'conversation_log' AND project = ? AND is_active = 1
+      WHERE source = 'conversation_log' AND project = ? AND is_active = 1 AND character_id = ?
         AND instr(text, ?) > 0
       ORDER BY rowid DESC LIMIT 1
-    `).get(project, '用户: ' + userMessage) as any;
+    `).get(project, characterId, '用户: ' + userMessage) as any;
     return row?.id;
   } catch {
     return undefined;
@@ -41,7 +41,8 @@ export async function autoProcess(args: {
   project?: string;
   sessionId?: string;  // v1.11 Part2: 会话 ID — 传了才启用会话记忆缓冲(渐进式临时反思),不传保持旧行为
 }): Promise<any> {
-  const cid = args.characterId || 'airi';
+  // v1.24: 角色由进程级 CHAR_ID 决定(与 Castalia 普通版一致);args.characterId 仅作内部显式覆盖
+  const cid = args.characterId || CHAR_ID;
   const proj = normalizeProject(args.project || PROJECT_ID);
   const results: any = {
     success: true,
@@ -74,7 +75,7 @@ export async function autoProcess(args: {
 
   // 返回值没带 id 时（旧版 store / 未来重构），从本项目 conversation_log 回查最近一条。
   // 仅在本轮确实落库成功时回查；save 失败时不能把上一轮同文本的行认成本轮。
-  if (!memoryId && results.conversationSaved) memoryId = findConversationTurnId(proj, args.userMessage);
+  if (!memoryId && results.conversationSaved) memoryId = findConversationTurnId(proj, args.userMessage, cid);
 
   // VAD 异步队列 — 不阻塞消息管道；条目带上 project + memoryId，flush 时精确回写。
   // 落库失败时不入队：没有本轮记录可回写，位置兜底可能误伤上一轮同文本的行。

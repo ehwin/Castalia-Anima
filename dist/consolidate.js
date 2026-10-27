@@ -9,7 +9,7 @@
  */
 import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { cosineSimilarity } from './ollama.js';
-import { isEmbedEnabled, normalizeProject } from './env.js';
+import { isEmbedEnabled, normalizeProject, CHAR_ID } from './env.js';
 const ACTIVATION_THRESHOLD = 0.15;
 // ═══ v1.10: 记忆整合候选预筛配置(env 可配;config.json 的 consolidate.similarity 会覆盖) ═══
 export const CONSOLIDATE_SIMILARITY = (() => {
@@ -43,15 +43,16 @@ export const CONSOLIDATE_MAX_PAIRS = (() => {
  * - 每对去重(不重复 idA/idB、不反向),数量上限 limit 防爆炸
  */
 /** v1.11.2 单个 memType 库的语义预筛(向量 KNN);候选并入共享 seen/pairs。 */
-function scanVectorPairs(db, proj, threshold, limit, seen, pairs) {
+function scanVectorPairs(db, proj, threshold, limit, seen, pairs, characterId = CHAR_ID) {
+    const cid = characterId || CHAR_ID;
     const mems = db.prepare(`
     SELECT m.rowid, m.id FROM memory m
-    WHERE m.is_active = 1 AND m.project = ? AND (m.locked IS NULL OR m.locked = 0)
+    WHERE m.is_active = 1 AND m.project = ? AND (? = 'any' OR m.character_id = ?) AND (m.locked IS NULL OR m.locked = 0)
       AND COALESCE(m.tier, 'standard') <> 'critical'
       AND COALESCE(m.status, '') NOT IN ('cold', 'superseded')
     ORDER BY m.created_at DESC
     LIMIT 500
-  `).all(proj);
+  `).all(proj, cid, cid);
     if (mems.length < 2)
         return;
     const rowidList = mems.map(m => Number(m.rowid));
@@ -119,18 +120,19 @@ function scanVectorPairs(db, proj, threshold, limit, seen, pairs) {
     }
 }
 /** v1.11.2 单个 memType 库的结构兜底(同 `# 表头` 分桶);由 findSimilarCandidates 跨库调度。 */
-function scanStructPairs(db, proj, limit, seen, pairs) {
+function scanStructPairs(db, proj, limit, seen, pairs, characterId = CHAR_ID) {
+    const cid = characterId || CHAR_ID;
     // ═══ v1.11 结构兜底:同 `# 表头` + 同 memType 分桶补候选(similarity 记 0 = 结构配对,非语义相似)═══
     if (CONSOLIDATE_BUCKET_PAIRS > 0 && pairs.length < limit) {
         let rows2 = [];
         try {
             rows2 = db.prepare(`
         SELECT id, text, mem_type FROM memory
-        WHERE is_active = 1 AND project = ? AND (locked IS NULL OR locked = 0)
+        WHERE is_active = 1 AND project = ? AND (? = 'any' OR character_id = ?) AND (locked IS NULL OR locked = 0)
           AND COALESCE(tier, 'standard') <> 'critical'
           AND COALESCE(status, '') NOT IN ('cold', 'superseded')
         ORDER BY created_at DESC LIMIT 500
-      `).all(proj);
+      `).all(proj, cid, cid);
         }
         catch {
             rows2 = [];
@@ -170,15 +172,17 @@ function scanStructPairs(db, proj, limit, seen, pairs) {
     }
     return;
 }
-export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIMILARITY, limit = CONSOLIDATE_MAX_PAIRS) {
+export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIMILARITY, limit = CONSOLIDATE_MAX_PAIRS, characterId = CHAR_ID) {
     if (!isEmbedEnabled())
         return [];
     const proj = normalizeProject(project);
+    const cid = characterId || CHAR_ID;
     const seen = new Set();
     const pairs = [];
     // v1.11.2 memdir:每个 memType 是**独立 sqlite** —— 旧版只扫 general,user/feedback/project 里的
     // "报告式"重复(带 # 表头的成组记录)完全够不到,LLM 也就无从裁决。
     // 逐库扫描并把候选并起来;两阶段(先全库语义 → 再全库结构)是为了让表头对不挤占语义候选的名额。
+    // v1.24: 角色隔离 — 候选只在本实例角色内配对(charId='any' 关闭过滤)。
     const dirs = listMemTypeDirs(proj);
     // 语义预筛给结构兜底预留名额（v1.23.1）
     const structReserve = Math.min(CONSOLIDATE_BUCKET_RESERVE, limit);
@@ -186,23 +190,25 @@ export async function findSimilarCandidates(project, threshold = CONSOLIDATE_SIM
     for (const mt of dirs) {
         if (pairs.length >= vecLimit)
             break;
-        scanVectorPairs(DatabaseManager.getInstance(project, mt), proj, threshold, vecLimit, seen, pairs);
+        scanVectorPairs(DatabaseManager.getInstance(project, mt), proj, threshold, vecLimit, seen, pairs, cid);
     }
     if (CONSOLIDATE_BUCKET_PAIRS > 0) {
         for (const mt of dirs) {
             if (pairs.length >= limit)
                 break;
-            scanStructPairs(DatabaseManager.getInstance(project, mt), proj, limit, seen, pairs);
+            scanStructPairs(DatabaseManager.getInstance(project, mt), proj, limit, seen, pairs, cid);
         }
     }
     return pairs.slice(0, limit);
 }
 export async function consolidate() {
     const now = Date.now();
+    const cid = CHAR_ID;
     let prunedCount = 0;
     let updatedCount = 0;
     let consolidateCount = 0;
     // memdir:遍历默认项目全部分类库(时间衰减/升华不只作用 general)
+    // v1.24: 角色隔离 — 衰减/剪枝/升华只作用于本实例角色,不替其它角色改记忆。
     const proj = normalizeProject(undefined);
     for (const mt of listMemTypeDirs(proj)) {
         const db = DatabaseManager.getInstance(proj, mt);
@@ -211,10 +217,10 @@ export async function consolidate() {
         // identity_locked 与 forgetMemory 同款保护，不参与自动剪枝。
         const activeRecords = db.prepare(`
       SELECT id, importance, COALESCE(base_importance, importance) AS base_importance, last_accessed_at
-      FROM memory WHERE is_active = 1 AND COALESCE(source, '') != 'manual_lore'
+      FROM memory WHERE is_active = 1 AND character_id = ? AND COALESCE(source, '') != 'manual_lore'
         AND COALESCE(tier, 'standard') != 'critical' AND (locked IS NULL OR locked = 0)
         AND COALESCE(identity_locked, 0) = 0
-    `).all();
+    `).all(cid);
         const decayTx = db.transaction(() => {
             for (const mem of activeRecords) {
                 const ts = new Date(mem.last_accessed_at).getTime();
@@ -239,7 +245,7 @@ export async function consolidate() {
         });
         decayTx();
         // ═══ Phase 2: reference_count 升华 ═══
-        const dupes = db.prepare('SELECT id FROM memory WHERE is_active = 1 AND reference_count > 2 LIMIT 20').all();
+        const dupes = db.prepare('SELECT id FROM memory WHERE is_active = 1 AND character_id = ? AND reference_count > 2 LIMIT 20').all(cid);
         for (const dup of dupes) {
             db.prepare(`UPDATE memory SET reference_count = 0,
            importance = MIN(0.95, COALESCE(base_importance, importance) + 0.1),
@@ -255,3 +261,4 @@ export async function consolidate() {
         consolidated: consolidateCount,
     };
 }
+//# sourceMappingURL=consolidate.js.map

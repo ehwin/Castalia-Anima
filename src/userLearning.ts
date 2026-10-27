@@ -13,6 +13,7 @@
  */
 import { DatabaseManager } from './db.js';
 import { normalizeProject } from './env.js';
+import { parseTagsSafe } from './tags.js';
 
 interface UserProfile {
   characterId: string;
@@ -164,7 +165,7 @@ export function loadUserProfilesFromDb(characterId: string, project?: string): v
 
     for (const row of rows) {
       try {
-        const tags = JSON.parse(row.tags || '[]');
+        const tags = parseTagsSafe(row.tags);
         const key = profileKey(characterId, 'default', proj);
         if (!profiles.has(key)) {
           profiles.set(key, {

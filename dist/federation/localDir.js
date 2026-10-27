@@ -163,3 +163,4 @@ export class LocalDirProvider {
             .map(h => ({ ...h, member: this.id }));
     }
 }
+//# sourceMappingURL=localDir.js.map

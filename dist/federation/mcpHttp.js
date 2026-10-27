@@ -187,3 +187,4 @@ export class McpHttpProvider {
         return this.mapHits(result);
     }
 }
+//# sourceMappingURL=mcpHttp.js.map

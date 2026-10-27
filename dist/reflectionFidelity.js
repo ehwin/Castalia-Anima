@@ -50,3 +50,4 @@ facts ${factExtraction === 'off' ? '本轮为空数组 []' : `最多 ${maxFacts}
 输出：{"processedSourceIds":["已完整处理ID"],"summary":"导航摘要","highlights":[],"facts":[{"subject":"user","predicate":"称呼","object":"示例","confidence":0.9}],"insights":[],"actions":[{"action":"extract","sourceId":"输入ID","newText":"含关键原话、主体、时间和条件的完整事件","newMemType":"project","newCategory":"emotional","newSubject":"self","tier":"standard","quotes":["原文逐字片段"]}]}
 category 可选 identity/preference/relationship/milestone/emotional/mood_snapshot/knowledge/general。`;
 }
+//# sourceMappingURL=reflectionFidelity.js.map

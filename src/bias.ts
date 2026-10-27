@@ -11,6 +11,7 @@
  */
 import { DatabaseManager } from './db.js';
 import { normalizeProject } from './env.js';
+import { parseTagsSafe } from './tags.js';
 
 interface TopicWeight {
   topic: string;
@@ -152,8 +153,8 @@ export function loadBiasesFromDb(characterId: string, project?: string): void {
         `).all(proj, characterId) as any[];
         for (const row of rows) {
           try {
-            const tags = JSON.parse(row.tags || '[]');
-            if (Array.isArray(tags)) allTags.push(...tags);
+            // v1.28-fix: 走唯一共享解码入口 —— 非字符串元素不再下传给 recordTopics/tag.toLowerCase()
+            allTags.push(...parseTagsSafe(row.tags));
           } catch { /* 脏 tags 忽略 */ }
         }
       } catch { /* 单库失败不影响其它库 */ }

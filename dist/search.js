@@ -13,27 +13,19 @@
  */
 import { DatabaseManager, listProjectNames, listMemTypeDirs } from './db.js';
 import { embed } from './ollama.js';
-import { normalizeProject, isEmbedEnabled } from './env.js';
+import { normalizeProject, isEmbedEnabled, CHAR_ID } from './env.js';
 import { normalizeMemType } from './memType.js';
 import { computeBiasBoost } from './bias.js';
 import { computeDecay, computeBaseIntensity, computeRecency, isNightTime } from './emotion.js';
+import { parseTagsSafe } from './tags.js';
+// v1.28: tags 解码收敛到纯模块 src/tags.ts（零副作用、可被验收脚本单独加载）。
+// 这里保留 re-export，历史 import { parseTagsSafe } from './search.js' 不会断。
+export { parseTagsSafe };
 // v5.2: 情绪锚定权重(可经环境变量调整)
 const WEIGHT_CONSISTENCY = parseFloat(process.env.WEIGHT_CONSISTENCY || '0.30'); // 标签/语义匹配
 const WEIGHT_EMOTION = parseFloat(process.env.WEIGHT_EMOTION || '0.45'); // 情感强度 — 主锚
 const WEIGHT_TIME = parseFloat(process.env.WEIGHT_TIME || '0.15'); // 时间衰减
 const WEIGHT_DEVIATION = parseFloat(process.env.WEIGHT_DEVIATION || '0.10'); // "不像她"的珍贵瞬间
-/** v1.23.1-fix: tags 列出现过被写成逗号串的历史数据；单条脏行不能让整个检索库失败。 */
-function parseTagsSafe(raw) {
-    if (Array.isArray(raw))
-        return raw;
-    try {
-        const v = JSON.parse(String(raw ?? '[]'));
-        return Array.isArray(v) ? v : [];
-    }
-    catch {
-        return [];
-    }
-}
 // minScore 阈值可配;harness 可用 SEARCH_MIN_SCORE 覆盖
 const SEARCH_PROFILES = {
     quick: { topK: 3, minScore: 0.6 },
@@ -84,8 +76,12 @@ async function searchInDb(db, options) {
     const profile = options.profile ? SEARCH_PROFILES[options.profile] : null;
     const topK = options.topK ?? profile?.topK ?? 10;
     const minScore = options.minScore ?? profile?.minScore ?? 0;
+    // v1.24: 角色隔离 — 未显式指定 characterId 时按进程级 CHAR_ID 过滤(传 'any' 才关闭过滤)。
+    // 三条检索路径(标签/向量/文本回退)共用这里的 scoped,避免只堵住一条路。
+    const cid = options.characterId ?? CHAR_ID;
+    const scoped = cid === 'any' ? { ...options, characterId: undefined } : { ...options, characterId: cid };
     // ═══ Phase 1: 标签搜索(0 次向量调用) ═══
-    const tagResults = tagSearch(db, options);
+    const tagResults = tagSearch(db, scoped);
     // 标签结果足够好 → 直接返回
     if (tagResults.length >= topK && tagResults[0].score >= 0.5) {
         updateAccessed(db, tagResults.slice(0, topK));
@@ -95,19 +91,26 @@ async function searchInDb(db, options) {
     const existingIds = new Set(tagResults.map(r => r.id));
     let vectorResults = [];
     if (isEmbedEnabled()) {
+        let vecOk = false;
         try {
-            const queryVector = await embed(options.query, options.project);
+            const queryVector = await embed(scoped.query, scoped.project);
             const floatQuery = new Float32Array(queryVector);
-            vectorResults = vectorKnnSearch(db, options, floatQuery, existingIds, topK, minScore);
+            vectorResults = vectorKnnSearch(db, scoped, floatQuery, existingIds, topK, minScore);
+            vecOk = true;
         }
         catch {
-            // 向量搜索失败 → 文本回退
-            vectorResults = textFallbackSearch(db, options, existingIds, topK, minScore);
+            vecOk = false;
+        }
+        // v1.28-fix(移植自 Lite 修 E6a):原来只在 embed/KNN **抛错**时回退。vec_memory 为空
+        // (换模型清空后尚未补齐、维度刚重建、批量嵌入没跑)时 KNN 会"成功返回 0 行",
+        // 于是嵌入服务明明健康却静默 0 命中。零命中同样要回退到文本检索。
+        if (!vecOk || vectorResults.length === 0) {
+            vectorResults = textFallbackSearch(db, scoped, existingIds, topK, minScore);
         }
     }
     else {
         // 纯本地模式:标签结果不足时直接文本回退
-        vectorResults = textFallbackSearch(db, options, existingIds, topK, minScore);
+        vectorResults = textFallbackSearch(db, scoped, existingIds, topK, minScore);
     }
     // 合并 + 去重 + 排序
     const merged = [...tagResults, ...vectorResults];
@@ -425,6 +428,7 @@ function updateAccessed(db, results) {
  */
 export function hydrateParentExcerpts(project, related, opts = {}) {
     const proj = normalizeProject(project);
+    const cid = opts.characterId ?? CHAR_ID;
     if (!related || related.length === 0)
         return [];
     let budget = opts.budget ?? 3000;
@@ -445,12 +449,12 @@ export function hydrateParentExcerpts(project, related, opts = {}) {
         for (const [pid, hit] of [...hitsByParent.entries()].slice(0, maxParents)) {
             if (budget <= 0)
                 break;
-            const row = DatabaseManager.queryAll(proj, 'SELECT id, text FROM memory WHERE id = ? AND project = ?', [pid, proj])[0];
+            const row = DatabaseManager.queryAll(proj, 'SELECT id, text FROM memory WHERE id = ? AND project = ? AND character_id = ?', [pid, proj, cid])[0];
             if (!row || !row.text)
                 continue;
             const parentText = String(row.text);
             // 分母只算活跃 leaf：已停用/被接管的 leaf 不该把"同父命中比"拉低
-            const totalLeaves = DatabaseManager.queryAll(proj, 'SELECT COUNT(*) AS c FROM memory WHERE parent_id = ? AND project = ? AND is_active = 1', [pid, proj])
+            const totalLeaves = DatabaseManager.queryAll(proj, 'SELECT COUNT(*) AS c FROM memory WHERE parent_id = ? AND project = ? AND is_active = 1 AND character_id = ?', [pid, proj, cid])
                 .reduce((n, r) => n + (Number(r.c) || 0), 0) || 1;
             const ratio = hit.hits / totalLeaves;
             const full = ratio > 0.5 || parentText.length <= 1800;
@@ -501,8 +505,13 @@ export function getRecentMemories(characterId, limit = 5, hoursBack = 24, projec
     for (const mt of dirs) {
         try {
             const db = DatabaseManager.getInstance(proj, mt);
-            const conds = ['is_active = 1', 'character_id = ?', 'project = ?', 'created_at > ?', "COALESCE(status, '') <> 'superseded'"];
-            const params = [characterId, proj, since];
+            // v1.24: 角色隔离 — characterId='any' 才关闭过滤(默认由调用方传 CHAR_ID)
+            const conds = ['is_active = 1', 'project = ?', 'created_at > ?', "COALESCE(status, '') <> 'superseded'"];
+            const params = [proj, since];
+            if (characterId && characterId !== 'any') {
+                conds.push('character_id = ?');
+                params.push(characterId);
+            }
             if (memType) {
                 conds.push('mem_type = ?');
                 params.push(memType);
@@ -544,6 +553,7 @@ export async function searchFacts(query, options = {}) {
     const topK = options.topK ?? 10;
     const minConfidence = options.minConfidence ?? 0.3;
     const proj = normalizeProject(options.project);
+    const cid = options.characterId ?? CHAR_ID;
     if (!isEmbedEnabled()) {
         return []; // 纯本地模式:facts 无向量可查
     }
@@ -572,6 +582,10 @@ export async function searchFacts(query, options = {}) {
     // v1.23.1: 已失效（valid_to 有值）的旧事实不进检索结果
     const conditions = ['f.is_active = 1', 'f.project = ?', "(f.valid_to IS NULL OR f.valid_to = '')", `f.rowid IN (${knnRows.map(() => '?').join(',')})`];
     const params = [proj, ...knnRows.map(r => Number(r.rowid))];
+    if (cid !== 'any') {
+        conditions.push('f.character_id = ?');
+        params.push(cid);
+    }
     if (options.subject) {
         conditions.push('f.subject = ?');
         params.push(options.subject);
@@ -617,3 +631,4 @@ export async function searchFacts(query, options = {}) {
     }
     return results;
 }
+//# sourceMappingURL=search.js.map

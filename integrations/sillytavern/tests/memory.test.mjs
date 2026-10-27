@@ -10,6 +10,7 @@ const temporaryBank = fs.mkdtempSync(path.join(os.tmpdir(), 'anima-tavern-test-'
 process.env.MEMORY_DB_DIR = temporaryBank;
 process.env.EMBED_MODE = 'none';
 const { syncTavernChat } = await import('../../../dist/tavern.js');
+const { CHAR_ID } = await import('../../../dist/env.js');
 const { DatabaseManager } = await import('../../../dist/db.js');
 const { searchMemory } = await import('../../../dist/search.js');
 after(() => { DatabaseManager.close(); fs.rmSync(temporaryBank, { recursive: true, force: true }); });
@@ -21,25 +22,34 @@ test('same chat in different users/characters is physically isolated', async () 
   assert.notEqual(a, b); assert.notEqual(a, c);
   syncTavernChat(a, [{ id: '1', role: 'assistant', name: 'CharacterA', text: 'secret-seashell 约定去海边' }]);
   for (const project of [b, c]) {
-    assert.equal((await searchMemory({ query: 'secret-seashell', project, characterId: project })).length, 0);
+    assert.equal((await searchMemory({ query: 'secret-seashell', project })).length, 0);
   }
-  const found = await searchMemory({ query: 'secret-seashell', project: a, characterId: a });
+  const found = await searchMemory({ query: 'secret-seashell', project: a });
   assert.equal(found.length, 1); assert.match(found[0].text, /CharacterA/); assert.doesNotMatch(found[0].text, /助手/);
+  // v1.24: 角色 = 进程级 CHAR_ID(不再等于 project);别的角色 id 逻辑上也看不到
+  assert.equal(found[0].characterId, CHAR_ID);
+  assert.equal((await searchMemory({ query: 'secret-seashell', project: a, characterId: 'another-role' })).length, 0);
   assert.ok(fs.existsSync(path.join(temporaryBank, a, 'general/memory.sqlite')));
 });
 
 test('swipe/edit/delete/retry synchronize only the currently selected version', async () => {
   const project = projectFor('alice', 'versions');
   const message = { id: 'stable', role: 'assistant', name: '角色甲', text: 'abandoned-answer' };
+  const keep = { id: 'kept', role: 'assistant', name: '角色甲', text: 'kept-answer' };
   assert.equal(syncTavernChat(project, [message]).changed, 1);
   assert.equal(syncTavernChat(project, [message]).changed, 0);
   assert.equal(syncTavernChat(project, [{ ...message, text: 'selected-answer' }]).changed, 1);
-  assert.equal((await searchMemory({ query: 'abandoned-answer', project, characterId: project })).length, 0);
-  assert.equal((await searchMemory({ query: 'selected-answer', project, characterId: project })).length, 1);
-  assert.equal(syncTavernChat(project, []).deleted, 1);
-  assert.equal((await searchMemory({ query: 'selected-answer', project, characterId: project })).length, 0);
-  assert.equal(syncTavernChat(project, [{ ...message, text: 'selected-answer' }]).changed, 1);
-  assert.equal((await searchMemory({ query: 'selected-answer', project, characterId: project })).length, 1);
+  assert.equal((await searchMemory({ query: 'abandoned-answer', project })).length, 0);
+  assert.equal((await searchMemory({ query: 'selected-answer', project })).length, 1);
+  // 删除：空快照被显式拒绝（防窗口化误清库），收缩必须走 replace:true 的更小快照
+  assert.throws(() => syncTavernChat(project, []), /empty/);
+  syncTavernChat(project, [message, keep]);
+  assert.equal(syncTavernChat(project, [keep], { replace: true }).deleted, 1);
+  assert.equal((await searchMemory({ query: 'selected-answer', project })).length, 0);
+  assert.equal((await searchMemory({ query: 'kept-answer', project })).length, 1);
+  // retry：同一条消息重新出现（replace:true 确认窗口收缩；keep 未变所以 changed=1）
+  assert.equal(syncTavernChat(project, [keep, { ...message, text: 'selected-answer' }], { replace: true }).changed, 1);
+  assert.equal((await searchMemory({ query: 'selected-answer', project })).length, 1);
 });
 
 test('invalid snapshot cannot erase a previously saved chat', () => {

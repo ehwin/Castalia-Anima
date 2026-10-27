@@ -12,6 +12,7 @@ const config = path.join(temp, 'config.json');
 fs.writeFileSync(config, JSON.stringify({ reflect: { preservation: 'evidence' } }));
 Object.assign(process.env, {
   MEMORY_DB_DIR: temp, MEMORY_CONFIG: config,
+  CHAR_ID: 'airi',                 // v1.24: 角色 = 进程级实例 ID(本回归显式钉成 airi)
   EMBED_MODE: 'api', OLLAMA_URL: 'https://fixture.invalid', EMBEDDING_API_KEY: 'fixture',
   REFLECT_LLM_API_KEY: 'fixture', REFLECT_LLM_URL: 'https://fixture.invalid', REFLECT_LLM_RETRIES: '1',
 });

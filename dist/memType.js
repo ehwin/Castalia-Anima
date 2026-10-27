@@ -59,3 +59,4 @@ export function summarizeForIndex(text, maxLen = 150) {
     const t = (text ?? '').trim();
     return t.length > maxLen ? t.slice(0, maxLen) + '…' : t;
 }
+//# sourceMappingURL=memType.js.map

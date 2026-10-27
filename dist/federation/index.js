@@ -85,3 +85,4 @@ export function resolveFedLibraries(ownDir, env = process.env) {
 export function providersWith(ownDir, predicate, env = process.env) {
     return buildProviders(ownDir, env).filter(predicate);
 }
+//# sourceMappingURL=index.js.map

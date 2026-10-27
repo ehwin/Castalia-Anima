@@ -9,7 +9,8 @@
  *
  * 情感提取不再用正则 → 全部走 Ollama 本地模型
  */
-import { normalizeProject } from './env.js';
+import { normalizeProject, CHAR_ID } from './env.js';
+import { serializeTags } from './tags.js';
 // ═══════════════════════════════════════════════════════════════════
 // Constants
 // ═══════════════════════════════════════════════════════════════════
@@ -589,10 +590,10 @@ export async function batchClassifyAndTag(entries, project) {
             .sort((a, b) => (b.entry.timestamp ?? 0) - (a.entry.timestamp ?? 0));
         const fallbackIds = noId.length === 0 ? [] : db.prepare(`
       SELECT id FROM memory
-      WHERE source = 'conversation_log' AND project = ? AND is_active = 1
+      WHERE source = 'conversation_log' AND project = ? AND is_active = 1 AND character_id = ?
       ORDER BY created_at DESC, rowid DESC
       LIMIT ?
-    `).all(proj, noId.length).map((r) => r.id);
+    `).all(proj, CHAR_ID, noId.length).map((r) => r.id);
         const fallbackIdByIndex = new Map();
         noId.forEach((x, k) => fallbackIdByIndex.set(x.index, fallbackIds[k]));
         let updated = 0;
@@ -604,7 +605,7 @@ export async function batchClassifyAndTag(entries, project) {
             const imp = clamp(r.importance || 0.5, 0, 1);
             const tier = imp >= 0.7 ? 'critical' : (imp <= 0.3 ? 'temporary' : 'standard');
             const cat = validCategories.includes(r.category) ? r.category : 'general';
-            const tags = JSON.stringify(Array.isArray(r.tags) ? r.tags.slice(0, 5) : []);
+            const tags = serializeTags(Array.isArray(r.tags) ? r.tags.slice(0, 5) : []);
             const vad = parseVadResult(r.vad);
             // 有 VAD 才写三列；没有就保持 NULL（检索的 VAD 衰减分支才不会误判）
             const res = vad
@@ -623,3 +624,4 @@ export async function batchClassifyAndTag(entries, project) {
         return 0;
     }
 }
+//# sourceMappingURL=emotion.js.map

@@ -204,3 +204,4 @@ export function getAgentState(characterId, project) {
 export function getAgentPrompt(characterId, project) {
     return getAgentState(characterId, project).toPromptString();
 }
+//# sourceMappingURL=agentState.js.map

@@ -97,10 +97,11 @@ export class SessionMemoryBuffer {
         });
     }
 }
-/** 进程内单例工厂:key = `${project}|${sessionId}`,同会话复用同一 buffer */
+/** 进程内单例工厂:key = `${project}|${sessionId}|${characterId}`,同会话+同角色复用同一 buffer
+ *  v1.24: key 加入 characterId —— 同库多角色共用同一会话 ID 时不再共用缓冲(否则会互相覆盖快照)。 */
 export function getBuffer(project, sessionId, characterId) {
     const proj = normalizeProject(project);
-    const key = `${proj}|${sessionId}`;
+    const key = `${proj}|${sessionId}|${characterId ?? ''}`;
     let b = buffers.get(key);
     if (!b) {
         b = new SessionMemoryBuffer(proj, sessionId, characterId);
@@ -119,3 +120,4 @@ export function flushAllBuffers() {
         }
     }
 }
+//# sourceMappingURL=buffer.js.map

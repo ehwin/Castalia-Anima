@@ -5,11 +5,13 @@
  * v4.0: 去重不再丢弃，SQLite 持久化 embedding 缓存
  */
 import { DatabaseManager, generateId, listMemTypeDirs } from './db.js';
+import { linkFactEntities, linkMemoryToEntities } from './entities.js';
 import type Database from 'better-sqlite3';
 import { embed, getEmbeddingCached } from './ollama.js';
 import { recordTopics } from './bias.js';
 import { PROJECT_ID, CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
 import { MemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
+import { parseTagsSafe, normalizeTagsForWrite, serializeTags } from './tags.js';
 
 let saveCount = 0;
 const CONSOLIDATE_INTERVAL = 50;
@@ -67,19 +69,22 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
   const memType = normalizeMemType(params.memType);
   // v1.8: 4 种封闭类型(memType≠general)且 text 非 Markdown 时,自动规范化包装(加标题行+转列表)
   const text = normalizeMarkdown(params.text, memType);
+  // v1.24: 角色 = 调用方显式指定,否则进程级 CHAR_ID —— 写入永不落 NULL(否则新行对所有角色都不可见)。
+  const charId = params.characterId ?? CHAR_ID;
 
-  // ═══ 精确去重：完全相同的文本不重复存(仅限同项目) ═══
+  // ═══ 精确去重：完全相同的文本不重复存(仅限同项目 + 同角色) ═══
+  // v1.24: 角色隔离 — 去重也必须限定 character_id,否则会把别的角色的同文本记忆
+  // 当成本次命中(reference_count 记到别人头上),返回的 id 对当前角色还不可见。
   const exactDup = db.prepare(`
     SELECT * FROM memory
     WHERE is_active = 1 AND project = ? AND TRIM(text) = TRIM(?)
-      AND session_id IS ? AND subject = ?
+      AND session_id IS ? AND subject = ? AND character_id IS ?
     LIMIT 1
-  `).get(project, text?.trim() || '', params.sessionId ?? null, params.subject ?? 'user') as any;
+  `).get(project, text?.trim() || '', params.sessionId ?? null, params.subject ?? 'user', charId) as any;
 
   if (exactDup) {
     db.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(exactDup.id);
-    let storedTags: string[] = [];
-    try { storedTags = JSON.parse(exactDup.tags || '[]'); } catch { /* keep empty */ }
+    const storedTags = parseTagsSafe(exactDup.tags);
     return {
       id: exactDup.id, text: exactDup.text, project: exactDup.project,
       sessionId: exactDup.session_id ?? null,
@@ -110,8 +115,9 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
       `).all(floatVec) as any[];
 
       if (knn.length > 0 && knn[0].distance < 0.05) {
-        // v1.5: 项目隔离 — 仅当最近邻属于同项目才算重复
-        const dupRow = db.prepare('SELECT id FROM memory WHERE rowid = ? AND project = ?').get(Number(knn[0].rowid), project) as any;
+        // v1.5: 项目隔离；v1.24: 角色隔离 — 仅当最近邻属于同项目 + 同角色才算重复
+        const dupRow = db.prepare('SELECT id FROM memory WHERE rowid = ? AND project = ? AND character_id IS ?')
+          .get(Number(knn[0].rowid), project, charId) as any;
         if (dupRow) {
           dupId = dupRow.id;
           isNearDup = true;
@@ -141,10 +147,12 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
     memType,
     category: params.category ?? 'general',
     subcategory: params.subcategory ?? null,
-    tags: params.tags ?? [],
+    // v1.28-fix: 写入路径统一归一化 —— 落库的 tags 必然是 string[] 的 JSON 序列化结果，
+    // 不再可能出现 '[1,null]' 这类"合法 JSON 但不是字符串数组"的脏值（历史脏行正来源于此）。
+    tags: normalizeTagsForWrite(params.tags),
     emotionalImpact: Math.max(0, Math.min(10, Number(params.emotionalImpact) || 0)),
     importance: params.importance ?? 0.5,
-    characterId: params.characterId ?? null,
+    characterId: charId,
     source: params.source ?? null,
     subject: params.subject ?? 'user',
     tier,
@@ -159,7 +167,7 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       record.id, record.text, record.project, record.sessionId, record.type, record.memType, record.category, record.subcategory,
-      JSON.stringify(record.tags), record.emotionalImpact,
+      serializeTags(record.tags), record.emotionalImpact,
       record.importance, record.importance,
       record.characterId, record.source, record.subject,
       record.tier, record.expiresAt, 1,
@@ -170,6 +178,9 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
     if (!skipEmbed && vector) {
       const info = db.prepare('SELECT rowid FROM memory WHERE id = ?').get(record.id) as any;
       const rowid = BigInt(info.rowid);
+      // v1.28-fix: 这个 rowid 若还残留旧向量（历史孤儿 / 进程外硬删），先清再写。
+      // 否则 INSERT 撞 sqlite-vec 的 vec0 主键，整个事务回滚 → 该条记忆永久保存失败且粘性。
+      db.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(rowid);
       db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(rowid, new Float32Array(vector));
     }
   });
@@ -193,32 +204,35 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
   return record;
 }
 
-/** 按 id 定位记忆所在分类库(memdir 遍历),返回库连接+分类;找不到返回 null */
-export function findDbByMemoryId(id: string, project?: string): { db: Database.Database; memType: string } | null {
+/** 按 id 定位记忆所在分类库(memdir 遍历),返回库连接+分类;找不到返回 null。
+ *  v1.24: 传 characterId 时只认该角色的行(角色隔离:跨角色 id 一律视为不存在)。 */
+export function findDbByMemoryId(id: string, project?: string, characterId?: string): { db: Database.Database; memType: string } | null {
   const proj = normalizeProject(project);
+  const own = characterId ? ' AND character_id = ?' : '';
+  const ownArgs = characterId ? [characterId] : [];
   for (const mt of listMemTypeDirs(proj)) {
     const db = DatabaseManager.getInstance(proj, mt);
-    if (db.prepare('SELECT id FROM memory WHERE id = ? AND is_active = 1').get(id)) return { db, memType: mt };
+    if (db.prepare(`SELECT id FROM memory WHERE id = ? AND is_active = 1${own}`).get(id, ...ownArgs)) return { db, memType: mt };
   }
   for (const mt of listMemTypeDirs(proj)) {
     const db = DatabaseManager.getInstance(proj, mt);
-    if (db.prepare('SELECT id FROM memory WHERE id = ?').get(id)) return { db, memType: mt };
+    if (db.prepare(`SELECT id FROM memory WHERE id = ?${own}`).get(id, ...ownArgs)) return { db, memType: mt };
   }
   return null;
 }
 
-export function forgetMemory(id: string, project?: string): boolean {
-  const found = findDbByMemoryId(id, project);
+export function forgetMemory(id: string, project?: string, characterId?: string): boolean {
+  const found = findDbByMemoryId(id, project, characterId);
   if (!found) return false;
   return found.db.prepare('UPDATE memory SET is_active = 0 WHERE id = ?').run(id).changes > 0;
 }
-export function restoreMemory(id: string, project?: string): boolean {
-  const found = findDbByMemoryId(id, project);
+export function restoreMemory(id: string, project?: string, characterId?: string): boolean {
+  const found = findDbByMemoryId(id, project, characterId);
   if (!found) return false;
   return found.db.prepare('UPDATE memory SET is_active = 1 WHERE id = ?').run(id).changes > 0;
 }
-export async function updateMemory(id: string, updates: Partial<StoreParams>): Promise<MemoryRecord | null> {
-  const found = findDbByMemoryId(id, updates.project);
+export async function updateMemory(id: string, updates: Partial<StoreParams>, characterId?: string): Promise<MemoryRecord | null> {
+  const found = findDbByMemoryId(id, updates.project, characterId);
   if (!found) return null;
   let db = found.db;
   const existing = db.prepare('SELECT * FROM memory WHERE id = ?').get(id) as any;
@@ -230,7 +244,9 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>): P
     const proj = normalizeProject(updates.project);
     const newDb = DatabaseManager.getInstance(proj, newMt);
     const text = updates.text !== undefined ? normalizeMarkdown(updates.text, newMt) : existing.text;
-    const tags = updates.tags !== undefined ? JSON.stringify(updates.tags) : (existing.tags ?? '[]');
+    const tags = updates.tags !== undefined
+      ? serializeTags(updates.tags)
+      : JSON.stringify(parseTagsSafe(existing.tags));  // v1.28-fix: 搬移时不把历史脏值原样抄到新库
     const now = new Date().toISOString();
     newDb.prepare(`
       INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, base_importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, emotional_impact)
@@ -288,7 +304,7 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>): P
   if (updates.type !== undefined) { fields.push('type = ?'); values.push(updates.type); }
   if (updates.category !== undefined) { fields.push('category = ?'); values.push(updates.category); }
   if (updates.subcategory !== undefined) { fields.push('subcategory = ?'); values.push(updates.subcategory); }
-  if (updates.tags !== undefined) { fields.push('tags = ?'); values.push(JSON.stringify(updates.tags)); }
+  if (updates.tags !== undefined) { fields.push('tags = ?'); values.push(serializeTags(updates.tags)); }
   if (updates.importance !== undefined) {
     fields.push('importance = ?, base_importance = ?');
     values.push(updates.importance, updates.importance);
@@ -321,7 +337,7 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>): P
 export async function saveConversationTurn(
   userMsg: string,
   assistantMsg: string,
-  characterId: string = 'airi',
+  characterId: string = CHAR_ID,
   moodValue?: number,
   moodReason?: string,
   project?: string,  // v1.5: 项目隔离
@@ -363,8 +379,9 @@ const HEAT_PROMOTE_THRESHOLD = parseInt(process.env.HEAT_PROMOTE_THRESHOLD || '5
 const COLD_AFTER_DAYS = (() => { const v = parseFloat(process.env.COLD_AFTER_DAYS || '60'); return Number.isFinite(v) && v > 0 ? v : 60; })();
 const COLD_MAX_IMPORTANCE = (() => { const v = parseFloat(process.env.COLD_MAX_IMPORTANCE || '0.6'); return Number.isFinite(v) && v > 0 ? v : 0.6; })();
 
-export function markColdMemories(project?: string): number {
+export function markColdMemories(project?: string, characterId: string = CHAR_ID): number {
   const proj = normalizeProject(project);
+  const cid = characterId ?? CHAR_ID;
   const cutoff = new Date(Date.now() - COLD_AFTER_DAYS * 86400000).toISOString();
   let marked = 0;
   for (const mt of listMemTypeDirs(proj)) {
@@ -373,16 +390,17 @@ export function markColdMemories(project?: string): number {
       // v1.23-fix: last_accessed_at/created_at 同时存在 ISO "T…Z" 与 SQLite "YYYY-MM-DD HH:MM:SS"
       // 两种格式，直接做字符串比较会把同一天不同时刻判错（' ' < 'T'），差一天。
       // 统一过 datetime() 归一化后再比。
+      // v1.24: 角色隔离 — 维护动作只作用于本实例角色,不替其它角色降权。
       const r = db.prepare(`
         UPDATE memory SET status = 'cold'
-        WHERE project = ? AND is_active = 1
+        WHERE project = ? AND character_id = ? AND is_active = 1
           AND COALESCE(status, '') NOT IN ('cold', 'superseded')
           AND COALESCE(tier, 'standard') = 'standard'
           AND (locked IS NULL OR locked = 0)
           AND importance < ?
           AND COALESCE(reference_count, 0) = 0
           AND datetime(COALESCE(last_accessed_at, created_at)) < datetime(?)
-      `).run(proj, COLD_MAX_IMPORTANCE, cutoff);
+      `).run(proj, cid, COLD_MAX_IMPORTANCE, cutoff);
       marked += r.changes;
     } catch { /* 单库失败不影响其它库 */ }
   }
@@ -390,8 +408,9 @@ export function markColdMemories(project?: string): number {
   return marked;
 }
 
-export function promoteByAccess(project?: string): number {
+export function promoteByAccess(project?: string, characterId: string = CHAR_ID): number {
   const proj = normalizeProject(project);
+  const cid = characterId ?? CHAR_ID;
   const now = new Date().toISOString();
   let total = 0;
   // memdir:遍历项目全部分类库(临时记忆可能落在任意 memType 分类库)
@@ -399,27 +418,28 @@ export function promoteByAccess(project?: string): number {
     const db = DatabaseManager.getInstance(proj, mt);
     const r = db.prepare(`
       UPDATE memory SET tier = 'standard', updated_at = ?
-      WHERE tier = 'temporary' AND accessed_count >= ? AND is_active = 1
-    `).run(now, HEAT_PROMOTE_THRESHOLD);
+      WHERE tier = 'temporary' AND accessed_count >= ? AND is_active = 1 AND character_id = ?
+    `).run(now, HEAT_PROMOTE_THRESHOLD, cid);
     total += r.changes;
   }
   if (total > 0) console.error(`[memory] heat promote: ${total} temporary → standard`);
   return total;
 }
 
-export function cleanupExpiredMemories(project?: string): number {
+export function cleanupExpiredMemories(project?: string, characterId: string = CHAR_ID): number {
   const proj = normalizeProject(project);
+  const cid = characterId ?? CHAR_ID;
   const now = new Date().toISOString();
   // 先升格再清理:被反复访问的 temporary 不该被清
-  promoteByAccess(project);
+  promoteByAccess(project, cid);
   let total = 0;
   // memdir:遍历项目全部分类库清理过期 temporary(避免只清 general 漏掉 user/feedback/project/reference)
   for (const mt of listMemTypeDirs(proj)) {
     const db = DatabaseManager.getInstance(proj, mt);
     const result = db.prepare(`
       UPDATE memory SET is_active = 0, updated_at = ?
-      WHERE tier = 'temporary' AND expires_at IS NOT NULL AND expires_at < ? AND is_active = 1
-    `).run(now, now);
+      WHERE tier = 'temporary' AND expires_at IS NOT NULL AND expires_at < ? AND is_active = 1 AND character_id = ?
+    `).run(now, now, cid);
     total += result.changes;
   }
   return total;
@@ -453,7 +473,7 @@ export async function reEmbedMemory(id: string, project?: string): Promise<boole
  * v1.5: 支持按项目隔离 — 传 project 只处理该项目;不传则默认项目
  * 扫描 is_active=1 但 vec_memory 中无对应向量的记录
  */
-export async function batchEmbedPending(characterId: string = 'airi', project?: string): Promise<{ embedded: number; errors: string[] }> {
+export async function batchEmbedPending(characterId: string = CHAR_ID, project?: string): Promise<{ embedded: number; errors: string[] }> {
   if (!isEmbedEnabled()) return { embedded: 0, errors: ['embedding disabled (EMBED_MODE=none)'] };
   const proj = normalizeProject(project);
   let embedded = 0;
@@ -529,7 +549,7 @@ export interface FactRecord {
 export async function saveFacts(
   facts: { subject: string; predicate: string; object: string; confidence: number; evidence?: string; validFrom?: string; validTo?: string }[],
   sourceMemoryId: string | null = null,
-  characterId: string = 'airi',
+  characterId: string = CHAR_ID,
   project?: string,  // v1.5: 项目隔离
 ): Promise<{ inserted: number; updated: number }> {
   if (!facts || facts.length === 0) return { inserted: 0, updated: 0 };
@@ -540,35 +560,45 @@ export async function saveFacts(
   let inserted = 0;
   let updated = 0;
 
-  const upsert = db.prepare(`
+  // v1.24: 角色隔离 — 事实按 (SPO + project + character_id) 去重。
+  // 不再用 ON CONFLICT(旧唯一索引只有 4 列,同库多角色会被互相覆盖/顶掉),
+  // 改成显式 SELECT→UPDATE/INSERT,唯一性由 idx_facts_spo_char(含 character_id) 保证。
+  const selectFact = db.prepare(
+    'SELECT id, confidence FROM facts WHERE subject=? AND predicate=? AND object=? AND project=? AND COALESCE(character_id, \'\') = ?'
+  );
+  const updateFact = db.prepare(`
+    UPDATE facts SET confidence = MAX(confidence, ?), updated_at = ?, is_active = 1,
+      evidence = COALESCE(NULLIF(?, ''), evidence),
+      valid_from = COALESCE(?, valid_from), valid_to = ?
+    WHERE id = ?
+  `);
+  const insertFact = db.prepare(`
     INSERT INTO facts (id, subject, predicate, object, project, confidence, source_memory_id, character_id, is_active, created_at, updated_at, evidence, valid_from, valid_to)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
-    ON CONFLICT(subject, predicate, object, project) DO UPDATE SET
-      confidence = MAX(confidence, excluded.confidence),
-      updated_at = excluded.updated_at,
-      is_active = 1,
-      evidence = COALESCE(NULLIF(excluded.evidence, ''), facts.evidence),
-      valid_from = COALESCE(excluded.valid_from, facts.valid_from),
-      valid_to = excluded.valid_to,
-      accessed_count = facts.accessed_count
   `);
 
   for (const f of facts) {
-    const id = generateId();
-    const before = db.prepare(
-      'SELECT id, confidence FROM facts WHERE subject=? AND predicate=? AND object=? AND project=?'
-    ).get(f.subject, f.predicate, f.object, proj) as any;
-
-    upsert.run(
-      id, f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId, characterId, now, now,
-      f.evidence ?? null, f.validFrom ?? null, f.validTo ?? null,
-    );
-
-    if (before) {
+    const existing = selectFact.get(f.subject, f.predicate, f.object, proj, characterId ?? '') as any;
+    const factId = existing ? existing.id : generateId();
+    if (existing) {
+      updateFact.run(f.confidence, now, f.evidence ?? '', f.validFrom ?? null, f.validTo ?? null, factId);
       updated++;
+      // v1.27: 老行的 valid_from 为空时补成 now —— 否则"按时刻查有效事实"会把
+      // 2026 年才写入的事实也算进 2000 年(未知起点被当成永恒为真)。
+      try { db.prepare('UPDATE facts SET valid_from = ? WHERE id = ? AND (valid_from IS NULL OR valid_from = \'\')').run(now, factId); } catch { /* 列未迁移 */ }
     } else {
+      insertFact.run(
+        factId, f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId, characterId, now, now,
+        f.evidence ?? null, f.validFrom ?? now, f.validTo ?? null,
+      );
       inserted++;
     }
+    // v1.27 实体层:事实一落库就登记实体 + 建立 fact/memory ↔ entity 关联,
+    // 这样"某实体的当前有效事实/相关记忆"是一次 JOIN,而不是 LIKE 扫正文。
+    try {
+      const linked = linkFactEntities(db, factId, f.subject, f.object);
+      if (sourceMemoryId) linkMemoryToEntities(db, sourceMemoryId, [linked.subjectEntityId, linked.objectEntityId]);
+    } catch { /* 实体表未迁移时静默跳过 */ }
   }
 
   // v1.23 冲突失效（Graphiti 式）：功能性关系（一个主体只能有一个值）出现新值时，
@@ -594,10 +624,10 @@ export async function saveFacts(
       if (keep.length === 0) continue;
       db.prepare(`
         UPDATE facts SET valid_to = ?, updated_at = ?
-        WHERE project = ? AND subject = ? AND predicate = ? AND object <> ?
+        WHERE project = ? AND COALESCE(character_id, '') = ? AND subject = ? AND predicate = ? AND object <> ?
           AND is_active = 1 AND (valid_to IS NULL OR valid_to = '')
           AND object NOT IN (${keep.map(() => '?').join(',')})
-      `).run(now, now, proj, f.subject, f.predicate, f.object, ...keep);
+      `).run(now, now, proj, characterId ?? '', f.subject, f.predicate, f.object, ...keep);
     }
   } catch { /* 列未迁移时静默跳过 */ }
 
@@ -606,10 +636,10 @@ export async function saveFacts(
   try {
     const allFacts = db.prepare(`
       SELECT rowid, subject, predicate, object FROM facts
-      WHERE project = ? AND subject || ' ' || predicate || ' ' || object IN (
+      WHERE project = ? AND COALESCE(character_id, '') = ? AND subject || ' ' || predicate || ' ' || object IN (
         ${facts.map(() => '?').join(',')}
       )
-    `).all(proj, ...facts.map(f => `${f.subject} ${f.predicate} ${f.object}`)) as any[];
+    `).all(proj, characterId ?? '', ...facts.map(f => `${f.subject} ${f.predicate} ${f.object}`)) as any[];
 
     for (const row of allFacts) {
       const factText = `${row.subject} ${row.predicate} ${row.object}`;
@@ -632,11 +662,13 @@ export function getFactsBySubject(subject: string, characterId?: string, project
   const db = DatabaseManager.getInstance(project);
   const proj = normalizeProject(project);
   // v1.23.1: 默认只返回当前有效事实；历史版本留在表里（valid_to 有值）供按需追溯
+  // v1.24: 角色隔离 — 未指定 characterId 时按当前实例角色过滤(不再跨角色泄露)
+  const cid = characterId ?? CHAR_ID;
   let query = "SELECT * FROM facts WHERE subject = ? AND is_active = 1 AND project = ? AND (valid_to IS NULL OR valid_to = '')";
   const params: any[] = [subject, proj];
-  if (characterId) {
+  if (cid !== 'any') {
     query += ' AND character_id = ?';
-    params.push(characterId);
+    params.push(cid);
   }
   query += ' ORDER BY confidence DESC, updated_at DESC LIMIT 50';
   return db.prepare(query).all(...params) as FactRecord[];
@@ -650,47 +682,49 @@ export function getFactsBySubject(subject: string, characterId?: string, project
 //   deleteSessionFragments: 晋升即删(清空该会话已晋升的 session_memory 碎片)
 // ═══════════════════════════════════════════════════════════════════
 
-/** 读取某会话当前滚动记忆快照(source=session_memory,最新一条) */
-export function getSessionMemory(project: string, sessionId: string): string | null {
+/** 读取某会话当前滚动记忆快照(source=session_memory,最新一条);v1.24: 按角色隔离 */
+export function getSessionMemory(project: string, sessionId: string, characterId: string = CHAR_ID): string | null {
   const db = DatabaseManager.getInstance(project);
   const proj = normalizeProject(project);
   const row = db.prepare(`
     SELECT text FROM memory
-    WHERE project = ? AND session_id = ? AND source = 'session_memory' AND is_active = 1
+    WHERE project = ? AND session_id = ? AND source = 'session_memory' AND is_active = 1 AND character_id = ?
     ORDER BY updated_at DESC LIMIT 1
-  `).get(proj, sessionId) as any;
+  `).get(proj, sessionId, characterId) as any;
   return row?.text ?? null;
 }
 
 /**
- * 会话滚动状态覆盖:按 (project, session_id) 查同会话已有 session_memory
+ * 会话滚动状态覆盖:按 (project, session_id, character_id) 查同会话已有 session_memory
  * → 有则 UPDATE text(覆盖),无则 INSERT(session_id 非空, source=session_memory,
  *   memType=general 或 LLM 给的, category=session)。
  * 单会话单行,实现"滚动覆盖"而非碎片堆积。
+ * v1.24: 会话快照同样打 character_id —— 否则同库多角色会互相覆盖/串味。
  */
 export function upsertSessionMemory(
   project: string,
   sessionId: string,
   content: string,
   memType?: MemType,
+  characterId: string = CHAR_ID,
 ): { id: string; updated: boolean } {
   const db = DatabaseManager.getInstance(project);
   const proj = normalizeProject(project);
   const now = new Date().toISOString();
   const existing = db.prepare(`
     SELECT id FROM memory
-    WHERE project = ? AND session_id = ? AND source = 'session_memory' AND is_active = 1
+    WHERE project = ? AND session_id = ? AND source = 'session_memory' AND is_active = 1 AND character_id = ?
     ORDER BY updated_at DESC LIMIT 1
-  `).get(proj, sessionId) as any;
+  `).get(proj, sessionId, characterId) as any;
   if (existing) {
     db.prepare('UPDATE memory SET text = ?, updated_at = ? WHERE id = ?').run(content, now, existing.id);
     return { id: existing.id, updated: true };
   }
   const id = generateId();
   db.prepare(`
-    INSERT INTO memory (id, text, project, session_id, type, mem_type, category, tags, importance, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
-    VALUES (?, ?, ?, ?, 'episodic', ?, 'session', '[]', 0.5, 'session_memory', 'user', 'standard', 1, ?, ?, ?, 0, 0)
-  `).run(id, content, proj, sessionId, normalizeMemType(memType), now, now, now);
+    INSERT INTO memory (id, text, project, session_id, type, mem_type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
+    VALUES (?, ?, ?, ?, 'episodic', ?, 'session', '[]', 0.5, ?, 'session_memory', 'user', 'standard', 1, ?, ?, ?, 0, 0)
+  `).run(id, content, proj, sessionId, normalizeMemType(memType), characterId, now, now, now);
   return { id, updated: false };
 }
 
@@ -720,9 +754,9 @@ export function promoteToProject(
     const md = normalizeMarkdown(text, mt);
     const dup = db.prepare(`
       SELECT id FROM memory
-      WHERE is_active = 1 AND project = ? AND session_id IS NULL AND TRIM(text) = TRIM(?) AND subject = ?
+      WHERE is_active = 1 AND project = ? AND session_id IS NULL AND TRIM(text) = TRIM(?) AND subject = ? AND character_id IS ?
       LIMIT 1
-    `).get(proj, md, item.subject || 'user') as any;
+    `).get(proj, md, item.subject || 'user', cid) as any;
     if (dup) { ids.push(dup.id); continue; }
     const id = generateId();
     db.prepare(`
@@ -735,14 +769,31 @@ export function promoteToProject(
 }
 /**
  * 晋升即删(吸收 Claude cleaner.onPromoted):晋升成功后清空该会话
- * source=session_memory 的已晋升碎片。硬删(内部家计行,不嵌向量)。
+ * source=session_memory 的已晋升碎片。硬删(内部家计行;v1.28 起若已补过向量一并清)。
  */
-export function deleteSessionFragments(project: string, sessionId: string): number {
+export function deleteSessionFragments(project: string, sessionId: string, characterId: string = CHAR_ID): number {
   const db = DatabaseManager.getInstance(project);
   const proj = normalizeProject(project);
-  const r = db.prepare(`
-    DELETE FROM memory
-    WHERE project = ? AND session_id = ? AND source = 'session_memory' AND is_active = 1
-  `).run(proj, sessionId);
-  return r.changes;
+  // v1.28-fix: 与启动 sweep 保持一致 —— 硬删前先清 vec_memory。
+  // 只删 memory 会把向量变成孤儿:rowid 复用时撞 vec0 主键,且孤儿向量会被 KNN 命中。
+  try {
+    const tx = db.transaction(() => {
+      const rows = db.prepare(`
+        SELECT rowid FROM memory
+        WHERE project = ? AND session_id = ? AND source = 'session_memory' AND is_active = 1 AND character_id = ?
+      `).all(proj, sessionId, characterId) as any[];
+      if (rows.length === 0) return 0;
+      const delVec = db.prepare('DELETE FROM vec_memory WHERE rowid = ?');
+      for (const row of rows) {
+        try { delVec.run(row.rowid); } catch { /* 无 vec 表/未加载扩展 */ }
+      }
+      return db.prepare(`
+        DELETE FROM memory
+        WHERE project = ? AND session_id = ? AND source = 'session_memory' AND is_active = 1 AND character_id = ?
+      `).run(proj, sessionId, characterId).changes;
+    });
+    return tx();
+  } catch {
+    return 0;
+  }
 }

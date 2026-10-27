@@ -4,7 +4,6 @@
  * 职责：
  *   1. 消费 VAD 队列（批量情感分析 + 批量贴标签）
  *   2. 清理过期临时记忆
- *   3. 恢复丢失的 critical 记忆
  *
  * 不负责：
  *   ✗ 合并对话 → reflect 做
@@ -15,7 +14,7 @@
  */
 
 import { DatabaseManager, listMemTypeDirs } from './db.js';
-import { normalizeProject } from './env.js';
+import { normalizeProject, CHAR_ID } from './env.js';
 import { flushVadQueue, regressToBaseline, isNightTime } from './emotion.js';
 import { cleanupExpiredMemories } from './store.js';
 import { getAgentState } from './agentState.js';
@@ -33,8 +32,9 @@ export interface DigestResult {
   details?: string[];
 }
 
-export async function runDigest(characterId: string = 'airi', project?: string): Promise<DigestResult> {
+export async function runDigest(characterId: string = CHAR_ID, project?: string): Promise<DigestResult> {
   const db = DatabaseManager.getInstance(project);
+  const cid = characterId || CHAR_ID;
   const result: DigestResult = {
     success: true,
     vadUpdated: false,
@@ -60,30 +60,17 @@ export async function runDigest(characterId: string = 'airi', project?: string):
     result.errors.push('VAD flush: ' + e.message);
   }
 
-  // 2. 清理过期临时记忆(memdir:遍历项目全部分类库)
-  result.cleaned = cleanupExpiredMemories(project);
+  // 2. 清理过期临时记忆(memdir:遍历项目全部分类库;v1.24 只清本角色)
+  result.cleaned = cleanupExpiredMemories(project, cid);
 
-  // 3. 恢复被误标记的 critical 记忆(memdir:遍历项目全部分类库)
-  const proj = normalizeProject(project);
-  let restored = 0;
-  for (const mt of listMemTypeDirs(proj)) {
-    try {
-      const mdb = DatabaseManager.getInstance(proj, mt);
-      const lostCritical = mdb.prepare(`
-        UPDATE memory SET is_active = 1
-        WHERE tier = 'critical' AND is_active = 0
-      `).run();
-      restored += lostCritical.changes;
-    } catch (e: any) {
-      result.errors.push('restore critical: ' + e.message);
-    }
-  }
-  result.restored = restored;
-
+  // 3. critical 记忆不再无条件复活（对齐 Lite/Full 的等价实现）：
+  //    inactive 可能代表人工删除、合并删除或跨 memType 迁移墓碑；
+  //    无条件 UPDATE ... is_active = 1 会让用户显式删掉的 critical 在 60s 定时器下反复活过来。
+  //    只有显式人工恢复接口(store.restoreMemory)可以恢复。
   return result;
 }
 
-export function maybeDigest(characterId: string = 'airi', project?: string): Promise<DigestResult> | null {
+export function maybeDigest(characterId: string = CHAR_ID, project?: string): Promise<DigestResult> | null {
   const now = Date.now();
   const projKey = normalizeProject(project);
   if (now - (lastDigestTimes.get(projKey) || 0) < MIN_DIGEST_GAP_MS) return null;
@@ -91,9 +78,9 @@ export function maybeDigest(characterId: string = 'airi', project?: string): Pro
   const db = DatabaseManager.getInstance(project);
   const unanalyzed = (db.prepare(`
     SELECT COUNT(*) as c FROM memory
-    WHERE is_active = 1 AND source = 'conversation_log'
+    WHERE is_active = 1 AND source = 'conversation_log' AND character_id = ?
       AND last_accessed_at = created_at
-  `).get() as any)?.c || 0;
+  `).get(characterId || CHAR_ID) as any)?.c || 0;
 
   if (unanalyzed === 0) return null;
 
@@ -101,7 +88,7 @@ export function maybeDigest(characterId: string = 'airi', project?: string): Pro
   return runDigest(characterId, project);
 }
 
-export function getRecentConversations(characterId: string, hoursBack: number = 24, limit: number = 50, project?: string): any[] {
+export function getRecentConversations(characterId: string = CHAR_ID, hoursBack: number = 24, limit: number = 50, project?: string): any[] {
   const db = DatabaseManager.getInstance(project);
   const since = new Date(Date.now() - hoursBack * 3600000).toISOString();
   const proj = normalizeProject(project);
@@ -109,8 +96,8 @@ export function getRecentConversations(characterId: string, hoursBack: number = 
     SELECT id, text, created_at, importance
     /* 对话审计带写入时 is_active=0(store.ts saveConversationTurn);
      * 按 is_active=1 过滤会永远查不到新数据(2026-10-17 修)。 */
-    FROM memory WHERE source = 'conversation_log' AND project = ?
+    FROM memory WHERE source = 'conversation_log' AND project = ? AND character_id = ?
       AND created_at > ?
     ORDER BY created_at DESC LIMIT ?
-  `).all(proj, since, limit) as any[];
+  `).all(proj, characterId || CHAR_ID, since, limit) as any[];
 }

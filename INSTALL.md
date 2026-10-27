@@ -120,6 +120,12 @@ Add a server entry to your client's MCP config (see `mcp-config.example.json` fo
 
 Restart the client, then call any tool (e.g. `memory_save`) to confirm the connection.
 
+`EMBEDDING_DIM` (default `1024`) must match the output dimension of `EMBEDDING_MODEL`. To switch to a
+model with a different dimension, change only that value — or write it in the memory bank's
+`config.json` as `"embedding": { "dim": 4096 }`. On the next start the engine rebuilds that bank's
+`vec_memory` / `vec_facts` tables (and clears the embedding cache); your stored memories and facts are
+untouched and get re-embedded on demand.
+
 ### Federation (this edition only)
 
 Federation lets one engine search the memories of *other* Castalia instances. Members come from

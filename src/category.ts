@@ -3,6 +3,7 @@
  * Hierarchical categories inspired by SynaBun
  */
 import { DatabaseManager } from './db.js';
+import { CHAR_ID } from './env.js';
 
 export interface Category {
   name: string;
@@ -82,8 +83,8 @@ export function deleteCategory(name: string, reassignTo?: string, reassignChildr
     throw new Error(`Cannot delete "${name}": has children [${children.map(c => c.name).join(', ')}]. Provide reassignChildrenTo.`);
   }
 
-  // Check for memories
-  const memCount = db.prepare('SELECT COUNT(*) as cnt FROM memory WHERE category = ? AND is_active = 1').get(name) as { cnt: number };
+  // Check for memories (v1.24: 只算本角色的记忆,别把别的角色的分类占用算到自己头上)
+  const memCount = db.prepare('SELECT COUNT(*) as cnt FROM memory WHERE category = ? AND is_active = 1 AND character_id = ?').get(name, CHAR_ID) as { cnt: number };
   if (memCount.cnt > 0 && !reassignTo) {
     throw new Error(`Cannot delete "${name}": ${memCount.cnt} memories use it. Provide reassignTo.`);
   }
@@ -94,9 +95,9 @@ export function deleteCategory(name: string, reassignTo?: string, reassignChildr
       db.prepare('UPDATE categories SET parent = ? WHERE parent = ?').run(reassignChildrenTo, name);
     }
 
-    // Reassign memories
+    // Reassign memories (v1.24: 只改本角色的行)
     if (memCount.cnt > 0 && reassignTo) {
-      db.prepare('UPDATE memory SET category = ? WHERE category = ?').run(reassignTo, name);
+      db.prepare('UPDATE memory SET category = ? WHERE category = ? AND character_id = ?').run(reassignTo, name, CHAR_ID);
     }
 
     // Delete category

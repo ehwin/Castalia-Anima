@@ -11,6 +11,7 @@
  */
 import { DatabaseManager } from './db.js';
 import { normalizeProject } from './env.js';
+import { parseTagsSafe } from './tags.js';
 // In-memory topic weights per (project, character) — v1.23.2 审计第 3 组：
 // 只按 characterId 做键会让不同项目的兴趣权重互相污染。
 const biasMaps = new Map();
@@ -132,9 +133,8 @@ export function loadBiasesFromDb(characterId, project) {
         `).all(proj, characterId);
                 for (const row of rows) {
                     try {
-                        const tags = JSON.parse(row.tags || '[]');
-                        if (Array.isArray(tags))
-                            allTags.push(...tags);
+                        // v1.28-fix: 走唯一共享解码入口 —— 非字符串元素不再下传给 recordTopics/tag.toLowerCase()
+                        allTags.push(...parseTagsSafe(row.tags));
                     }
                     catch { /* 脏 tags 忽略 */ }
                 }
@@ -149,3 +149,4 @@ export function loadBiasesFromDb(characterId, project) {
         // DB not ready yet
     }
 }
+//# sourceMappingURL=bias.js.map

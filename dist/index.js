@@ -17,16 +17,18 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { searchMemory, searchFacts, getRecentMemories, searchMemoryAcross, hydrateParentExcerpts } from './search.js';
+import { parseTagsSafe } from './tags.js';
 import { saveMemory, forgetMemory, updateMemory, saveConversationTurn, cleanupExpiredMemories, batchEmbedPending, markColdMemories } from './store.js';
 import { consolidate } from './consolidate.js';
 import { DatabaseManager, listProjectNames, listMemTypeDirs, safeFilePart, currentMemDir, sweepExpiredSessionMemories } from './db.js';
 import { runDigest, getRecentConversations, maybeDigest } from './digest.js';
 import { flushAllBuffers } from './buffer.js';
 import { reflect, getAllMemories, getMemoryGraph, REFLECT_SYSTEM_PROMPT, getUnanalyzedConversations } from './reflect.js';
+import { findEntities, entityFacts, entityMemories, entityGraphSlice, expandEntityGraph, conflictsReport, entityStats } from './entities.js';
 import { autoProcess } from './autoProcessor.js';
 import { runAutoReflect, runDeepReflect, shouldAutoReflect, runConsolidate, shouldAutoConsolidate } from './reflectDriver.js';
 import { ensureSeedInstructions, saveInstruction, getInstruction, listInstructions, deleteInstruction } from './instructions.js';
-import { CHAR_ID, PROJECT_ID, SERVER_NAME, SERVER_VERSION, normalizeProject, charFor, getPersona } from './env.js';
+import { CHAR_ID, PROJECT_ID, SERVER_NAME, SERVER_VERSION, normalizeProject, getPersona } from './env.js';
 import { MEM_TYPES, summarizeForIndex } from './memType.js';
 import { fedSearchAll, resolveFedLibraries } from './federation/index.js';
 import { runReflectAll } from './reflectAll.js';
@@ -61,8 +63,8 @@ if (_healthPort > 0) {
     }).catch((e) => console.error('[health] init failed:', e.message));
 }
 /** 人格声明行:[角色声明] 我是 <name>(charId=<charId>) [。人格设定:<persona>](persona 非空时) */
-function roleDeclaration(project) {
-    const p = getPersona(project);
+function roleDeclaration() {
+    const p = getPersona();
     return p.persona
         ? `[角色声明] 我是 ${p.name}(charId=${p.charId}) 。人格设定:${p.persona}`
         : `[角色声明] 我是 ${p.name}(charId=${p.charId})`;
@@ -97,9 +99,13 @@ function memorySnapshotWarn(createdAt) {
 //   MCP_TOOLS=agent,admin → agent + admin 两组
 // ═══════════════════════════════════════════════════════════════════
 const TOOL_GROUPS = {
-    agent: ['memory_search', 'memory_get', 'memory_recent', 'memory_index', 'fact_search', 'memory_graph'],
+    agent: ['memory_search', 'memory_get', 'memory_recent', 'memory_index', 'fact_search', 'memory_graph', 'entity_lookup'],
     harness: ['auto_process', 'conversation_save', 'tavern_sync', 'digest_run', 'reflect_auto', 'reflect_deep', 'reflect_batch_embed', 'memory_save', 'memory_update', 'memory_delete', 'memory_log', 'instruction_save', 'user_observe'],
     admin: ['memory_list', 'stats_get', 'recent_conversations', 'daily_summary_data', 'reflect_analyze', 'reflect_apply', 'memory_context', 'context_get', 'project_list', 'project_create', 'memory_search_all', 'reflect_all', 'instruction_list', 'instruction_delete', 'consolidate_deep', 'mood_journal'],
+    // v1.26: 前端存储桥(AIRI 这类"每个角色一套记忆"的客户端当持久层用)
+    store: ['memory_store_list', 'memory_store_save', 'memory_store_forget'],
+    // v1.27: 实体层 —— 按实体名查事实/记忆,以及事实失效(矛盾)报告
+    entity: ['entity_lookup', 'facts_conflicts_report'],
 };
 function resolveTools(input) {
     if (!input || input === 'all')
@@ -170,7 +176,7 @@ register('memory_search', 'agent', 'Search past memories using tag-first then ve
     try {
         const r = args.projects && args.projects.length > 0
             ? await searchMemoryAcross({ query: args.query, topK: args.topK ?? 5, category: args.category, memType: args.memType, projects: args.projects })
-            : await searchMemory({ query: args.query, topK: args.topK ?? 5, profile: 'balanced', category: args.category, memType: args.memType, characterId: charFor(args.project), project: args.project });
+            : await searchMemory({ query: args.query, topK: args.topK ?? 5, profile: 'balanced', category: args.category, memType: args.memType, characterId: CHAR_ID, project: args.project });
         return ok({
             op: 'search',
             query: args.query,
@@ -202,7 +208,7 @@ register('fact_search', 'agent', 'Search structured facts (subject-predicate-obj
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
-        const r = await searchFacts(args.query, { subject: args.subject, topK: args.topK ?? 5, minConfidence: 0.3, project: args.project });
+        const r = await searchFacts(args.query, { subject: args.subject, topK: args.topK ?? 5, minConfidence: 0.3, project: args.project, characterId: CHAR_ID });
         return ok({
             op: 'fact_search',
             query: args.query,
@@ -241,7 +247,7 @@ register('memory_save', 'harness', 'Store a new memory or update existing one by
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
-        const r = await saveMemory({ text: args.text, project: args.project, sessionId: args.sessionId, type: args.type, memType: args.memType, category: args.category, tags: args.tags, emotionalImpact: args.emotionalImpact, importance: args.importance, tier: args.tier, source: args.source, subject: args.subject, characterId: charFor(args.project), skipEmbed: args.skipEmbed, expiresAt: args.expiresAt });
+        const r = await saveMemory({ text: args.text, project: args.project, sessionId: args.sessionId, type: args.type, memType: args.memType, category: args.category, tags: args.tags, emotionalImpact: args.emotionalImpact, importance: args.importance, tier: args.tier, source: args.source, subject: args.subject, characterId: CHAR_ID, skipEmbed: args.skipEmbed, expiresAt: args.expiresAt });
         return ok({ id: r.id, text: r.text.substring(0, 100), type: r.type, memType: r.memType, category: r.category });
     }
     catch (e) {
@@ -249,7 +255,7 @@ register('memory_save', 'harness', 'Store a new memory or update existing one by
     }
 });
 register('memory_delete', 'harness', 'Soft-delete a memory by ID.', { id: z.string().describe('Memory ID to delete'), project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') }, async (args) => {
-    const ok_ = forgetMemory(args.id, args.project);
+    const ok_ = forgetMemory(args.id, args.project, CHAR_ID);
     return ok({ deleted: ok_ });
 });
 register('memory_update', 'harness', 'Update memory fields (text, category, tags, importance, etc.).', {
@@ -263,7 +269,7 @@ register('memory_update', 'harness', 'Update memory fields (text, category, tags
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
-        const r = await updateMemory(args.id, args);
+        const r = await updateMemory(args.id, args, CHAR_ID);
         return ok(r ? { updated: true, id: r.id, memType: r.mem_type || 'general' } : { updated: false, error: 'not found' });
     }
     catch (e) {
@@ -292,7 +298,7 @@ register('memory_log', 'harness', 'Log a cognitive entry (decision/pattern/mista
         const r = await saveMemory({
             text: args.text, project: args.project, type: conf.type, category: conf.category,
             tags: conf.tags, importance: conf.importance, tier: conf.tier,
-            source: 'agent_log', characterId: charFor(args.project),
+            source: 'agent_log', characterId: CHAR_ID,
         });
         return ok({ id: r.id, kind, category: conf.category, tier: conf.tier });
     }
@@ -309,11 +315,11 @@ register('auto_process', 'harness', '[Internal] Process a conversation turn: sav
     moodValue: z.number().min(-10).max(10).optional(),
     moodReason: z.string().optional(),
     sessionId: z.string().optional().describe('Session identifier for progressive in-session reflection (rolls session memory, promotes long-term facts). Omit to keep the legacy behavior (no session buffer).'),
-    characterId: z.string().optional().describe('AI persona charId (optional; defaults to the persona resolved from project, falling back to CHAR_ID). Explicit value takes priority.'),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
-        const cid = args.characterId || charFor(args.project);
+        // v1.24: 角色由进程级 CHAR_ID 决定,不再接受调用方指定的 characterId(防跨角色伪造写入)
+        const cid = CHAR_ID;
         const r = await autoProcess({ userMessage: args.userMessage, assistantMessage: args.assistantMessage, characterId: cid, moodValue: args.moodValue, moodReason: args.moodReason, sessionId: args.sessionId, project: args.project });
         // Trigger event-driven digest
         maybeDigest(cid, args.project)?.catch(() => { });
@@ -326,7 +332,7 @@ register('auto_process', 'harness', '[Internal] Process a conversation turn: sav
 register('digest_run', 'harness', '[Internal] Run the digest cycle: flush VAD queue, cleanup expired memories, restore lost critical memories.', { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') }, async (args) => {
     try {
         flushAllBuffers(); // 周期兜底:强制 flush 所有会话 buffer(补漏未达阈值的尾部消息)
-        const r = await runDigest(charFor(args.project), args.project);
+        const r = await runDigest(CHAR_ID, args.project);
         return ok(r);
     }
     catch (e) {
@@ -341,7 +347,7 @@ register('conversation_save', 'harness', '[Internal] Save a raw conversation tur
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
-        const r = await saveConversationTurn(args.userMessage, args.assistantMessage, charFor(args.project), args.moodValue, args.moodReason, args.project);
+        const r = await saveConversationTurn(args.userMessage, args.assistantMessage, CHAR_ID, args.moodValue, args.moodReason, args.project);
         return ok(r);
     }
     catch (e) {
@@ -354,17 +360,17 @@ register('conversation_save', 'harness', '[Internal] Save a raw conversation tur
 register('context_get', 'admin', 'Get agent state (mood/energy/desire), bias layer, user profile, and memory context summary for prompt injection.', { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') }, async (args) => {
     try {
         const proj = normalizeProject(args.project);
-        const p = getPersona(args.project);
-        const state = getAgentState(charFor(args.project), args.project);
-        const bias = getBiasPrompt(charFor(args.project), args.project);
-        const profile = getUserProfilePrompt(charFor(args.project), 'default', args.project);
-        const recent = getRecentMemories(charFor(args.project), 5, 24, proj);
-        // memdir 分库:总数跨 user/feedback/project/reference/general 聚合
-        const total = DatabaseManager.queryAll(args.project, 'SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?', [proj])
+        const p = getPersona();
+        const state = getAgentState(CHAR_ID, args.project);
+        const bias = getBiasPrompt(CHAR_ID, args.project);
+        const profile = getUserProfilePrompt(CHAR_ID, 'default', args.project);
+        const recent = getRecentMemories(CHAR_ID, 5, 24, proj);
+        // memdir 分库:总数跨 user/feedback/project/reference/general 聚合(v1.24: 只数本角色)
+        const total = DatabaseManager.queryAll(args.project, 'SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=?', [proj, CHAR_ID])
             .reduce((n, r) => n + (r.c || 0), 0);
         return ok({
             op: 'context',
-            state: roleDeclaration(args.project) + '\n' + state.toPromptString(),
+            state: roleDeclaration() + '\n' + state.toPromptString(),
             persona: { charId: p.charId, name: p.name, persona: p.persona },
             bias,
             profile,
@@ -403,44 +409,45 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         const relatedLimit = clampInt(args.relatedLimit ?? 5, 5, 1, 50);
         const proj = normalizeProject(args.project);
         // 1. 近期重要记忆
-        const recent = getRecentMemories(charFor(args.project), recentLimit, hoursBack, proj);
+        const recent = getRecentMemories(CHAR_ID, recentLimit, hoursBack, proj);
         // 2. 与当前任务相关的记忆(向量搜索)
         let related = [];
         if (args.query) {
-            const r = await searchMemory({ query: args.query, topK: relatedLimit, profile: 'balanced', characterId: charFor(args.project), project: proj });
+            const r = await searchMemory({ query: args.query, topK: relatedLimit, profile: 'balanced', characterId: CHAR_ID, project: proj });
             related = r.map(m => ({ id: m.id, text: m.text, category: m.category, importance: m.importance, score: m.score, createdAt: m.createdAt, parentId: m.parentId || null }));
         }
         // 2.5 v1.23 Parent-Child 原文回捞：命中的是提炼记忆(leaf)，按 parent_id 取对话原文。
         //     策略照 llama_index AutoMergingRetriever：同父命中比例 > 50% 或 parent 短 → 整段；
         //     否则按 leaf 正文锚点截窗口（pre-400/post-800），总预算 3k 字符 / 最多 3 个 parent。
         const hydrated = related.length > 0
-            ? hydrateParentExcerpts(proj, related, { budget: 3000, maxParents: 3 })
+            ? hydrateParentExcerpts(proj, related, { budget: 3000, maxParents: 3, characterId: CHAR_ID })
             : [];
         // 3. 认知记录(决策/错误/模式)—— 跨分类库聚合(decision/mistake 可能落在 project 库)
         const cognitives = DatabaseManager.queryAll(proj, `
         SELECT text, category, importance, created_at FROM memory
-        WHERE is_active = 1 AND project = ?
+        WHERE is_active = 1 AND project = ? AND character_id = ?
           AND (category IN ('decision','mistake') OR tags LIKE '%pattern%')
         ORDER BY created_at DESC LIMIT 9
-      `, [proj]).sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))).slice(0, 9);
+      `, [proj, CHAR_ID]).sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))).slice(0, 9);
         // 4. 关键事实(高置信度)
         // v1.23.1: 只注入当前有效事实；被新值推翻的旧事实保留在库里（valid_to 有值）但不再进 prompt
+        // v1.24: 角色隔离 — 只注入本角色事实
         const facts = db.prepare(`
         SELECT subject, predicate, object, confidence FROM facts
-        WHERE is_active = 1 AND project = ? AND confidence >= 0.7
+        WHERE is_active = 1 AND project = ? AND character_id = ? AND confidence >= 0.7
           AND (valid_to IS NULL OR valid_to = '')
         ORDER BY confidence DESC, created_at DESC LIMIT 5
-      `).all(proj);
+      `).all(proj, CHAR_ID);
         // 4.5 记忆索引层(4 种封闭类型,轻量摘要 — 对应 Claude Code MEMORY.md,先索引后详情)
         //     这 4 类各自独立成库,必须跨库聚合;只读 general 会恒空。
         const indexRows = DatabaseManager.queryAll(proj, `
         SELECT id, mem_type, substr(text, 1, 150) AS summary, length(text) AS full_len, updated_at
         FROM memory
-        WHERE is_active = 1 AND project = ?
+        WHERE is_active = 1 AND project = ? AND character_id = ?
           AND mem_type IN ('user','feedback','project','reference')
         ORDER BY updated_at DESC
         LIMIT 10
-      `, [proj]).sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || ''))).slice(0, 10);
+      `, [proj, CHAR_ID]).sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || ''))).slice(0, 10);
         const indexLayer = indexRows.map((row) => {
             const s = row.summary || '';
             return {
@@ -452,13 +459,13 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         // 0. 三层指令记忆(全局→用户→项目;拼接顺序 L1→L2→L3,L3 在 Prompt 末尾约束最高)
         //    path 可选:对带 paths 的指令做 glob 过滤
         const instructions = getInstruction(proj, args.path);
-        // memdir 分库:统计跨全部分类库
-        const total = DatabaseManager.queryAll(proj, 'SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?', [proj])
+        // memdir 分库:统计跨全部分类库(v1.24: 只统计本角色)
+        const total = DatabaseManager.queryAll(proj, 'SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=?', [proj, CHAR_ID])
             .reduce((n, r) => n + (r.c || 0), 0);
         const stats = { c: total };
         // 5. Ground Truth 提示词组装(人格声明在最前,指令分节次之)
         const sections = [];
-        sections.push(roleDeclaration(args.project));
+        sections.push(roleDeclaration());
         if (instructions.length > 0) {
             const lines = instructions.map(i => {
                 const base = i.scope === 'global' ? '[全局]' : i.scope === 'user' ? '[用户]' : '[项目]';
@@ -471,9 +478,9 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         if (args.sessionId) {
             const sess = db.prepare(`
           SELECT text FROM memory
-          WHERE is_active = 1 AND project = ? AND session_id = ? AND source = 'session_memory'
+          WHERE is_active = 1 AND project = ? AND session_id = ? AND source = 'session_memory' AND character_id = ?
           ORDER BY updated_at DESC LIMIT 1
-        `).get(proj, args.sessionId);
+        `).get(proj, args.sessionId, CHAR_ID);
             if (sess?.text) {
                 sections.push(`\n■ 会话滚动状态(会话 ${args.sessionId},以此为准,勿重复询问):`);
                 sections.push(sess.text);
@@ -549,21 +556,21 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
 register('stats_get', 'admin', 'Get memory system statistics: total count, by category, by source.', { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') }, async (args) => {
     try {
         const proj = normalizeProject(args.project);
-        // memdir:聚合项目全部分类库统计
+        // memdir:聚合项目全部分类库统计(v1.24: 只统计本角色)
         let total = 0;
         const byCategory = {};
         const bySource = {};
         const byMemType = {};
         for (const mt of listMemTypeDirs(proj)) {
             const db = DatabaseManager.getInstance(proj, mt);
-            total += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=?').get(proj).c;
-            for (const r of db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? GROUP BY category').all(proj)) {
+            total += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=?').get(proj, CHAR_ID).c;
+            for (const r of db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? GROUP BY category').all(proj, CHAR_ID)) {
                 byCategory[r.category] = (byCategory[r.category] || 0) + r.c;
             }
-            for (const r of db.prepare('SELECT source,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? GROUP BY source').all(proj)) {
+            for (const r of db.prepare('SELECT source,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? GROUP BY source').all(proj, CHAR_ID)) {
                 bySource[r.source] = (bySource[r.source] || 0) + r.c;
             }
-            for (const r of db.prepare('SELECT mem_type,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? GROUP BY mem_type').all(proj)) {
+            for (const r of db.prepare('SELECT mem_type,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? GROUP BY mem_type').all(proj, CHAR_ID)) {
                 byMemType[r.mem_type] = (byMemType[r.mem_type] || 0) + r.c;
             }
         }
@@ -590,7 +597,7 @@ register('user_observe', 'harness', '[Internal] Observe a user message for commu
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
-        observeUserMessage(charFor(args.project), 'default', args.message, args.project);
+        observeUserMessage(CHAR_ID, 'default', args.message, args.project);
         return ok({ observed: true });
     }
     catch (e) {
@@ -607,14 +614,14 @@ register('mood_journal', 'admin', 'Get mood history for the past N days.', {
         // omitted project into listMemTypeDirs used to reach safeFilePart(undefined)
         // and made the default mood journal fail instead of returning history.
         const dbs = listMemTypeDirs(proj).map(mt => DatabaseManager.getInstance(proj, mt));
-        const p = getPersona(args.project);
+        const p = getPersona();
         const since = new Date(Date.now() - (args.days || 7) * 86400000).toISOString();
         return ok({
             op: 'mood_journal',
             days: args.days,
             project: proj,
             persona: { charId: p.charId, name: p.name, persona: p.persona },
-            moods: dbs.flatMap(db => db.prepare("SELECT emotional_impact as value, created_at, text, category FROM memory WHERE is_active=1 AND project=? AND (category='emotional' OR category='mood_snapshot' OR tier='temporary') AND created_at>? ORDER BY created_at DESC LIMIT 30").all(proj, since)).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 30),
+            moods: dbs.flatMap(db => db.prepare("SELECT emotional_impact as value, created_at, text, category FROM memory WHERE is_active=1 AND project=? AND character_id=? AND (category='emotional' OR category='mood_snapshot' OR tier='temporary') AND created_at>? ORDER BY created_at DESC LIMIT 30").all(proj, CHAR_ID, since)).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 30),
         });
     }
     catch (e) {
@@ -632,7 +639,7 @@ register('memory_list', 'admin', 'List active memories, optionally filtered. Adm
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
-        const memories = getAllMemories(charFor(args.project), args.limit, args.project);
+        const memories = getAllMemories(CHAR_ID, args.limit, args.project);
         let filtered = memories;
         if (args.category)
             filtered = filtered.filter((m) => m.category === args.category);
@@ -665,13 +672,13 @@ register('memory_get', 'agent', 'Get one memory by ID with full text. Use to exp
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
-        // memdir:按 id 遍历项目分类库定位
+        // memdir:按 id 遍历项目分类库定位(v1.24: 只认本角色的记忆,跨角色 id 一律 not found)
         const proj = normalizeProject(args.project);
         let db = null;
         let row = null;
         for (const mt of listMemTypeDirs(proj)) {
             const d = DatabaseManager.getInstance(proj, mt);
-            const r = d.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(args.id);
+            const r = d.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1 AND character_id = ?').get(args.id, CHAR_ID);
             if (r) {
                 db = d;
                 row = r;
@@ -692,7 +699,7 @@ register('memory_get', 'agent', 'Get one memory by ID with full text. Use to exp
                 type: row.type,
                 memType: row.mem_type || 'general',
                 category: row.category,
-                tags: JSON.parse(row.tags || '[]'),
+                tags: parseTagsSafe(row.tags),
                 importance: row.importance,
                 tier: row.tier,
                 source: row.source,
@@ -711,17 +718,121 @@ register('memory_get', 'agent', 'Get one memory by ID with full text. Use to exp
         return err(e.message, 'GET_FAILED');
     }
 });
-register('memory_graph', 'agent', 'Get the memory relationship graph. Neighborhood only: nodes capped by limit (default 50), edges kept only between returned nodes.', { limit: z.number().max(200).optional().default(50).describe('Max nodes (default 50)'),
+register('memory_graph', 'agent', 'Get the memory relationship graph. Neighborhood only: nodes capped by limit (default 50). via=memory 只给记忆↔记忆边;via=entity 追加实体节点/记忆↔实体/实体↔实体共现边;via=both(默认)全给。depth=实体扩散跳数(1-3)。', { limit: z.number().max(200).optional().default(50).describe('Max nodes (default 50)'),
+    depth: z.number().min(1).max(3).optional().default(1).describe('实体层扩散跳数(1-3,v1.27;仅 via 含 entity 时生效)'),
+    via: z.enum(['memory', 'entity', 'both']).optional().default('both').describe('memory=仅记忆关系图(旧行为);entity=加实体层;both=默认'),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') }, async (args) => {
     try {
-        const g = getMemoryGraph(charFor(args.project), args.project);
+        const g = getMemoryGraph(CHAR_ID, args.project);
         const limit = args.limit ?? 50;
-        const nodes = g.nodes.slice(0, limit);
+        const via = args.via ?? 'both';
+        const depth = args.depth ?? 1;
+        const nodes = g.nodes.slice(0, limit).map((n) => ({ ...n, type: 'memory' }));
         const nodeIds = new Set(nodes.map((n) => n.id));
-        const edges = g.edges.filter((e) => nodeIds.has(e.sourceId) && nodeIds.has(e.targetId));
+        const edges = g.edges
+            .filter((e) => nodeIds.has(e.sourceId) && nodeIds.has(e.targetId))
+            .map((e) => ({ ...e, kind: 'memory' }));
+        let entityCount = 0;
+        if (via !== 'memory') {
+            try {
+                // v1.27: 记忆图是跨 memType 聚合的(listAllMemories 会扫 project 下所有分类库),
+                // 所以实体切片也必须逐库做 —— 否则只查 general 库,别的分类库里的节点永远匹配不到实体。
+                const seenEntities = new Set();
+                const memTypes = listMemTypeDirs(normalizeProject(args.project));
+                for (const mt of (memTypes.length ? memTypes : ['general'])) {
+                    let db;
+                    try {
+                        db = DatabaseManager.getInstance(args.project, mt);
+                    }
+                    catch {
+                        continue;
+                    }
+                    const slice = entityGraphSlice(db, [...nodeIds], limit);
+                    for (const e of slice.entities) {
+                        if (nodes.length >= limit * 2)
+                            break;
+                        if (seenEntities.has(e.id))
+                            continue;
+                        seenEntities.add(e.id);
+                        nodes.push({ id: e.id, type: 'entity', label: e.name, key: e.key, kind: e.kind, mentionCount: e.mention_count });
+                        entityCount++;
+                    }
+                    for (const me of slice.memoryEntityEdges)
+                        edges.push({ id: `${me.sourceId}~${me.targetId}`, sourceId: me.sourceId, targetId: me.targetId, relationType: 'mentions', kind: 'memory-entity' });
+                    for (const ee of slice.entityEntityEdges)
+                        edges.push({ id: `${ee.sourceId}~${ee.targetId}`, sourceId: ee.sourceId, targetId: ee.targetId, relationType: 'co_occurs', kind: 'entity-entity' });
+                }
+                // 兜底:本次节点集完全没有实体关联时(线上常见:按 importance 取的记忆里没有 facts),
+                // 用"最近产出过事实的记忆"补一批种子,否则真实库上这张图永远是空的。
+                if (entityCount === 0) {
+                    for (const mt of (memTypes.length ? memTypes : ['general'])) {
+                        if (entityCount > 0)
+                            break;
+                        let db;
+                        try {
+                            db = DatabaseManager.getInstance(args.project, mt);
+                        }
+                        catch {
+                            continue;
+                        }
+                        try {
+                            const seeds = db.prepare(`SELECT DISTINCT me.memory_id AS id FROM memory_entities me
+                  JOIN entities e ON e.id = me.entity_id
+                  LEFT JOIN memory m ON m.id = me.memory_id
+                  WHERE COALESCE(e.kind, 'topic') NOT IN ('url', 'path', 'config', 'number')
+                  ORDER BY COALESCE(m.created_at, '') DESC LIMIT ?`).all(limit).map(r => r.id);
+                            if (!seeds.length)
+                                continue;
+                            const slice = entityGraphSlice(db, seeds, limit);
+                            for (const e of slice.entities) {
+                                if (nodes.length >= limit * 2)
+                                    break;
+                                if (seenEntities.has(e.id))
+                                    continue;
+                                seenEntities.add(e.id);
+                                nodes.push({ id: e.id, type: 'entity', label: e.name, key: e.key, kind: e.kind, mentionCount: e.mention_count, seeded: true });
+                                entityCount++;
+                            }
+                            for (const me of slice.memoryEntityEdges)
+                                edges.push({ id: `${me.sourceId}~${me.targetId}`, sourceId: me.sourceId, targetId: me.targetId, relationType: 'mentions', kind: 'memory-entity' });
+                        }
+                        catch { /* 单库失败继续 */ }
+                    }
+                }
+                // depth>1:把实体的邻居实体也拉进来(变长路径,SQL 递归 CTE)
+                if (depth > 1) {
+                    const extra = new Map();
+                    for (const mt of (memTypes.length ? memTypes : ['general'])) {
+                        let db;
+                        try {
+                            db = DatabaseManager.getInstance(args.project, mt);
+                        }
+                        catch {
+                            continue;
+                        }
+                        for (const entityId of seenEntities) {
+                            const expanded = expandEntityGraph(db, String(entityId), depth, limit);
+                            for (const e of expanded.entities)
+                                if (!seenEntities.has(e.id) && !extra.has(e.id))
+                                    extra.set(e.id, e);
+                        }
+                    }
+                    for (const e of extra.values()) {
+                        if (nodes.length >= limit * 2 + limit)
+                            break;
+                        nodes.push({ id: e.id, type: 'entity', label: e.name, key: e.key, kind: e.kind, mentionCount: e.mention_count, depth: e.depth });
+                        entityCount++;
+                    }
+                }
+            }
+            catch { /* 实体层未迁移时退回纯记忆图 */ }
+        }
         return ok({
             op: 'graph',
             count: nodes.length,
+            entityCount,
+            via,
+            depth,
             nodes,
             edges,
             truncated: g.nodes.length > limit,
@@ -732,6 +843,58 @@ register('memory_graph', 'agent', 'Get the memory relationship graph. Neighborho
         return err(e.message, 'GRAPH_FAILED');
     }
 });
+register('entity_lookup', 'entity', '按实体名查记忆:归一化匹配实体 → 当前有效事实 + 相关记忆(1 跳)。等价于图数据库里的 (Entity)-[:MENTIONED_IN]->(Fact)->(Memory),但只需要一次 JOIN。', {
+    name: z.string().min(1).describe('实体名/关键词(如 "猫"、"张三"、"Rust")'),
+    at: z.string().optional().describe('时间点(ISO 字符串),返回该时刻有效的的历史事实;省略=现在'),
+    limit: z.number().min(1).max(50).optional().default(20),
+    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+    includeGraph: z.boolean().optional().default(false).describe('是否附带 1 跳实体邻居(共现实体)'),
+}, async (args) => {
+    try {
+        const db = DatabaseManager.getInstance(args.project);
+        const candidates = findEntities(db, args.name, 5);
+        if (candidates.length === 0)
+            return ok({ op: 'entity_lookup', query: args.name, found: false, candidates: [], facts: [], memories: [], hint: '实体层里没有匹配;可能是历史数据尚未回填,或用词不同' });
+        const entity = candidates[0];
+        const facts = entityFacts(db, entity.id, args.at, args.limit);
+        const memories = entityMemories(db, entity.id, args.limit);
+        const graph = args.includeGraph ? expandEntityGraph(db, entity.id, 1, args.limit) : null;
+        return ok({
+            op: 'entity_lookup', query: args.name, found: true,
+            entity: { id: entity.id, key: entity.key, name: entity.name, mentionCount: entity.mention_count, kind: entity.kind },
+            otherCandidates: candidates.slice(1).map((c) => ({ id: c.id, key: c.key, mentionCount: c.mention_count })),
+            at: args.at ?? null,
+            facts, memories,
+            neighborEntities: graph ? graph.entities : undefined,
+            counts: { facts: facts.length, memories: memories.length },
+        });
+    }
+    catch (e) {
+        return err(e.message, 'ENTITY_LOOKUP_FAILED');
+    }
+});
+register('facts_conflicts_report', 'entity', '事实健康度报告:被推翻的历史事实(valid_to 非空)+ 同一主体同一谓词下的当前多值(潜在矛盾)。用来确认"时间失效"路径真的在跑。', {
+    limit: z.number().min(1).max(200).optional().default(50),
+    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+}, async (args) => {
+    try {
+        const db = DatabaseManager.getInstance(args.project);
+        const report = conflictsReport(db, args.limit ?? 50);
+        const stats = entityStats(db);
+        return ok({
+            op: 'facts_conflicts_report',
+            invalidatedCount: report.invalidated.length,
+            multiValuedCount: report.multiValued.length,
+            invalidated: report.invalidated,
+            multiValued: report.multiValued,
+            entityStats: stats,
+            hint: report.invalidated.length === 0 ? '没有任何事实被推翻过 —— 要么还没出现功能性关系的新值,要么失效路径没被触发' : undefined,
+        });
+    }
+    catch (e) {
+        return err(e.message, 'CONFLICTS_REPORT_FAILED');
+    }
+});
 register('memory_recent', 'agent', 'Get recent important memories (no vector search, just time+importance).', {
     limit: z.number().optional().default(5),
     hoursBack: z.number().optional().default(24),
@@ -739,7 +902,7 @@ register('memory_recent', 'agent', 'Get recent important memories (no vector sea
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
-        const r = getRecentMemories(charFor(args.project), args.limit, args.hoursBack, args.project, args.memType);
+        const r = getRecentMemories(CHAR_ID, args.limit, args.hoursBack, args.project, args.memType);
         return ok({
             op: 'recent',
             count: r.length,
@@ -767,8 +930,8 @@ register('memory_index', 'agent', 'Lightweight memory index (corresponds to Clau
     try {
         const proj = normalizeProject(args.project);
         const limit = Math.min(args.limit ?? 20, 100);
-        const conds = ['is_active = 1', 'project = ?'];
-        const params = [proj];
+        const conds = ['is_active = 1', 'project = ?', 'character_id = ?'];
+        const params = [proj, CHAR_ID];
         if (args.memType) {
             conds.push('mem_type = ?');
             params.push(args.memType);
@@ -805,7 +968,7 @@ register('recent_conversations', 'admin', 'Get recent conversation log entries.'
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
-        const r = getRecentConversations(charFor(args.project), args.hoursBack, args.limit, args.project);
+        const r = getRecentConversations(CHAR_ID, args.hoursBack, args.limit, args.project);
         return ok({ count: r.length, results: r });
     }
     catch (e) {
@@ -818,7 +981,7 @@ register('recent_conversations', 'admin', 'Get recent conversation log entries.'
 register('reflect_analyze', 'admin', 'Get unanalyzed conversations bundled with system prompt for a big LLM to perform reflection.', { limit: z.number().optional().default(30),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') }, async (args) => {
     try {
-        const conversations = getUnanalyzedConversations(charFor(args.project), undefined, args.limit ?? 30, args.project);
+        const conversations = getUnanalyzedConversations(CHAR_ID, undefined, args.limit ?? 30, args.project);
         const prompt = JSON.stringify(conversations);
         return ok({
             conversationCount: conversations.length,
@@ -845,7 +1008,7 @@ register('reflect_apply', 'admin', 'Apply reflection results (merge, extract, re
             const m = args.actions.match(/```(?:json)?\s*([\s\S]*?)```/);
             parsed = m ? JSON.parse(m[1]) : JSON.parse(args.actions);
         }
-        const r = await reflect(args.action, { actions: parsed, project: args.project, characterId: charFor(args.project) });
+        const r = await reflect(args.action, { actions: parsed, project: args.project, characterId: CHAR_ID });
         return ok(r);
     }
     catch (e) {
@@ -859,8 +1022,8 @@ register('reflect_auto', 'harness', 'Run automatic reflection: feed unanalyzed c
 }, async (args) => {
     try {
         const r = args.mode === 'deep'
-            ? await runDeepReflect(charFor(args.project), args.limit ?? 500, args.project)
-            : await runAutoReflect(charFor(args.project), args.limit ?? 30, args.project);
+            ? await runDeepReflect(CHAR_ID, args.limit ?? 500, args.project)
+            : await runAutoReflect(CHAR_ID, args.limit ?? 30, args.project);
         return ok({ op: args.mode === 'deep' ? 'reflect_deep' : 'reflect_auto', ...r });
     }
     catch (e) {
@@ -870,7 +1033,7 @@ register('reflect_auto', 'harness', 'Run automatic reflection: feed unanalyzed c
 register('reflect_deep', 'harness', '[Legacy] Deep calibration. Use reflect_auto(mode="deep") instead.', { limit: z.number().optional().default(500),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') }, async (args) => {
     try {
-        const r = await runDeepReflect(charFor(args.project), args.limit ?? 500, args.project);
+        const r = await runDeepReflect(CHAR_ID, args.limit ?? 500, args.project);
         return ok({ op: 'reflect_deep', ...r });
     }
     catch (e) {
@@ -880,7 +1043,7 @@ register('reflect_deep', 'harness', '[Legacy] Deep calibration. Use reflect_auto
 register('reflect_batch_embed', 'harness', '[Internal] Batch embed all pending (un-embedded) memories. Called after reflect. characterId="any" embeds across all roles (e.g. reflect library).', { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
     characterId: z.string().optional().describe('Character id filter (default CHAR_ID; "any" = no filter, e.g. for reflect library)') }, async (args) => {
     try {
-        const r = await batchEmbedPending(args.characterId ?? charFor(args.project), args.project);
+        const r = await batchEmbedPending(args.characterId ?? CHAR_ID, args.project);
         return ok(r);
     }
     catch (e) {
@@ -898,7 +1061,7 @@ register('consolidate_deep', 'admin', 'Run memory consolidation: vector pre-scre
 }, async (args) => {
     try {
         // 手动/工具调用 = 显式意图,绕过"最小间隔"闸门(启动自动整合才受限)
-        const r = await runConsolidate(charFor(args.project), args.project, args.threshold, args.limit, { force: true });
+        const r = await runConsolidate(CHAR_ID, args.project, args.threshold, args.limit, { force: true });
         return ok({ op: 'consolidate_deep', ...r });
     }
     catch (e) {
@@ -914,8 +1077,8 @@ register('daily_summary_data', 'admin', 'Get conversation and auto-process data 
         const db = DatabaseManager.getInstance(args.project);
         const since = new Date(Date.now() - (args.hoursBack || 24) * 3600000).toISOString();
         const proj = normalizeProject(args.project);
-        const convs = db.prepare("SELECT text FROM memory WHERE is_active=1 AND source='conversation_log' AND project=? AND created_at>? ORDER BY created_at ASC LIMIT 100").all(proj, since).map((r) => r.text);
-        const aps = db.prepare("SELECT text FROM memory WHERE is_active=1 AND source='auto_process' AND project=? AND created_at>? ORDER BY created_at ASC LIMIT 50").all(proj, since).map((r) => r.text);
+        const convs = db.prepare("SELECT text FROM memory WHERE is_active=1 AND source='conversation_log' AND project=? AND character_id=? AND created_at>? ORDER BY created_at ASC LIMIT 100").all(proj, CHAR_ID, since).map((r) => r.text);
+        const aps = db.prepare("SELECT text FROM memory WHERE is_active=1 AND source='auto_process' AND project=? AND character_id=? AND created_at>? ORDER BY created_at ASC LIMIT 50").all(proj, CHAR_ID, since).map((r) => r.text);
         return ok({ conversations: [...convs, ...aps] });
     }
     catch (e) {
@@ -929,12 +1092,12 @@ register('project_list', 'admin', 'List all project namespaces and their memory/
             const db = DatabaseManager.getInstance();
             const mem = db.prepare(`
           SELECT project, COUNT(*) as c FROM memory
-          WHERE is_active = 1 GROUP BY project ORDER BY c DESC
-        `).all();
+          WHERE is_active = 1 AND character_id = ? GROUP BY project ORDER BY c DESC
+        `).all(CHAR_ID);
             const facts = db.prepare(`
           SELECT project, COUNT(*) as c FROM facts
-          WHERE is_active = 1 GROUP BY project ORDER BY c DESC
-        `).all();
+          WHERE is_active = 1 AND character_id = ? GROUP BY project ORDER BY c DESC
+        `).all(CHAR_ID);
             const byId = {};
             for (const r of mem)
                 byId[r.project || 'default'] = { project: r.project || 'default', memories: r.c, facts: 0 };
@@ -965,14 +1128,14 @@ register('project_list', 'admin', 'List all project namespaces and their memory/
         const projects = [];
         for (const name of listProjectNames()) {
             try {
-                // memdir:聚合项目全部分类库统计
+                // memdir:聚合项目全部分类库统计(v1.24: 只统计本角色)
                 let mem = 0;
                 let facts = 0;
                 for (const mt of listMemTypeDirs(name)) {
                     const db = DatabaseManager.getInstance(name, mt);
-                    mem += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1').get().c;
+                    mem += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=?').get(CHAR_ID).c;
                     try {
-                        facts += db.prepare('SELECT COUNT(*) as c FROM facts WHERE is_active=1').get().c;
+                        facts += db.prepare('SELECT COUNT(*) as c FROM facts WHERE is_active=1 AND character_id=?').get(CHAR_ID).c;
                     }
                     catch { }
                 }
@@ -1124,6 +1287,182 @@ register('instruction_delete', 'admin', 'Delete one instruction layer. scope=pro
     }
 });
 // ═══════════════════════════════════════════════════════════════════
+// v1.26 前端存储桥 — 给 AIRI 这类「每个角色一套记忆」的客户端当持久层
+//   角色 = memory.character_id;不传 characterId 回落到本进程 CHAR_ID
+//   general=true 表示所有角色共享(character_id 写空串)
+//   文本约定:第一行 `# <name>` 是索引名,第二行是用途说明,空行之后是正文
+//   source='airi' 标记写入方,方便和引擎自己产生的记忆区分
+// ═══════════════════════════════════════════════════════════════════
+const STORE_SOURCE = 'airi';
+const STORE_NAME_RE = /^#\s+([^\n]+)\n?/;
+/** 拆出「索引名 / 用途说明 / 正文」。没有约定的头(引擎自己写的记忆)返回 name=null。 */
+function parseStoreText(text) {
+    const m = STORE_NAME_RE.exec(text);
+    if (!m)
+        return { name: null, description: '', body: text };
+    const rest = text.slice(m[0].length);
+    const nl = rest.indexOf('\n');
+    const description = (nl === -1 ? rest : rest.slice(0, nl)).trim();
+    const body = nl === -1 ? '' : rest.slice(nl + 1).replace(/^\n/, '');
+    return { name: m[1].trim(), description, body };
+}
+/** characterId 归一:general 优先,否则显式 id,最后回落本进程角色。 */
+function storeCharacterId(args) {
+    if (args.general)
+        return '';
+    return (args.characterId ?? '').trim() || CHAR_ID;
+}
+function readStoreRows(project, characterId, includeGeneral, limit, opts = {}) {
+    const proj = normalizeProject(project ?? PROJECT_ID);
+    const cap = Math.max(1, Math.min(Math.trunc(limit) || 500, 2000));
+    const conditions = ['is_active = 1'];
+    const params = [];
+    if (opts.allCharacters) {
+        // 前端要重建自己那份缓存:只按 source 圈定写入方,不再按角色过滤
+    }
+    else if (characterId === '') {
+        conditions.push("(character_id IS NULL OR character_id = '')");
+    }
+    else if (includeGeneral) {
+        conditions.push("(character_id = ? OR character_id IS NULL OR character_id = '')");
+        params.push(characterId);
+    }
+    else {
+        conditions.push('character_id = ?');
+        params.push(characterId);
+    }
+    if (opts.source) {
+        conditions.push('source = ?');
+        params.push(opts.source);
+    }
+    const rows = [];
+    for (const mt of listMemTypeDirs(proj)) {
+        try {
+            const db = DatabaseManager.getInstance(proj, mt);
+            const found = db.prepare(`
+        SELECT id, text, character_id, mem_type, tags, importance, source, created_at, updated_at
+        FROM memory WHERE ${conditions.join(' AND ')}
+        ORDER BY COALESCE(updated_at, created_at) DESC LIMIT ?
+      `).all(...params, cap);
+            for (const r of found)
+                rows.push({ ...r, mem_type: r.mem_type || mt });
+        }
+        catch { /* 单个分类库损坏不阻断 */ }
+    }
+    rows.sort((a, b) => String(b.updated_at || b.created_at).localeCompare(String(a.updated_at || a.created_at)));
+    return { project: proj, rows: rows.slice(0, cap) };
+}
+/** 把一行 memory 变成前端能直接用的结构。 */
+function toStoreRecord(row) {
+    const parsed = parseStoreText(String(row.text ?? ''));
+    const charId = row.character_id ?? null;
+    return {
+        id: row.id,
+        ...parsed,
+        // 没有约定头的记录给一个稳定可寻址的名字,避免前端出现空名
+        fallbackName: parsed.name ? undefined : `mem-${String(row.id).slice(0, 8)}`,
+        characterId: charId ?? '',
+        general: !charId,
+        memType: row.mem_type || 'general',
+        source: row.source ?? '',
+        tags: parseTagsSafe(row.tags),
+        importance: row.importance,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at ?? row.created_at,
+    };
+}
+register('memory_store_list', 'store', 'List a frontend store with full text: rows owned by characterId, plus shared rows when includeGeneral. No truncation, so a client can rebuild its whole index.', {
+    characterId: z.string().optional().describe('Character/role id owning the memories (default: process CHAR_ID)'),
+    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+    includeGeneral: z.boolean().optional().describe('Also return memories shared by every role (default true)'),
+    allCharacters: z.boolean().optional().describe('Ignore the role filter and return every role (a client rebuilding its own cache wants this)'),
+    source: z.string().optional().describe('Only rows written by this source (e.g. "airi")'),
+    limit: z.number().optional().describe('Max rows (default 500, hard cap 2000)'),
+}, async (args) => {
+    try {
+        const charId = storeCharacterId(args);
+        const { project, rows } = readStoreRows(args.project, charId, args.includeGeneral !== false, args.limit ?? 500, { allCharacters: args.allCharacters, source: args.source });
+        return ok({
+            op: 'store_list',
+            project,
+            characterId: charId,
+            allCharacters: Boolean(args.allCharacters),
+            count: rows.length,
+            results: rows.map(toStoreRecord),
+        });
+    }
+    catch (e) {
+        return err(e.message, 'STORE_LIST_FAILED');
+    }
+});
+register('memory_store_save', 'store', 'Create or replace one frontend store entry, addressed by its index name inside (project, characterId). Keeps the engine pipeline (embedding, edges, decay) because it goes through memory_save.', {
+    name: z.string().min(1).describe('Kebab-case index name, unique inside the role scope'),
+    description: z.string().optional().describe('One-line index text shown next to the name'),
+    body: z.string().min(1).describe('Full text of the memory'),
+    characterId: z.string().optional().describe('Character/role id (default: process CHAR_ID)'),
+    general: z.boolean().optional().describe('Store as a memory shared by every role'),
+    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+    importance: z.number().optional().describe('Importance 0..1 (default 0.5)'),
+}, async (args) => {
+    try {
+        const charId = storeCharacterId(args);
+        const name = String(args.name).trim();
+        const description = (args.description ?? '').trim();
+        const body = String(args.body).trim();
+        if (!name || !body)
+            return err('name 和 body 不能为空', 'INVALID_STORE_ENTRY');
+        const text = description ? `# ${name}\n${description}\n\n${body}` : `# ${name}\n\n${body}`;
+        const { project, rows } = readStoreRows(args.project, charId, false, 2000);
+        const existing = rows.find(row => parseStoreText(String(row.text ?? '')).name === name);
+        let id;
+        let updated = false;
+        if (existing) {
+            const r = await updateMemory(String(existing.id), { text, project }, charId);
+            if (!r)
+                return err('已有同名记忆但更新失败', 'STORE_UPDATE_FAILED');
+            id = String(existing.id);
+            updated = true;
+        }
+        else {
+            const r = await saveMemory({
+                text,
+                project,
+                memType: 'general',
+                type: 'episodic',
+                source: STORE_SOURCE,
+                subject: 'self',
+                importance: args.importance ?? 0.5,
+                characterId: charId,
+            });
+            id = r.id;
+        }
+        return ok({ op: 'store_save', id, name, characterId: charId, general: !charId, updated, text });
+    }
+    catch (e) {
+        return err(e.message, 'STORE_SAVE_FAILED');
+    }
+});
+register('memory_store_forget', 'store', 'Forget one frontend store entry by its index name inside (project, characterId).', {
+    name: z.string().min(1).describe('Index name to forget'),
+    characterId: z.string().optional().describe('Character/role id (default: process CHAR_ID)'),
+    general: z.boolean().optional().describe('Forget a shared entry instead of this role\'s own'),
+    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+}, async (args) => {
+    try {
+        const charId = storeCharacterId(args);
+        const name = String(args.name).trim();
+        const { project, rows } = readStoreRows(args.project, charId, false, 2000);
+        const existing = rows.find(row => parseStoreText(String(row.text ?? '')).name === name);
+        if (!existing)
+            return ok({ op: 'store_forget', deleted: false, name, characterId: charId });
+        const deleted = forgetMemory(String(existing.id), project, charId);
+        return ok({ op: 'store_forget', deleted, id: existing.id, name, characterId: charId });
+    }
+    catch (e) {
+        return err(e.message, 'STORE_FORGET_FAILED');
+    }
+});
+// ═══════════════════════════════════════════════════════════════════
 // STARTUP
 // ═══════════════════════════════════════════════════════════════════
 async function main() {
@@ -1248,3 +1587,4 @@ async function main() {
     process.on('SIGTERM', () => { DatabaseManager.close(); process.exit(0); });
 }
 main();
+//# sourceMappingURL=index.js.map

@@ -18,7 +18,7 @@ import { DatabaseManager, listMemTypeDirs, currentMemDir } from './db.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { normalizeProject, isEmbedEnabled } from './env.js';
+import { normalizeProject, isEmbedEnabled, CHAR_ID } from './env.js';
 import { isMemType } from './memType.js';
 import { findSimilarCandidates, CONSOLIDATE_SIMILARITY, CONSOLIDATE_MAX_PAIRS } from './consolidate.js';
 import { getRecentConversations } from './digest.js';
@@ -83,7 +83,7 @@ export function isFactExtractionEnabled() {
  *   c. 未分析对话数 > REFLECT_MIN_UNANALYZED(默认 5)
  * 按 project 维度查询(默认项目用 charId + normalizeProject)。
  */
-export function shouldAutoReflect(charId = 'airi', project) {
+export function shouldAutoReflect(charId = CHAR_ID, project) {
     if (!isReflectConfigured()) {
         return { should: false, reason: 'REFLECT_LLM_API_KEY 未配置' };
     }
@@ -99,12 +99,12 @@ export function shouldAutoReflect(charId = 'airi', project) {
             return { should: false, reason: `上次反思失败${first}；退避中 ${(ageMs / 3600000).toFixed(1)}h < ${REFLECT_FAIL_BACKOFF_HOURS}h` };
         }
     }
-    // 最近一次反思时间(source='reflect_summary',按 project 过滤)
+    // 最近一次反思时间(source='reflect_summary',按 project + 角色过滤)
     const last = db.prepare(`
     SELECT created_at FROM memory
-    WHERE source = 'reflect_summary' AND project = ?
+    WHERE source = 'reflect_summary' AND project = ? AND character_id = ?
     ORDER BY created_at DESC LIMIT 1
-  `).get(proj);
+  `).get(proj, charId || CHAR_ID);
     const lastTime = last?.created_at ? new Date(last.created_at).getTime() : null;
     const hoursSince = lastTime === null
         ? Number.POSITIVE_INFINITY // 从未反思 → 视为超时,满足时间条件
@@ -124,10 +124,10 @@ export function shouldAutoReflect(charId = 'airi', project) {
  * v1.10: 启动自动整合条件检查 — active 记忆条数 > CONSOLIDATE_MIN_MEMORIES(默认 15)即达成。
  * 注意:整合只需记忆足够多,不依赖 REFLECT_LLM_API_KEY(无 key 时 runConsolidate 会报错跳过)。
  */
-export function shouldAutoConsolidate(project) {
+export function shouldAutoConsolidate(project, characterId = CHAR_ID) {
     const db = DatabaseManager.getInstance(project);
     const proj = normalizeProject(project);
-    const count = db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active = 1 AND project = ?').get(proj)?.c ?? 0;
+    const count = db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active = 1 AND project = ? AND character_id = ?').get(proj, characterId || CHAR_ID)?.c ?? 0;
     const min = CONSOLIDATE_MIN_MEMORIES;
     if (count > min)
         return { should: true, count, min, reason: `${count} > ${min}` };
@@ -437,7 +437,7 @@ function normalizeConsolidationActions(raw) {
  * - EMBED_MODE=none:预筛返回空 → LLM 全量扫兜底
  * - 有向量但无相似候选 → 直接返回空结果,不再调 LLM(省 token)
  */
-export async function runConsolidate(charId = 'default', project, threshold, limit, opts = {}) {
+export async function runConsolidate(charId = CHAR_ID, project, threshold, limit, opts = {}) {
     const base = { ok: false, scanned: 0, candidates: 0, merged: 0, deleted: 0, kept: 0, actions: 0, applied: 0, errors: [] };
     if (!isReflectConfigured()) {
         return { ...base, skipped: true, errors: ['REFLECT_LLM_API_KEY 未配置,跳过整合'] };
@@ -450,7 +450,9 @@ export async function runConsolidate(charId = 'default', project, threshold, lim
     // v1.23 轮转：窗口 = "重要度前 300" + "最久未更新 200" 两片各自保底。
     // 只取重要度会让低分老记忆永远轮不到；若先合并再按重要度截断到 500，最久那 200 条会被整片丢掉
     // （Full 现网实现的缺陷），所以这里先定 head=top300，再从最久片补满 200，合计 ≤500。
-    const windowWhere = `is_active = 1 AND project = ? AND (locked IS NULL OR locked = 0)
+    // v1.24: 角色隔离 — 整合窗口只含本实例角色(charId='any' 关闭过滤)。
+    const cid = charId || CHAR_ID;
+    const windowWhere = `is_active = 1 AND project = ? AND (? = 'any' OR character_id = ?) AND (locked IS NULL OR locked = 0)
         AND COALESCE(tier, 'standard') <> 'critical'
         AND COALESCE(status, '') <> 'cold'`;
     const headRows = [];
@@ -465,7 +467,7 @@ export async function runConsolidate(charId = 'default', project, threshold, lim
         WHERE ${windowWhere}
         ORDER BY importance DESC, created_at DESC
         LIMIT 300
-      `).all(proj)) {
+      `).all(proj, cid, cid)) {
                 if (!headSeen.has(r.id)) {
                     headSeen.add(r.id);
                     headRows.push(r);
@@ -476,7 +478,7 @@ export async function runConsolidate(charId = 'default', project, threshold, lim
         WHERE ${windowWhere}
         ORDER BY COALESCE(updated_at, created_at) ASC
         LIMIT 200
-      `).all(proj)) {
+      `).all(proj, cid, cid)) {
                 if (!tailSeen.has(r.id)) {
                     tailSeen.add(r.id);
                     tailRows.push(r);
@@ -513,7 +515,7 @@ export async function runConsolidate(charId = 'default', project, threshold, lim
     // 1. 向量预筛(EMBED_MODE=none 返回空 → 全量扫兜底)
     let candidates = [];
     if (isEmbedEnabled()) {
-        candidates = await findSimilarCandidates(proj, threshold ?? CONSOLIDATE_SIMILARITY, limit ?? CONSOLIDATE_MAX_PAIRS);
+        candidates = await findSimilarCandidates(proj, threshold ?? CONSOLIDATE_SIMILARITY, limit ?? CONSOLIDATE_MAX_PAIRS, cid);
         // v1.23: 候选对必须两端都在本次窗口内 —— 否则模型会拿到窗口外的 id，动作必被
         // `allowedSourceIds` 拒绝（"target is outside the current reflection input" 的根因）。
         const before = candidates.length;
@@ -556,10 +558,10 @@ export async function runConsolidate(charId = 'default', project, threshold, lim
     try {
         factRows = DatabaseManager.getInstance(proj).prepare(`
       SELECT id, subject, predicate, object, confidence FROM facts
-      WHERE is_active = 1 AND project = ? AND confidence >= 0.6
+      WHERE is_active = 1 AND project = ? AND (? = 'any' OR character_id = ?) AND confidence >= 0.6
         AND (valid_to IS NULL OR valid_to = '')
       ORDER BY updated_at DESC LIMIT 80
-    `).all(proj);
+    `).all(proj, cid, cid);
     }
     catch { /* facts 表不存在时忽略 */ }
     const factsJson = JSON.stringify(factRows.map(f => ({ id: f.id, s: f.subject, p: f.predicate, o: f.object })), null, 1);
@@ -698,3 +700,4 @@ ${transcript || '无近期对话转录'}`;
         receipts: r.receipts,
     };
 }
+//# sourceMappingURL=reflectDriver.js.map

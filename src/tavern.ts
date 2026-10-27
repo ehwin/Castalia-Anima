@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { DatabaseManager, safeFilePart } from './db.js';
+import { CHAR_ID } from './env.js';
 
 export interface TavernMessage {
   id: string;
@@ -29,6 +30,13 @@ export function syncTavernChat(project: string, messages: TavernMessage[], opts:
   }
   const db = DatabaseManager.getInstance(project);
   const now = new Date().toISOString();
+
+  // v1.24: 角色隔离 —— 本模块自己的行从"按 project 当角色"迁移到进程级 CHAR_ID。
+  // 只动 source='sillytavern_chat' 的行(本模块独占),避免影响该库里其它来源的记忆。
+  try {
+    db.prepare("UPDATE memory SET character_id = ? WHERE project = ? AND source = 'sillytavern_chat' AND (character_id IS NULL OR character_id = ?)")
+      .run(CHAR_ID, project, project);
+  } catch { /* 旧库无列时忽略 */ }
 
   // 窗口化子集保护：只有显式 replace:true 才允许“本次条数 < 已有条数”的收缩。
   const previousActive = (db.prepare(
@@ -81,7 +89,7 @@ export function syncTavernChat(project: string, messages: TavernMessage[], opts:
       } else {
         db.prepare(`INSERT INTO memory (id,text,project,session_id,type,mem_type,category,tags,importance,character_id,source,subject,tier,is_active,created_at,updated_at,last_accessed_at,accessed_count,reference_count)
           VALUES (?,?,?,?,'episodic','general','conversation','[]',0.5,?,'sillytavern_chat','environment','standard',1,?,?,?,0,0)`)
-          .run(row.id, row.text, project, project, project, row.createdAt, now, now);
+          .run(row.id, row.text, project, project, CHAR_ID, row.createdAt, now, now);
       }
       changed++;
     }

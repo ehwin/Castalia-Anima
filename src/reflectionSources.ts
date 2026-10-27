@@ -1,6 +1,6 @@
 /** Original records and explicit processing progress, independent of summaries. */
 import { DatabaseManager, listMemTypeDirs } from './db.js';
-import { normalizeProject } from './env.js';
+import { normalizeProject, CHAR_ID } from './env.js';
 
 function ensureReflectionProgress(db: any): void {
   db.exec(`CREATE TABLE IF NOT EXISTS reflection_progress (
@@ -39,12 +39,13 @@ export function deepReflectionCursor(project?: string, nextId?: string): string 
 }
 
 export function getUnanalyzedConversations(
-  characterId: string = 'airi',
+  characterId: string = CHAR_ID,
   since?: string,  // 可选日期筛选，处理进度始终按来源 ID 记录
   limit: number = 30,
   project?: string,  // v1.5: 项目隔离
 ): { id: string; text: string; createdAt: string; subject: string; memType: string; emotionalImpact: number; vad: { valence: number | null; arousal: number | null; dominance: number | null }; agentMood: string | null; agentDesire: string | null; tsundereLevel: number }[] {
   const proj = normalizeProject(project);
+  const cid = characterId || CHAR_ID;
   const dbs = listMemTypeDirs(proj).map(mt => DatabaseManager.getInstance(proj, mt));
 
   // A summary timestamp is not a processing cursor: a failed/partial run may still
@@ -61,6 +62,7 @@ export function getUnanalyzedConversations(
   }
 
   // Anima 对话审计原文含活跃和历史行；跨库按时间排序，再应用全局 limit。
+  // v1.24: 角色隔离 — 只取本实例角色(charId='any' 时关闭过滤,供跨库管理场景)。
   const all: any[] = [];
   for (const db of dbs) {
     try {
@@ -70,9 +72,10 @@ export function getUnanalyzedConversations(
         FROM memory
         WHERE source = 'conversation_log'
           AND project = ?
+          AND (? = 'any' OR character_id = ?)
           AND (? IS NULL OR created_at > ?)
         ORDER BY created_at ASC
-      `).all(proj, since || null, since || null) as any[]);
+      `).all(proj, cid, cid, since || null, since || null) as any[]);
     } catch { /* 单分类库失败不影响其它库 */ }
   }
   all.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)) || String(a.id).localeCompare(String(b.id)));
