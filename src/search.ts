@@ -452,7 +452,11 @@ function textFallbackSearch(
   // ("你母亲是怎么死的" 与行文只共享「母亲」)。所以这里**召回优先**:命中 ≥1 词就进候选,
   // 精度交给排序 —— 命中词多的排前面(ORDER BY 命中数 DESC),而不是把候选直接丢掉。
   // 之前试过 need=2,结果自然问句又变成 0 条,等于没修(2026-10-28)。
-  const matchExpr = `(${terms.map(() => 'CASE WHEN m.text LIKE ? THEN 1 ELSE 0 END').join(' + ')})`;
+  // 标题也参与匹配(2026-10-28):标题短而具体("三年前那笔交易:我换掉了看见命运的能力"),
+  // 把正文里的长句意涵提到了命中的第一线。只匹配正文时,问"你为什么看不见命运了"要命的那条
+  // 排不进 top5 —— 同分全靠 created_at 决,等于随机。
+  const haystack = `(COALESCE(m.title, '') || ' ' || m.text)`;
+  const matchExpr = `(${terms.map(() => `CASE WHEN ${haystack} LIKE ? THEN 1 ELSE 0 END`).join(' + ')})`;
   const likeParams = terms.map(t => `%${t}%`);
 
   const conds: string[] = [`m.is_active = 1`, `m.project = ?`, "COALESCE(m.status, '') <> 'superseded'", `${matchExpr} >= 1`];
@@ -476,7 +480,7 @@ function textFallbackSearch(
       m.vad_valence, m.vad_arousal, m.vad_dominance, m.tsundere_level
     FROM memory m
     WHERE ${conds.join(' AND ')}
-    ORDER BY (${terms.map(() => 'CASE WHEN m.text LIKE ? THEN 1 ELSE 0 END').join(' + ')}) DESC, m.created_at DESC
+    ORDER BY (${terms.map(() => `CASE WHEN ${haystack} LIKE ? THEN 1 ELSE 0 END`).join(' + ')}) DESC, m.created_at DESC
     LIMIT ?
   `).all(...params, ...likeParams, topK * 2) as any[];
 
@@ -487,7 +491,7 @@ function textFallbackSearch(
       // 于是没向量时**每一条文本命中都被当成"不够像"丢掉**,她的记忆一条也进不了提示词。
       // 改成真实词法覆盖率:命中词数 / min(词数, 4)(分母封顶 4,长问句的 bigram 数会虚高,
       // 否则「你母亲是怎么死的」这种只共享一个词的问句永远过不了线)。
-      const lower = String(row.text || '').toLowerCase();
+      const lower = `${String(row.title || '')} ${String(row.text || '')}`.toLowerCase();
       const matched = terms.reduce((n, t) => n + (lower.includes(t.toLowerCase()) ? 1 : 0), 0);
       const lexSim = Math.min(1, matched / Math.min(terms.length, 4));
       const { score, biasBoost } = computeScore(row, lexSim, project);

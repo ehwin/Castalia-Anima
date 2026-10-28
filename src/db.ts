@@ -478,6 +478,12 @@ export function initProjectSchema(db: Database.Database) {
   try { db.exec(`ALTER TABLE memory ADD COLUMN status TEXT`); } catch (_e) { /* already exists */ }
   try { db.exec(`ALTER TABLE memory ADD COLUMN identity_locked INTEGER DEFAULT 0`); } catch (_e) { /* already exists */ }
 
+  // 2026-10-28:title —— 真库里早就有这列(老 Full 血统建表时带来的),但本引擎的
+  // initProjectSchema 从来不建它。检索里一旦用 m.title,任何**新建库**都会整条抛
+  // "no such column",而异常被 searchInDb 的单库 try/catch 吞掉 → 检索静默返回 0 条
+  // (新加的 regression_cjk_recall 当场抓到)。新建库与老库都补齐。
+  try { db.exec(`ALTER TABLE memory ADD COLUMN title TEXT`); } catch (_e) { /* already exists */ }
+
   // v1.23 Parent-Child 检索：leaf 记忆指回父对话（llama_index ParentDocumentRetriever 思路）
   try { db.exec(`ALTER TABLE memory ADD COLUMN parent_id TEXT`); } catch (_e) { /* already exists */ }
   try { db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_parent ON memory(parent_id)`); } catch (_e) {}
