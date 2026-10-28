@@ -174,9 +174,12 @@ async function searchInDb(db: Database.Database, options: SearchOptions): Promis
     // v1.28-fix(移植自 Lite 修 E6a):原来只在 embed/KNN **抛错**时回退。vec_memory 为空
     // (换模型清空后尚未补齐、维度刚重建、批量嵌入没跑)时 KNN 会"成功返回 0 行",
     // 于是嵌入服务明明健康却静默 0 命中。零命中同样要回退到文本检索。
-    if (!vecOk || vectorResults.length === 0) {
-      vectorResults = textFallbackSearch(db, scoped, new Set(), topK, minScore);
-    }
+    // 2026-10-28(2):有向量时也**始终**算一遍词法结果并合并。原来只在 KNN 抛错/零命中时
+    // 才回退,而向量一旦返回任何一条(哪怕相似度只有 0.37),精确词法命中(0.5~1.0)就整条
+    // 被挤掉 —— 实测 airi 库:只用向量路时注入要点覆盖 70% → 30%(「你的生日是哪天」的
+    // 「未知」、用户问身份时命中的原始叙事全丢)。合并后去重取 similarity 高者(下方 bestById)。
+    vectorResults = [...vectorResults, ...textFallbackSearch(db, scoped, new Set(), topK, minScore)];
+    if (vectorResults.length === 0 && !vecOk) vectorResults = textFallbackSearch(db, scoped, new Set(), topK, minScore);
   } else {
     // 纯本地模式:标签结果不足时直接文本回退。
     // 2026-10-28:这里**不再**把标签已命中的 id 排除掉 —— 一条记忆先被标签弱命中(0.333)、
@@ -369,6 +372,18 @@ function tagSearch(db: any, options: SearchOptions): SearchResult[] {
 }
 
 /** 向量 KNN 搜索 */
+/**
+ * sqlite-vec 的 vec0 默认是 **L2** 距离(建表时没写 distance_metric,见 db.ts),
+ * 而这里一直按 `1 - 距离` 当作余弦相似度 —— 单位向量下正确换算是 `1 - d²/2`
+ * (d² = 2 - 2cos)。实测:「第 127 位谕女」那句查自己的行,distance=0.6683 而真实
+ * 余弦=0.7767,按旧算法得 0.33 → 低于注入门槛 0.5,于是**所有真实语义命中都被丢掉**,
+ * 向量召回形同虚设。排序本来就没错(单位向量下 L2 序 = 余弦序),错的只是喂给门槛的值。
+ */
+export function l2ToCosine(dist: number): number {
+  if (!Number.isFinite(dist)) return 0;
+  return Math.max(0, Math.min(1, 1 - (dist * dist) / 2));
+}
+
 function vectorKnnSearch(
   db: any, options: SearchOptions, floatQuery: Float32Array,
   excludeIds: Set<string>, topK: number, minScore: number
@@ -423,7 +438,7 @@ function vectorKnnSearch(
   for (const row of rows) {
     if (excludeIds.has(row.id)) continue;
     const dist = rowidMap.get(row.rowid) ?? 1.0;
-    const similarity = Math.max(0, 1.0 - dist);
+    const similarity = l2ToCosine(dist);   // L2 → 余弦(2026-10-28)
     const { score, biasBoost } = computeScore(row, similarity, project);
     if (score >= minScore) {
       results.push({
@@ -436,6 +451,8 @@ function vectorKnnSearch(
         tier: row.tier || 'standard',
         parentId: row.parent_id || null,
         score, similarity: Math.round(similarity * 1000) / 1000,
+        basis: 'vector' as const,   // 2026-10-28:向量命中必须自带 basis,否则注入层按默认
+                                    // (向量)门槛之外的量纲判它,且统计里查不出走了哪条路
         createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
         accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
       });
@@ -824,7 +841,7 @@ export async function searchFacts(
 
   for (const row of rows) {
     const dist = rowidMap.get(row.rowid) ?? 1.0;
-    const similarity = Math.max(0, 1.0 - dist);
+    const similarity = l2ToCosine(dist);   // L2 → 余弦(2026-10-28)
     const confidence = row.confidence;
 
     if (confidence < minConfidence) continue;

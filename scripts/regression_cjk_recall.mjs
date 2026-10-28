@@ -34,7 +34,8 @@ process.env.EMBED_MODE = 'none';
 
 const { DatabaseManager } = await import(pathToFileURL(path.join(ROOT, 'dist', 'db.js')).href);
 const { searchMemory, queryTerms } = await import(pathToFileURL(path.join(ROOT, 'dist', 'search.js')).href);
-const { recallForInjection } = await import(pathToFileURL(path.join(ROOT, 'dist', 'recallForInjection.js')).href);
+const { recallForInjection, renderInjectionBlock, injectionMinSimilarityVector, injectionMinSimilarityLexical }
+  = await import(pathToFileURL(path.join(ROOT, 'dist', 'recallForInjection.js')).href);
 
 let pass = 0;
 let fail = 0;
@@ -111,6 +112,23 @@ const inj = await recallForInjection('你母亲是怎么死的', { project: PROJ
 check('无向量时文本命中能被注入(修复前为空)', (inj.text || '').includes('母亲'), `chars=${inj.stats?.chars} belowThreshold=${inj.stats?.belowThreshold}`);
 const injJunk = await recallForInjection('量子纠缠 弦理论', { project: PROJ, characterId: 'cjk' });
 check('无关问句不注入', !(injJunk.text || '').trim(), `chars=${injJunk.stats?.chars}`);
+
+// 2026-10-28(3):向量命中必须自带 basis='vector',门槛按来源分:向量 0.45、标签/词法 0.2。
+// 起因:向量路过去既不打 basis、又只在零命中时才回退词法,一旦返回任何一条(相似度 0.37)
+// 就把精确词法命中(1.0)整条挤掉;且向量命中的相似度(0.42~0.55)低于 0.5 门槛被全丢。
+// 实测 BAAI/bge-m3:相关问句 top 0.476~0.522,噪音 top 0.415~0.487 —— 两者**重叠**,
+// 所以门槛取 0.45(丢掉 5 条噪音里的 4 条)并保留词法路做精确信号。
+check('向量门槛默认 0.45', injectionMinSimilarityVector() === 0.45, `got ${injectionMinSimilarityVector()}`);
+check('词法门槛默认 0.2', injectionMinSimilarityLexical() === 0.2, `got ${injectionMinSimilarityLexical()}`);
+const fakeHits = [
+  { id: 'lex1', text: '母亲在几年前去世了，我一直记得她的样子', similarity: 0.25, basis: 'lexical', score: 2, project: PROJ },
+  { id: 'vec1', text: '命运改变醒来', similarity: 0.40, basis: 'vector', score: 1.5, project: PROJ },
+];
+const rGate = renderInjectionBlock(fakeHits);
+check('词法 0.25 通过 / 向量 0.40 被挡', rGate.text.includes('母亲') && !rGate.text.includes('命运改变醒来'),
+  `chars=${rGate.stats?.chars} belowThreshold=${rGate.stats?.belowThreshold}`);
+const rGate2 = renderInjectionBlock([{ ...fakeHits[1], similarity: 0.46 }]);
+check('向量 0.46 通过(新门槛生效)', rGate2.text.includes('命运改变醒来'), `chars=${rGate2.stats?.chars}`);
 
 console.log(`\n通过 ${pass} / 失败 ${fail}`);
 if (!KEEP) { try { fs.rmSync(TMP, { recursive: true, force: true }); } catch { /* Windows 上 db 句柄未释放时会 EPERM,清理失败不影响结论 */ } }

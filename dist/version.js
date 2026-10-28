@@ -1,3 +1,3 @@
 // 由 scripts/gen_version.mjs 从仓库根 VERSION 生成，不要手改。
-export const VERSION = '1.28.6';
+export const VERSION = '1.28.7';
 //# sourceMappingURL=version.js.map

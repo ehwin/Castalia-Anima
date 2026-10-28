@@ -3,6 +3,11 @@ export const INJECTION_DEFAULTS = {
     topK: 5,
     minSimilarity: 0.5,
     minSimilarityLexical: 0.2,
+    // 2026-10-28:向量门槛 0.5 是"近重复"量级。实测 BAAI/bge-m3 上短问句 vs 长记忆的余弦
+    // 普遍落在 0.42~0.55(相关问句 top 0.476~0.522,噪音 top 0.415~0.487 —— **两者重叠**,
+    // 任何绝对阈值都分不开),0.5 等于把真实语义命中全丢。降到 0.45 并保留词法路 0.2 作为
+    // 精确信号;噪音里 top≥0.45 的少数问句会注入 1~2 条她自己的记忆,已实测记录。
+    minSimilarityVector: 0.45,
     capChars: 1200,
     maxItemChars: 200,
 };
@@ -16,6 +21,11 @@ export function injectionMinSimilarity() {
  * 向量相关通常 ≥0.5,而自然问句的词法命中经常只有 0.2~0.4。以前两者共用 0.5,
  * 于是**没配嵌入 key 时每一条文本命中都被判"不够像"丢掉**,她的记忆一条都注入不了。
  */
+/** 向量门槛(env MEMORY_INJECT_MIN_SIM_VECTOR,默认 0.45):见 INJECTION_DEFAULTS 里的实测说明 */
+export function injectionMinSimilarityVector() {
+    const raw = parseFloat(process.env.MEMORY_INJECT_MIN_SIM_VECTOR || '');
+    return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : INJECTION_DEFAULTS.minSimilarityVector;
+}
 export function injectionMinSimilarityLexical() {
     const raw = Number.parseFloat(process.env.MEMORY_INJECT_MIN_SIM_LEXICAL ?? '');
     return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : INJECTION_DEFAULTS.minSimilarityLexical;
@@ -50,9 +60,10 @@ export function renderInjectionBlock(hits, options = {}) {
     const maxItemChars = Math.max(20, options.maxItemChars ?? INJECTION_DEFAULTS.maxItemChars);
     const minSimilarity = options.minSimilarity ?? injectionMinSimilarity();
     const minSimLexical = options.minSimilarityLexical ?? injectionMinSimilarityLexical();
+    const minSimVector = options.minSimilarityVector ?? injectionMinSimilarityVector();
     const topK = Math.max(0, options.topK ?? INJECTION_DEFAULTS.topK);
     // 按命中来源取门槛:向量用余弦门槛,标签/词法用词法门槛。undefined 视为向量(老调用方语义不变)
-    const gateOf = (h) => (h?.basis && h.basis !== 'vector' ? minSimLexical : minSimilarity);
+    const gateOf = (h) => (h?.basis && h.basis !== 'vector' ? minSimLexical : minSimVector);
     const stats = {
         count: 0, chars: 0, topSim: 0, dropped: 0, belowThreshold: 0, minSimilarity,
     };
