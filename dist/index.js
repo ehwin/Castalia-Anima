@@ -18,6 +18,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { searchMemory, searchFacts, getRecentMemories, searchMemoryAcross, hydrateParentExcerpts } from './search.js';
 import { recallForInjection } from './recallForInjection.js';
+import { factsAsOf } from './bitemporal.js';
+import { applyWindowRepairs, planWindowRepairs } from './factWindows.js';
 import { parseTagsSafe } from './tags.js';
 import { saveMemory, forgetMemory, updateMemory, saveConversationTurn, cleanupExpiredMemories, batchEmbedPending, markColdMemories } from './store.js';
 import { consolidate } from './consolidate.js';
@@ -100,9 +102,9 @@ function memorySnapshotWarn(createdAt) {
 //   MCP_TOOLS=agent,admin → agent + admin 两组
 // ═══════════════════════════════════════════════════════════════════
 const TOOL_GROUPS = {
-    agent: ['memory_search', 'memory_get', 'memory_recent', 'memory_index', 'fact_search', 'memory_graph', 'entity_lookup'],
+    agent: ['memory_search', 'memory_get', 'memory_recent', 'memory_index', 'fact_search', 'fact_as_of', 'memory_graph', 'entity_lookup'],
     harness: ['auto_process', 'conversation_save', 'tavern_sync', 'digest_run', 'reflect_auto', 'reflect_deep', 'reflect_batch_embed', 'memory_save', 'memory_update', 'memory_delete', 'memory_log', 'instruction_save', 'user_observe'],
-    admin: ['memory_list', 'stats_get', 'recent_conversations', 'daily_summary_data', 'reflect_analyze', 'reflect_apply', 'memory_context', 'context_get', 'project_list', 'project_create', 'memory_search_all', 'reflect_all', 'instruction_list', 'instruction_delete', 'consolidate_deep', 'mood_journal'],
+    admin: ['memory_list', 'stats_get', 'recent_conversations', 'daily_summary_data', 'reflect_analyze', 'reflect_apply', 'memory_context', 'context_get', 'project_list', 'project_create', 'memory_search_all', 'reflect_all', 'instruction_list', 'instruction_delete', 'consolidate_deep', 'mood_journal', 'facts_windows_plan', 'facts_windows_apply'],
     // v1.26: 前端存储桥(AIRI 这类"每个角色一套记忆"的客户端当持久层用)
     store: ['memory_store_list', 'memory_store_save', 'memory_store_forget', 'memory_recall'],
     // v1.27: 实体层 —— 按实体名查事实/记忆,以及事实失效(矛盾)报告
@@ -1372,6 +1374,89 @@ function toStoreRecord(row) {
         updatedAt: row.updated_at ?? row.created_at,
     };
 }
+register('fact_as_of', 'agent', 'Answer what the facts were at one instant, on one of two axes. axis=valid = what was true in the world then; axis=transaction = what we already knew then (a fact backfilled today is not known for a past date). Returns rows that were true then, including ones since superseded.', {
+    at: z.string().describe('The instant: YYYY-MM-DD or YYYY-MM-DD HH:MM[:SS]'),
+    axis: z.enum(['valid', 'transaction']).optional().describe('valid = what was true then (default); transaction = what we believed then'),
+    subject: z.string().optional().describe('Filter by subject'),
+    predicate: z.string().optional().describe('Filter by predicate'),
+    characterId: z.string().optional().describe('Role id (default: process CHAR_ID). "any" disables the role filter'),
+    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+}, async (args) => {
+    try {
+        const rows = factsAsOf({
+            at: args.at,
+            axis: args.axis,
+            subject: args.subject,
+            predicate: args.predicate,
+            characterId: args.characterId,
+            project: args.project,
+        });
+        return ok({
+            op: 'fact_as_of',
+            at: args.at,
+            axis: args.axis ?? 'valid',
+            count: rows.length,
+            results: rows.map(row => ({
+                id: row.id,
+                subject: row.subject,
+                predicate: row.predicate,
+                object: row.object,
+                confidence: row.confidence,
+                validFrom: row.validFrom,
+                validTo: row.validTo,
+                expiredAt: row.expiredAt,
+                supersededBy: row.supersededBy,
+            })),
+        });
+    }
+    catch (e) {
+        return err(e.message, 'FACT_AS_OF_FAILED');
+    }
+});
+register('facts_windows_plan', 'admin', 'Read-only: list the fact slots with more than one open window (two "current" values for one single-valued slot), and what a repair would close. Writes nothing.', {
+    characterId: z.string().optional().describe('Role id (default: process CHAR_ID). "any" disables the role filter'),
+    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+}, async (args) => {
+    try {
+        const plans = planWindowRepairs({ characterId: args.characterId, project: args.project });
+        return ok({
+            op: 'facts_windows_plan',
+            count: plans.length,
+            results: plans.map(plan => ({
+                subject: plan.subject,
+                predicate: plan.predicate,
+                reason: plan.reason,
+                keep: { id: plan.keep.id, object: plan.keep.object, validFrom: plan.keep.validFrom ?? plan.keep.createdAt },
+                close: plan.close.map(window => ({ id: window.id, object: window.object, validFrom: window.validFrom ?? window.createdAt })),
+            })),
+        });
+    }
+    catch (e) {
+        return err(e.message, 'FACTS_WINDOWS_PLAN_FAILED');
+    }
+});
+register('facts_windows_apply', 'admin', 'Apply a repair from facts_windows_plan. Writes valid_to and expired_at on the older open rows. Run the plan first, and read what it would close.', {
+    confirm: z.literal(true).describe('Must be true: this writes to the bank'),
+    characterId: z.string().optional().describe('Role id (default: process CHAR_ID)'),
+    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+    subject: z.string().optional().describe('Only repair this subject'),
+    predicate: z.string().optional().describe('Only repair this predicate'),
+}, async (args) => {
+    try {
+        const plans = planWindowRepairs({ characterId: args.characterId, project: args.project })
+            .filter(plan => (!args.subject || plan.subject === args.subject) && (!args.predicate || plan.predicate === args.predicate));
+        const applied = applyWindowRepairs(plans, { project: args.project });
+        return ok({
+            op: 'facts_windows_apply',
+            planCount: plans.length,
+            closedRows: applied.reduce((total, item) => total + item.closed, 0),
+            results: applied,
+        });
+    }
+    catch (e) {
+        return err(e.message, 'FACTS_WINDOWS_APPLY_FAILED');
+    }
+});
 register('memory_recall', 'store', 'Recall for one query and render a ready-to-inject context block (<memory> container, char budget). Abstains with empty text when nothing passes the SIMILARITY gate, so a caller can append the block unconditionally; never blocks the turn.', {
     query: z.string().min(1).describe('The user turn / topic to recall for'),
     characterId: z.string().optional().describe('Character/role id (default: process CHAR_ID)'),
