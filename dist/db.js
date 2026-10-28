@@ -552,6 +552,17 @@ export function initProjectSchema(db) {
         db.exec(`ALTER TABLE facts ADD COLUMN valid_to DATETIME`);
     }
     catch (_e) { /* already exists */ }
+    // v1.28 双时间轴：superseded_by = 推翻它的新事实 id；expired_at = 判定时刻（事务时间）。
+    // valid_to 是"这个说法何时起不再成立"，expired_at 是"我们何时知道"——两者分开才能
+    // 复现"按当时已知重放"。见 volatility.ts。
+    try {
+        db.exec(`ALTER TABLE facts ADD COLUMN superseded_by TEXT`);
+    }
+    catch (_e) { /* already exists */ }
+    try {
+        db.exec(`ALTER TABLE facts ADD COLUMN expired_at DATETIME`);
+    }
+    catch (_e) { /* already exists */ }
     try {
         db.exec(`ALTER TABLE facts ADD COLUMN evidence TEXT`);
     }

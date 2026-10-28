@@ -17,6 +17,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { searchMemory, searchFacts, getRecentMemories, searchMemoryAcross, hydrateParentExcerpts } from './search.js';
+import { recallForInjection } from './recallForInjection.js';
 import { parseTagsSafe } from './tags.js';
 import { saveMemory, forgetMemory, updateMemory, saveConversationTurn, cleanupExpiredMemories, batchEmbedPending, markColdMemories } from './store.js';
 import { consolidate } from './consolidate.js';
@@ -103,7 +104,7 @@ const TOOL_GROUPS = {
     harness: ['auto_process', 'conversation_save', 'tavern_sync', 'digest_run', 'reflect_auto', 'reflect_deep', 'reflect_batch_embed', 'memory_save', 'memory_update', 'memory_delete', 'memory_log', 'instruction_save', 'user_observe'],
     admin: ['memory_list', 'stats_get', 'recent_conversations', 'daily_summary_data', 'reflect_analyze', 'reflect_apply', 'memory_context', 'context_get', 'project_list', 'project_create', 'memory_search_all', 'reflect_all', 'instruction_list', 'instruction_delete', 'consolidate_deep', 'mood_journal'],
     // v1.26: 前端存储桥(AIRI 这类"每个角色一套记忆"的客户端当持久层用)
-    store: ['memory_store_list', 'memory_store_save', 'memory_store_forget'],
+    store: ['memory_store_list', 'memory_store_save', 'memory_store_forget', 'memory_recall'],
     // v1.27: 实体层 —— 按实体名查事实/记忆,以及事实失效(矛盾)报告
     entity: ['entity_lookup', 'facts_conflicts_report'],
 };
@@ -1371,6 +1372,37 @@ function toStoreRecord(row) {
         updatedAt: row.updated_at ?? row.created_at,
     };
 }
+register('memory_recall', 'store', 'Recall for one query and render a ready-to-inject context block (<memory> container, char budget). Abstains with empty text when nothing passes the SIMILARITY gate, so a caller can append the block unconditionally; never blocks the turn.', {
+    query: z.string().min(1).describe('The user turn / topic to recall for'),
+    characterId: z.string().optional().describe('Character/role id (default: process CHAR_ID)'),
+    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+    topK: z.number().optional().describe('Max items, default 5'),
+    minSimilarity: z.number().optional().describe('Cosine similarity gate (default 0.5, or MEMORY_INJECT_MIN_SIM)'),
+    capChars: z.number().optional().describe('Whole-block character budget, default 1200'),
+}, async (args) => {
+    try {
+        const charId = storeCharacterId(args);
+        const project = normalizeProject(args.project ?? PROJECT_ID);
+        const result = await recallForInjection(String(args.query), {
+            project,
+            characterId: charId,
+            topK: args.topK,
+            minSimilarity: args.minSimilarity,
+            capChars: args.capChars,
+        });
+        return ok({
+            op: 'recall',
+            project,
+            characterId: charId,
+            text: result.text,
+            injected: result.stats.count > 0,
+            ...result.stats,
+        });
+    }
+    catch (e) {
+        return err(e.message, 'RECALL_FAILED');
+    }
+});
 register('memory_store_list', 'store', 'List a frontend store with full text: rows owned by characterId, plus shared rows when includeGeneral. No truncation, so a client can rebuild its whole index.', {
     characterId: z.string().optional().describe('Character/role id owning the memories (default: process CHAR_ID)'),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),

@@ -485,6 +485,11 @@ export function initProjectSchema(db: Database.Database) {
   // v1.23 事实边：Graphiti 式时间有效性 + 证据引用（不删除，只失效）
   try { db.exec(`ALTER TABLE facts ADD COLUMN valid_from DATETIME`); } catch (_e) { /* already exists */ }
   try { db.exec(`ALTER TABLE facts ADD COLUMN valid_to DATETIME`); } catch (_e) { /* already exists */ }
+  // v1.28 双时间轴：superseded_by = 推翻它的新事实 id；expired_at = 判定时刻（事务时间）。
+  // valid_to 是"这个说法何时起不再成立"，expired_at 是"我们何时知道"——两者分开才能
+  // 复现"按当时已知重放"。见 volatility.ts。
+  try { db.exec(`ALTER TABLE facts ADD COLUMN superseded_by TEXT`); } catch (_e) { /* already exists */ }
+  try { db.exec(`ALTER TABLE facts ADD COLUMN expired_at DATETIME`); } catch (_e) { /* already exists */ }
   try { db.exec(`ALTER TABLE facts ADD COLUMN evidence TEXT`); } catch (_e) { /* already exists */ }
 
   // v1.23.2: 衰减基线 + 向量化失败计数（与 Castalia 核心同步）

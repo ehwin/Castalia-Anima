@@ -12,6 +12,7 @@ import { recordTopics } from './bias.js';
 import { PROJECT_ID, CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
 import { MemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
 import { parseTagsSafe, normalizeTagsForWrite, serializeTags } from './tags.js';
+import { estimatePredicateVolatility, needsEvidence, shouldSupersede } from './volatility.js';
 
 let saveCount = 0;
 const CONSOLIDATE_INTERVAL = 50;
@@ -564,7 +565,7 @@ export async function saveFacts(
   // 不再用 ON CONFLICT(旧唯一索引只有 4 列,同库多角色会被互相覆盖/顶掉),
   // 改成显式 SELECT→UPDATE/INSERT,唯一性由 idx_facts_spo_char(含 character_id) 保证。
   const selectFact = db.prepare(
-    'SELECT id, confidence FROM facts WHERE subject=? AND predicate=? AND object=? AND project=? AND COALESCE(character_id, \'\') = ?'
+    'SELECT id, confidence, valid_to FROM facts WHERE subject=? AND predicate=? AND object=? AND project=? AND COALESCE(character_id, \'\') = ?'
   );
   const updateFact = db.prepare(`
     UPDATE facts SET confidence = MAX(confidence, ?), updated_at = ?, is_active = 1,
@@ -581,8 +582,15 @@ export async function saveFacts(
     const existing = selectFact.get(f.subject, f.predicate, f.object, proj, characterId ?? '') as any;
     const factId = existing ? existing.id : generateId();
     if (existing) {
+      // v1.28: 复写一条"已被失效"的事实 = 重新断言它。它的有效起点要回到现在，否则按
+      // valid_from 排序的时间线上它仍排在接管它的那个值之前，会被立刻重新闭合 —— v1.23 的
+      // "复写清空 valid_to" 就失效了（regression_v123_anima 7b）。显式给了 validFrom 时以调用方为准。
+      const wasInvalidated = !!(existing.valid_to && String(existing.valid_to).length > 0) && !f.validFrom;
       updateFact.run(f.confidence, now, f.evidence ?? '', f.validFrom ?? null, f.validTo ?? null, factId);
       updated++;
+      if (wasInvalidated) {
+        try { db.prepare('UPDATE facts SET valid_from = ? WHERE id = ?').run(now, factId); } catch { /* 列未迁移 */ }
+      }
       // v1.27: 老行的 valid_from 为空时补成 now —— 否则"按时刻查有效事实"会把
       // 2026 年才写入的事实也算进 2000 年(未知起点被当成永恒为真)。
       try { db.prepare('UPDATE facts SET valid_from = ? WHERE id = ? AND (valid_from IS NULL OR valid_from = \'\')').run(now, factId); } catch { /* 列未迁移 */ }
@@ -601,33 +609,56 @@ export async function saveFacts(
     } catch { /* 实体表未迁移时静默跳过 */ }
   }
 
-  // v1.23 冲突失效（Graphiti 式）：功能性关系（一个主体只能有一个值）出现新值时，
-  // 旧事实只打 valid_to 保留，不删除 —— 历史版本可查，当前值以最新为准。
-  const FUNCTIONAL_PREDICATES = new Set([
-    '姓名', '名字', '年龄', '职业', '居住地', '工作单位', '生日', '称呼', '昵称',
-    'name', 'age', 'job', 'occupation', 'residence', 'birthday',
-  ]);
+  // v1.28 冲突失效：语义先验（多值关系永不失效 / 计划类只并存 / 单值种子表）+ 证据补充（详见 volatility.ts）。
+  // 裁决为"失效"时重算整条时间线：每个值只在对它成立的那段时间里有效 ——
+  //   valid_to      = 链上下一个值的 valid_from（不是 now —— 记的是"何时起不再成立"）
+  //   expired_at    = 判定时刻（事务时间，与 valid_to 分开才能"按当时已知重放"）
+  //   superseded_by = 接管它的那一行 id
+  // 重构而不是"把当前值之前的所有行都打成 now"：这样"第 2 次因为证据不足没失效、第 3 次才判失效"
+  // 的链也能被修正成正确的区间。同一时刻的两个值（同一批写入）无法排序，按 Graphiti 的
+  // "区间不相交就不算推翻"保持并存。
   try {
-    // v1.23-fix: 同一批里出现 姓名=张三 和 姓名=李四 时，两条都是"本批的新值"，不能互相打 valid_to。
-    // 先按 (subject,predicate) 收集本批 objects，失效 UPDATE 时整体排除。
+    // v1.23-fix「同批不互相失效」改成显式判据：只有"同一批写入 + 时间戳相同"的两个值才无法排序、
+    // 保持并存；不同批（哪怕时间戳撞在同一毫秒）按写入顺序先后接管。
     const batchObjects = new Map<string, Set<string>>();
     for (const f of facts) {
-      if (!FUNCTIONAL_PREDICATES.has(String(f.predicate).trim())) continue;
       const key = `${f.subject}\u0000${String(f.predicate).trim()}`;
       const set = batchObjects.get(key) || new Set<string>();
-      set.add(f.object);
+      set.add(String(f.object));
       batchObjects.set(key, set);
     }
+    const loadChain = db.prepare(`
+      SELECT id, object, COALESCE(valid_from, created_at) AS at FROM facts
+      WHERE project = ? AND COALESCE(character_id, '') = ? AND subject = ? AND predicate = ? AND is_active = 1
+      ORDER BY julianday(COALESCE(valid_from, created_at)), rowid
+    `);
+    // 只管理"开口"的窗口（valid_to 为空）：调用方显式给的 validTo 是事实，不被重算覆盖
+    // （regression_v123_anima「explicit validTo is respected」）。
+    const setWindow = db.prepare('UPDATE facts SET valid_to = ?, superseded_by = ?, expired_at = ?, updated_at = ? WHERE id = ? AND (valid_to IS NULL OR valid_to = \'\')');
+
     for (const f of facts) {
-      if (!FUNCTIONAL_PREDICATES.has(String(f.predicate).trim())) continue;
-      const keep = [...(batchObjects.get(`${f.subject}\u0000${String(f.predicate).trim()}`) || new Set([f.object]))];
-      if (keep.length === 0) continue;
-      db.prepare(`
-        UPDATE facts SET valid_to = ?, updated_at = ?
-        WHERE project = ? AND COALESCE(character_id, '') = ? AND subject = ? AND predicate = ? AND object <> ?
-          AND is_active = 1 AND (valid_to IS NULL OR valid_to = '')
-          AND object NOT IN (${keep.map(() => '?').join(',')})
-      `).run(now, now, proj, characterId ?? '', f.subject, f.predicate, f.object, ...keep);
+      const predicate = String(f.predicate).trim();
+      const key = `${f.subject}\u0000${predicate}`;
+      const inThisBatch = batchObjects.get(key) || new Set<string>();
+      // 表外谓词才查历史证据（表内谓词由语义先验直接决定，省一次查询）。
+      const evidence = needsEvidence(predicate)
+        ? estimatePredicateVolatility(db, proj, f.subject, predicate, characterId)
+        : undefined;
+      if (!shouldSupersede({ predicate, evidence }).supersede) continue;
+
+      const chain = loadChain.all(proj, characterId ?? '', f.subject, predicate) as any[];
+      for (let i = 0; i < chain.length - 1; i++) {
+        const next = chain[i + 1];
+        // 同批 + 同时间戳 = 无法排序的两个值 → 并存（v1.23-fix 的语义）
+        const unordered = next.at === chain[i].at
+          && inThisBatch.has(String(chain[i].object)) && inThisBatch.has(String(next.object));
+        const closes = !unordered;
+        setWindow.run(closes ? next.at : null, closes ? next.id : null, closes ? now : null, now, chain[i].id);
+      }
+      if (chain.length > 0) {
+        // 链尾是当前值：保持开口（重算也把之前误闭合的窗口清干净）
+        setWindow.run(null, null, null, now, chain[chain.length - 1].id);
+      }
     }
   } catch { /* 列未迁移时静默跳过 */ }
 

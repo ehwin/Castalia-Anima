@@ -51,10 +51,13 @@ function computeEmotionalIntensity(row) {
 }
 /** 统一评分:一致性 + 情感强度(主锚) + 时间衰减 + 偏离加成,乘 bias/importance/tier/access */
 function computeScore(row, similarity, project) {
-    const hoursSinceCreated = (Date.now() - new Date(row.created_at).getTime()) / (1000 * 60 * 60);
+    // v1.28: 时间衰减锚点用 last_accessed_at（缺失才回退 created_at）—— 回忆一次就刷新时钟。
+    // 原来只认 created_at：半年前写下、昨天刚被反复用到的记忆，时间衰减分接近 0。
+    const touchedAt = row.last_accessed_at || row.created_at;
+    const hoursSinceTouched = (Date.now() - new Date(touchedAt).getTime()) / (1000 * 60 * 60);
     const { emotionalIntensity, isHighEmotion } = computeEmotionalIntensity(row);
     const consistency = Math.min(Math.max(similarity, 0), 0.7); // 上限 0.7,避免过度拟合人设
-    const timeDecay = computeRecency(hoursSinceCreated);
+    const timeDecay = computeRecency(hoursSinceTouched);
     const deviationBonus = (similarity < 0.3 && isHighEmotion) ? 0.8 : 0; // 低一致性+高情绪=珍贵"不像她"瞬间
     const tierBoost = row.tier === 'critical' ? 3.0 : (row.tier === 'temporary' ? 0.5 : 1.0);
     const importanceMult = 0.5 + (row.importance || 0.5);
@@ -114,6 +117,11 @@ async function searchInDb(db, options) {
     }
     // 合并 + 去重 + 排序
     const merged = [...tagResults, ...vectorResults];
+    // v1.28 回指召回：查询在问"以前/之前/原来/上次说过什么"时，把被接管的旧记忆带
+    // superseded 标记 + 降权加进候选池，参与同一次排序。非回指查询行为不变。
+    if (isBackReferenceQuery(scoped.query)) {
+        merged.push(...supersededRecall(db, scoped, new Set(merged.map(r => r.id)), Math.min(3, topK)));
+    }
     merged.sort((a, b) => b.score - a.score);
     const seen = new Set();
     const unique = [];
@@ -232,7 +240,11 @@ function tagSearch(db, options) {
         params.push(options.category);
     }
     if (options.characterId) {
-        conditions.push('m.character_id = ?');
+        // includeGeneral: 读取路径(提示里的索引 + read 工具)给角色看的是"自己的 + owner 共享的"，
+        // 任何按相关性取内容的调用方都要开它才跟读取路径一致。默认关：维护类调用严格按角色隔离。
+        conditions.push(options.includeGeneral
+            ? "(m.character_id = ? OR m.character_id IS NULL OR m.character_id = '')"
+            : 'm.character_id = ?');
         params.push(options.characterId);
     }
     if (options.subject) {
@@ -308,7 +320,11 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
         params.push(options.category);
     }
     if (options.characterId) {
-        conditions.push('m.character_id = ?');
+        // includeGeneral: 读取路径(提示里的索引 + read 工具)给角色看的是"自己的 + owner 共享的"，
+        // 任何按相关性取内容的调用方都要开它才跟读取路径一致。默认关：维护类调用严格按角色隔离。
+        conditions.push(options.includeGeneral
+            ? "(m.character_id = ? OR m.character_id IS NULL OR m.character_id = '')"
+            : 'm.character_id = ?');
         params.push(options.characterId);
     }
     const rows = db.prepare(`
@@ -367,7 +383,9 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
         params.push(options.category);
     }
     if (options.characterId) {
-        conds.push('m.character_id = ?');
+        conds.push(options.includeGeneral
+            ? "(m.character_id = ? OR m.character_id IS NULL OR m.character_id = '')"
+            : 'm.character_id = ?');
         params.push(options.characterId);
     }
     if (options.subject) {
@@ -400,6 +418,93 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
             score, similarity: 0.3,
             createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
             accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
+        };
+    });
+}
+/**
+ * v1.28 回指查询：用户在问"以前/之前/原来/当时/上次说过什么"。
+ *
+ * 这条判据是 v1.23-fix「被接管的旧记忆不该再被检索命中」与 RoMem「不删除只降权」
+ * 之间那个语义矛盾的裁决点：默认不返回（接管的旧记忆与接管它的新记忆内容重复，
+ * 同一条历史讲两遍会污染上下文）；用户明确回指时相反 —— 那时"当时的说法"就是答案本身。
+ */
+const BACK_REFERENCE_PATTERN = /以前|之前|原来|当时|上次|上回|早先|曾经|说过|提过|讲过|不是说过|previously|earlier|used to|back then|you said|i said|last time/i;
+export function isBackReferenceQuery(query) {
+    return BACK_REFERENCE_PATTERN.test(String(query ?? ''));
+}
+/** 被接管旧记忆的降权系数：低于任何正常命中，但不为零（可见、可解释，不与新记忆同权竞争） */
+export const SUPERSEDED_PENALTY = 0.6;
+/** metadata.supersededBy 可能是字符串或数组；解析失败返回 undefined（不是空数组）。 */
+function readSupersededBy(metadata) {
+    if (typeof metadata !== 'string' || metadata.length === 0)
+        return undefined;
+    try {
+        const parsed = JSON.parse(metadata);
+        const raw = parsed?.supersededBy;
+        const list = Array.isArray(raw) ? raw : (typeof raw === 'string' ? [raw] : []);
+        const ids = list.map(String).filter(Boolean);
+        return ids.length > 0 ? ids : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/** 回指召回：带 superseded 标记 + 降权返回被接管的旧记忆。 */
+function supersededRecall(db, options, excludeIds, limit) {
+    if (limit <= 0)
+        return [];
+    const terms = String(options.query || '').split(/[\s,，。！？、；：]+/).filter(t => t.length >= 2);
+    if (terms.length === 0)
+        return [];
+    const project = normalizeProject(options.project);
+    const likeCond = terms.map(() => 'm.text LIKE ?').join(' OR ');
+    const conds = ['m.is_active = 1', 'm.project = ?', "COALESCE(m.status, '') = 'superseded'", `(${likeCond})`];
+    const params = [project, ...terms.map(t => `%${t}%`)];
+    if (options.characterId) {
+        conds.push(options.includeGeneral
+            ? "(m.character_id = ? OR m.character_id IS NULL OR m.character_id = '')"
+            : 'm.character_id = ?');
+        params.push(options.characterId);
+    }
+    if (options.memType) {
+        conds.push('m.mem_type = ?');
+        params.push(options.memType);
+    }
+    let rows = [];
+    try {
+        rows = db.prepare(`
+      SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
+        m.emotional_impact, m.importance, m.character_id, m.source,
+        m.subject, m.agent_mood, m.agent_desire, m.tier, m.metadata,
+        m.created_at, m.last_accessed_at, m.accessed_count, m.parent_id,
+        m.vad_valence, m.vad_arousal, m.vad_dominance, m.tsundere_level
+      FROM memory m
+      WHERE ${conds.join(' AND ')}
+      ORDER BY m.created_at DESC LIMIT ?
+    `).all(...params, limit);
+    }
+    catch {
+        return [];
+    }
+    return rows
+        .filter(row => !excludeIds.has(row.id))
+        .map((row) => {
+        const { score, biasBoost } = computeScore(row, 0.3, project);
+        return {
+            id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
+            subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
+            emotionalImpact: row.emotional_impact ?? 0,
+            importance: row.importance,
+            characterId: row.character_id, source: row.source,
+            subject: row.subject || 'user', agentMood: row.agent_mood, agentDesire: row.agent_desire,
+            tier: row.tier || 'standard',
+            parentId: row.parent_id || null,
+            score: Math.round(score * SUPERSEDED_PENALTY * 1000) / 1000,
+            similarity: 0.3,
+            createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
+            accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
+            superseded: true,
+            supersededBy: readSupersededBy(row.metadata),
         };
     });
 }
