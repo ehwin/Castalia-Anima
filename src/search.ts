@@ -175,11 +175,15 @@ async function searchInDb(db: Database.Database, options: SearchOptions): Promis
     // (换模型清空后尚未补齐、维度刚重建、批量嵌入没跑)时 KNN 会"成功返回 0 行",
     // 于是嵌入服务明明健康却静默 0 命中。零命中同样要回退到文本检索。
     if (!vecOk || vectorResults.length === 0) {
-      vectorResults = textFallbackSearch(db, scoped, existingIds, topK, minScore);
+      vectorResults = textFallbackSearch(db, scoped, new Set(), topK, minScore);
     }
   } else {
-    // 纯本地模式:标签结果不足时直接文本回退
-    vectorResults = textFallbackSearch(db, scoped, existingIds, topK, minScore);
+    // 纯本地模式:标签结果不足时直接文本回退。
+    // 2026-10-28:这里**不再**把标签已命中的 id 排除掉 —— 一条记忆先被标签弱命中(0.333)、
+    // 正文其实强命中(0.5)时,排除掉等于把它的高分永不上报:实测「你为什么看不见命运了」
+    // 要命的那条(三年前那笔交易)就被压在候选第 6 名、进不了 top5。合并时按 score 去重,
+    // 同一 id 只会留下分高的那个版本。
+    vectorResults = textFallbackSearch(db, scoped, new Set(), topK, minScore);
   }
 
   // 合并 + 去重 + 排序
@@ -191,12 +195,14 @@ async function searchInDb(db: Database.Database, options: SearchOptions): Promis
   }
   merged.sort((a, b) => b.score - a.score);
 
-  const seen = new Set<string>();
-  const unique: SearchResult[] = [];
+  // 2026-10-28: 同一条记忆会被多条路径命中(标签给 0.333、正文给 1.0),以前"先到先留"
+  // 让低分的标签版本赢,把最相关的那条挤到 top5 之外。现在同 id 保留 similarity 更高的那份。
+  const bestById = new Map<string, SearchResult>();
   for (const r of merged) {
-    if (!seen.has(r.id)) { seen.add(r.id); unique.push(r); }
-    if (unique.length >= topK) break;
+    const prev = bestById.get(r.id);
+    if (!prev || (Number(r.similarity) || 0) > (Number(prev.similarity) || 0)) bestById.set(r.id, r);
   }
+  const unique = [...bestById.values()].sort((a, b) => b.score - a.score).slice(0, topK);
 
   updateAccessed(db, unique.slice(0, topK));
   return unique.slice(0, topK);
@@ -216,14 +222,13 @@ export async function searchMemory(options: SearchOptions): Promise<SearchResult
       all.push(...r);
     } catch { /* 单分类库失败不影响其他 */ }
   }
-  all.sort((a, b) => b.score - a.score);
-  const seen = new Set<string>();
-  const unique: SearchResult[] = [];
+  // 同上:跨分类库聚合时,同 id 保留 similarity 更高的那份再排序
+  const bestAcross = new Map<string, SearchResult>();
   for (const r of all) {
-    if (!seen.has(r.id)) { seen.add(r.id); unique.push(r); }
-    if (unique.length >= topK) break;
+    const prev = bestAcross.get(r.id);
+    if (!prev || (Number(r.similarity) || 0) > (Number(prev.similarity) || 0)) bestAcross.set(r.id, r);
   }
-  return unique.slice(0, topK);
+  return [...bestAcross.values()].sort((a, b) => b.score - a.score).slice(0, topK);
 }
 /**
  * 跨库搜索(多项目合并,2026-08-16) — 显式语义:
