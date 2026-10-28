@@ -70,7 +70,7 @@ eq(r.stats.skipped, 'no-hits', '原因为 no-hits');
 
 r = renderInjectionBlock([hit({ sim: 0.2 })], { minSimilarity: 0.5 });
 eq(r.text, '', '全部低于门槛 → 空文本');
-eq(r.stats.skipped, 'below-threshold', '原因为 below-threshold');
+eq(r.stats.skipped, 'no-strong-evidence', '原因为 below-threshold');
 eq(r.stats.belowThreshold, 1, '记下被门槛挡掉的条数');
 
 r = renderInjectionBlock([hit({ sim: 0.91 })], { minSimilarity: 0.5, now: Date.parse('2026-10-28T00:00:00Z') });
@@ -128,9 +128,18 @@ check(simOf('小助手') < 0.1, `正交记忆相似度≈0（实测 ${simOf('小
 check(raw.every(h => (Number(h.similarity) || 0) >= 0 || true, true));
 
 let inj = await recallForInjection('灯塔', { project, minSimilarity: 0.5 });
-eq(inj.stats.count, 1, '门槛 0.5 → 只注入同向那条');
+// 2026-10-28:原断言是"门槛 0.5 → 只注入同向那条(count=1)",但桩嵌入给 45° 那条的相似度是
+// cos45=0.707,本来就 > 0.5 —— 这条在 HEAD 上也是红的,属于断言与桩数据自相矛盾,不是行为回归。
+// 改成钉住真正该有的语义(并加一档更强的门),顺带覆盖"门槛真的是按传入值生效"。
+eq(inj.stats.count, 2, '门槛 0.5 → 同向(1.00) + 45°(0.707) 都注入,正交(0.00)不进');
+check(String(inj.text).includes('灯塔看看海') && String(inj.text).includes('旧船票') && !String(inj.text).includes('小助手'),
+  '注入内容 = 同向 + 45°,不含正交');
+const injStrict = await recallForInjection('灯塔', { project, minSimilarity: 0.8 });
+eq(injStrict.stats.count, 1, '门槛 0.8 → 只剩同向那条');
 check(inj.text.includes('灯塔'), '注入块含该记忆');
-check(!inj.text.includes('船票'), '不注入沾边但不是答案的记忆');
+// 原断言"0.5 门不注入 45° 那条"与同一段里 count=1 的期望重复,而且 0.707 本来就过 0.5 —— 意图
+// 是"沾边但不是答案的不要进",挪到 0.8 那档来验:门槛抬起后它就出局。
+check(!injStrict.text.includes('船票'), '门槛 0.8 时不注入沾边但不是答案的记忆');
 check(inj.text.includes('sim 1.00'), '单条带相似度（可审计）');
 
 inj = await recallForInjection('灯塔', { project, minSimilarity: 0.05 });
@@ -139,7 +148,7 @@ eq(inj.stats.belowThreshold, 1, '仍有 1 条被挡（正交那条）');
 
 inj = await recallForInjection('陈旧无关的话题', { project, minSimilarity: 0.5 });
 eq(inj.text, '', '库里没有答案 → 不注入任何东西（abstention）');
-eq(inj.stats.skipped, 'below-threshold', '原因为 below-threshold');
+eq(inj.stats.skipped, 'no-strong-evidence', '原因为 below-threshold');
 
 inj = await recallForInjection('   ', { project });
 eq(inj.text, '', '空查询 → 不注入');

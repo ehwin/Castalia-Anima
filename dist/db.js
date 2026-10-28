@@ -98,6 +98,14 @@ export function ensureEmbedSpace(db) {
         }
         catch (_e) { }
         try {
+            db.exec('DELETE FROM vec_chunk');
+        }
+        catch (_e) { }
+        try {
+            db.exec('DELETE FROM chunk_meta');
+        }
+        catch (_e) { }
+        try {
             db.exec('DELETE FROM embedding_cache');
         }
         catch (_e) { }
@@ -161,6 +169,14 @@ function reconcileVecDim(db) {
     catch (_e) { }
     try {
         db.exec(`DROP TABLE IF EXISTS vec_facts`);
+    }
+    catch (_e) { }
+    try {
+        db.exec(`DROP TABLE IF EXISTS vec_chunk`);
+    }
+    catch (_e) { }
+    try {
+        db.exec(`DROP TABLE IF EXISTS chunk_meta`);
     }
     catch (_e) { }
     try {
@@ -685,6 +701,14 @@ export function initProjectSchema(db) {
         }
         catch (_e) { }
         try {
+            db.exec(`DROP TABLE IF EXISTS vec_chunk`);
+        }
+        catch (_e) { }
+        try {
+            db.exec(`DROP TABLE IF EXISTS chunk_meta`);
+        }
+        catch (_e) { }
+        try {
             db.exec(`DELETE FROM embedding_cache`);
         }
         catch (_e) { }
@@ -699,6 +723,16 @@ export function initProjectSchema(db) {
     catch (_e) { }
     try {
         db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(embedding float[${vecDim()}])`);
+    }
+    catch (_e) { }
+    // 2026-10-28:句级片段索引(见 chunkIndex.ts)。整行向量在长记忆上被稀释 —— 实测整行余弦
+    // 0.40~0.52 而最佳句 0.51~0.69,要点的行因此排到 15~39 名。片段是可重建的派生索引。
+    try {
+        db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunk USING vec0(embedding float[${vecDim()}])`);
+    }
+    catch (_e) { }
+    try {
+        db.exec(`CREATE TABLE IF NOT EXISTS chunk_meta (mem_rowid INTEGER NOT NULL, chunk_idx INTEGER NOT NULL, text TEXT NOT NULL, text_hash TEXT NOT NULL, updated_at TEXT, PRIMARY KEY (mem_rowid, chunk_idx))`);
     }
     catch (_e) { }
     // v1.28-fix(移植自 Lite 修 E4): 嵌入空间(模型+维度)对齐 —— 换模型但维度不变时,
@@ -925,11 +959,22 @@ export function sweepExpiredSessionMemories(project, characterId = CHAR_ID) {
                 if (rows.length === 0)
                     return 0;
                 const delVec = db.prepare('DELETE FROM vec_memory WHERE rowid = ?');
+                // 2026-10-28:片段索引一并清掉(vec_chunk 的合成键是 rowid*1000+idx,按区间删)
+                const delChunk = db.prepare('DELETE FROM vec_chunk WHERE rowid >= ? AND rowid < ?');
+                const delChunkMeta = db.prepare('DELETE FROM chunk_meta WHERE mem_rowid = ?');
                 for (const row of rows) {
                     try {
                         delVec.run(row.rowid);
                     }
                     catch { /* 无 vec 表/未加载扩展 */ }
+                    try {
+                        delChunk.run(BigInt(row.rowid) * 1000n, (BigInt(row.rowid) + 1n) * 1000n);
+                    }
+                    catch { /* 无片段表 */ }
+                    try {
+                        delChunkMeta.run(row.rowid);
+                    }
+                    catch { /* 无片段表 */ }
                 }
                 return db.prepare(`
           DELETE FROM memory

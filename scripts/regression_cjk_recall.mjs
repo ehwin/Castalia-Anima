@@ -120,14 +120,18 @@ check('无关问句不注入', !(injJunk.text || '').trim(), `chars=${injJunk.st
 // 所以门槛取 0.45(丢掉 5 条噪音里的 4 条)并保留词法路做精确信号。
 check('向量门槛默认 0.45', injectionMinSimilarityVector() === 0.45, `got ${injectionMinSimilarityVector()}`);
 check('词法门槛默认 0.2', injectionMinSimilarityLexical() === 0.2, `got ${injectionMinSimilarityLexical()}`);
+// 注意:2026-10-28 起注入层多了一道"证据门" —— 有向量能力时,必须有一条命中真的贴得近
+// (向量 ≥0.50 / 片段 ≥0.60 / 词法 ≥0.60)才注入。所以这里要放一条强命中把门打开,
+// 再验"按来源分别用 0.2 / 0.45 门槛"这件事本身。
 const fakeHits = [
   { id: 'lex1', text: '母亲在几年前去世了，我一直记得她的样子', similarity: 0.25, basis: 'lexical', score: 2, project: PROJ },
   { id: 'vec1', text: '命运改变醒来', similarity: 0.40, basis: 'vector', score: 1.5, project: PROJ },
+  { id: 'vec2', text: '七丘四方殿的名册上，我是第 127 位谕女。', similarity: 0.62, basis: 'vector', score: 3, project: PROJ },
 ];
 const rGate = renderInjectionBlock(fakeHits);
 check('词法 0.25 通过 / 向量 0.40 被挡', rGate.text.includes('母亲') && !rGate.text.includes('命运改变醒来'),
   `chars=${rGate.stats?.chars} belowThreshold=${rGate.stats?.belowThreshold}`);
-const rGate2 = renderInjectionBlock([{ ...fakeHits[1], similarity: 0.46 }]);
+const rGate2 = renderInjectionBlock([{ ...fakeHits[1], similarity: 0.46 }, fakeHits[2]]);
 check('向量 0.46 通过(新门槛生效)', rGate2.text.includes('命运改变醒来'), `chars=${rGate2.stats?.chars}`);
 
 console.log(`\n通过 ${pass} / 失败 ${fail}`);

@@ -18,13 +18,24 @@ import { normalizeMemType } from './memType.js';
 import { computeBiasBoost } from './bias.js';
 import { computeDecay, computeBaseIntensity, computeRecency, isNightTime } from './emotion.js';
 import { parseTagsSafe } from './tags.js';
+import { chunkKnnSearch } from './chunkIndex.js';
 // v1.28: tags 解码收敛到纯模块 src/tags.ts（零副作用、可被验收脚本单独加载）。
 // 这里保留 re-export，历史 import { parseTagsSafe } from './search.js' 不会断。
 export { parseTagsSafe };
 // v5.2: 情绪锚定权重(可经环境变量调整)
-const WEIGHT_CONSISTENCY = parseFloat(process.env.WEIGHT_CONSISTENCY || '0.30'); // 标签/语义匹配
-const WEIGHT_EMOTION = parseFloat(process.env.WEIGHT_EMOTION || '0.45'); // 情感强度 — 主锚
-const WEIGHT_TIME = parseFloat(process.env.WEIGHT_TIME || '0.15'); // 时间衰减
+// v5.2 原本是 WEIGHT_CONSISTENCY=0.30 / EMOTION=0.45 —— 情感是主锚,相关性只占三成。
+// 2026-10-28 重新配平:情绪/时间/偏差的作用是"**同样相关时**偏好哪一段",不能盖过相关性本身。
+// 起因(实测):6 个字的垃圾行「命运改变醒来」(tier=critical, 被反复注入 → accessed_count 滚雪球)
+// 在每个查询里都以 score 4.3 排第一,而真正回答了问题的长设定(sim 0.53)只有 1.88 —— 注入的
+// 永远不是要点。改后相关性占六成,元数据降为有界乘数(见 computeScore),仍可用同名 env 覆盖。
+// 第二轮实测(2026-10-28):0.60/0.22 还不够 —— 「你母亲是怎么死的」要点行的片段余弦 0.659(全场
+// 最高),却因为 tier=standard、emotional_impact=0 而排到 #32(score 0.625 < 相似度只有 0.50 的
+// 那些行 0.72)。相似度差 0.16 只值 0.6×0.16=0.096,而情绪一项就能加 0.22、tier 再乘 1.35 —— 
+// 相关性在任何情况下都可能被元数据翻盘。改成相似度占 ~1.0、情绪 0.12、时间 0.06(情绪/偏差只做
+// "同样相关时"的偏好,不再是主锚);偏差保留 0.10 让它那个"不像她的瞬间"特性仍然有效。
+const WEIGHT_CONSISTENCY = parseFloat(process.env.WEIGHT_CONSISTENCY || '1.00'); // 标签/语义匹配 — 主轴
+const WEIGHT_EMOTION = parseFloat(process.env.WEIGHT_EMOTION || '0.12'); // 情感强度(同等相关时)
+const WEIGHT_TIME = parseFloat(process.env.WEIGHT_TIME || '0.15'); // 时间衰减(回忆一次刷新时钟)
 const WEIGHT_DEVIATION = parseFloat(process.env.WEIGHT_DEVIATION || '0.10'); // "不像她"的珍贵瞬间
 // minScore 阈值可配;harness 可用 SEARCH_MIN_SCORE 覆盖
 const SEARCH_PROFILES = {
@@ -59,16 +70,29 @@ function computeScore(row, similarity, project) {
     const consistency = Math.min(Math.max(similarity, 0), 0.7); // 上限 0.7,避免过度拟合人设
     const timeDecay = computeRecency(hoursSinceTouched);
     const deviationBonus = (similarity < 0.3 && isHighEmotion) ? 0.8 : 0; // 低一致性+高情绪=珍贵"不像她"瞬间
-    const tierBoost = row.tier === 'critical' ? 3.0 : (row.tier === 'temporary' ? 0.5 : 1.0);
-    const importanceMult = 0.5 + (row.importance || 0.5);
-    const accessBoost = 1 + Math.min(0.5, Math.log2(1 + (row.accessed_count || 0)) * 0.1);
+    // 2026-10-28:这三个原来是**乘在总分上的**乘数(critical ×3.0、importance ×(0.5+imp)、
+    // 访问次数 ×(1~1.5)),于是结构性元数据可以完全压过相关性 —— 而且"被注入→last_accessed/
+    // accessed_count 被刷新→下次更容易被注入"形成正反馈,垃圾行越滚越强。改成有界加成/弱乘数。
+    const tierBoost = row.tier === 'critical' ? 1.10 : (row.tier === 'temporary' ? 0.95 : 1.0);
+    const importanceMult = 0.85 + 0.3 * (row.importance || 0.5); // 0.85~1.15
+    const accessBoost = 1 + Math.min(0.08, Math.log2(1 + (row.accessed_count || 0)) * 0.02);
     const memTags = parseTagsSafe(row.tags);
     const biasBoost = computeBiasBoost(row.character_id || '', memTags, project);
+    // 信息密度:极短行(如 6 字的残片)即使余弦不低也几乎不含内容,轻微降权而不直接排除
+    const lenOfText = String(row.text || '').length;
+    const densityFactor = Math.max(0.75, Math.min(1, lenOfText / 24));
     const rawScore = WEIGHT_CONSISTENCY * consistency
         + WEIGHT_EMOTION * emotionalIntensity
         + WEIGHT_TIME * timeDecay
         + WEIGHT_DEVIATION * deviationBonus;
-    const score = Math.round(rawScore * importanceMult * biasBoost * tierBoost * accessBoost * 1000) / 1000;
+    // 2026-10-28:派生摘要行(reflect_summary / reflect_reasoning 是"这段时间用户与尤诺…""这批记忆
+    // 全部…"这类第三人称概括)在语义上离任何问题都很近,会把第一人称正典挤出前几名 —— 实测
+    // 「你还记得自己是谁吗」的第一条注入就是"这段时间用户小托与尤诺建立了深厚的羁绊"。它们对
+    // 索引有用、对台词没用,给个**有界**降权(不动可检索性)。
+    const src = String(row.source || '');
+    const sourceFactor = (src === 'reflect_summary' || src === 'reflect_reasoning') ? 0.85
+        : (src.startsWith('reflect_') ? 0.93 : 1.0);
+    const score = Math.round(rawScore * sourceFactor * densityFactor * importanceMult * biasBoost * tierBoost * accessBoost * 1000) / 1000;
     return { score, biasBoost };
 }
 /**
@@ -98,7 +122,15 @@ async function searchInDb(db, options) {
         try {
             const queryVector = await embed(scoped.query, scoped.project);
             const floatQuery = new Float32Array(queryVector);
-            vectorResults = vectorKnnSearch(db, scoped, floatQuery, existingIds, topK, minScore);
+            // 2026-10-28:片段级 KNN(整行向量在长记忆上被稀释,见 chunkIndex.ts 里的实测数字)
+            let chunkSims;
+            try {
+                chunkSims = chunkKnnSearch(db, floatQuery, topK);
+            }
+            catch {
+                chunkSims = undefined;
+            }
+            vectorResults = vectorKnnSearch(db, scoped, floatQuery, existingIds, topK, minScore, chunkSims);
             vecOk = true;
         }
         catch {
@@ -131,6 +163,24 @@ async function searchInDb(db, options) {
         merged.push(...supersededRecall(db, scoped, new Set(merged.map(r => r.id)), Math.min(3, topK)));
     }
     merged.sort((a, b) => b.score - a.score);
+    // 2026-10-28:接管关系要有硬保证。降权系数是乘法(0.6),而相关性权重提到 1.0 之后,被接管的旧记忆
+    // 靠更高的相似度就能翻盘(实测 0.176 > 0.137,「以前的居住地」那条旧记录排到了现行记录前面)。
+    // 语义上"以新的为准":同一结果里接替者也在时,把旧的压到它下面(仍然保留、仍带 superseded 标记,
+    // 这样"我以前说过…"依然可解释)。
+    {
+        const scoreById = new Map(merged.map(r => [r.id, r.score]));
+        for (const r of merged) {
+            if (!r.superseded || !Array.isArray(r.supersededBy))
+                continue;
+            const succScores = r.supersededBy.map(id => scoreById.get(id)).filter((v) => typeof v === 'number');
+            if (succScores.length === 0)
+                continue;
+            const cap = Math.min(...succScores) * 0.95;
+            if (r.score > cap)
+                r.score = Math.round(cap * 1000) / 1000;
+        }
+        merged.sort((a, b) => b.score - a.score);
+    }
     // 2026-10-28: 同一条记忆会被多条路径命中(标签给 0.333、正文给 1.0),以前"先到先留"
     // 让低分的标签版本赢,把最相关的那条挤到 top5 之外。现在同 id 保留 similarity 更高的那份。
     const bestById = new Map();
@@ -320,7 +370,10 @@ export function l2ToCosine(dist) {
         return 0;
     return Math.max(0, Math.min(1, 1 - (dist * dist) / 2));
 }
-function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
+function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore, 
+// 2026-10-28:片段级 KNN 的"每行最大余弦"。长记忆整行向量被稀释(实测整行 0.40~0.52,
+// 最佳句 0.51~0.69),把片段命中的行也纳入候选、相似度取两者的最大值。
+chunkSims) {
     // v1.5: vec0 虚拟表禁止 JOIN(KNN 必须在 vec0 上 LIMIT),项目过滤放在第二段 memory 查询
     // 候选集放大(全库 KNN)保证单项目召回;隔离语义由 memory 查询的 project=? 保证
     const knnLimit = Math.min(topK * 8, 60);
@@ -337,11 +390,22 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
     }
     if (knnRows.length === 0)
         return [];
-    const rowidMap = new Map();
+    // 相似度表(不再是距离表):行级 L2→余弦,再用片段级余弦取大
+    const simMap = new Map();
     for (const r of knnRows)
-        rowidMap.set(Number(r.rowid), r.distance);
-    const rowidPlaceholders = knnRows.map(() => '?').join(',');
-    const rowidParams = knnRows.map(r => Number(r.rowid));
+        simMap.set(Number(r.rowid), l2ToCosine(Number(r.distance)));
+    const fromChunk = new Set();
+    if (chunkSims) {
+        for (const [rid, s] of chunkSims) {
+            if (s > (simMap.get(rid) ?? 0))
+                fromChunk.add(rid);
+            simMap.set(rid, Math.max(simMap.get(rid) ?? 0, s));
+        }
+    }
+    // SQL 的 IN 列表要覆盖"片段命中但整行没进 KNN"的行
+    const candidateRowids = [...simMap.keys()];
+    const rowidPlaceholders = candidateRowids.map(() => '?').join(',');
+    const rowidParams = candidateRowids;
     const conditions = [`m.rowid IN (${rowidPlaceholders})`, 'm.is_active = 1', 'm.project = ?', "COALESCE(m.status, '') <> 'superseded'"];
     const params = [...rowidParams, project];
     if (options.type) {
@@ -374,10 +438,11 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
   `).all(...params);
     const results = [];
     for (const row of rows) {
-        if (excludeIds.has(row.id))
-            continue;
-        const dist = rowidMap.get(row.rowid) ?? 1.0;
-        const similarity = l2ToCosine(dist); // L2 → 余弦(2026-10-28)
+        // 2026-10-28:这里原本 `if (excludeIds.has(row.id)) continue;` —— 把"标签路弱命中(0.33)"的行
+        // 从向量/片段路里整条跳掉,于是它的强相似度(片段 0.66)永远上报不了。「你母亲是怎么死的」
+        // 要点的行就是这样消失的:标签路给了个低分把它锁在外面,注入里根本见不到。
+        // 和词法路同一个修法:不排除,合并后由 bestById 保留 similarity 更高的那份。
+        const similarity = simMap.get(row.rowid) ?? 0; // 行级/片段级取大(2026-10-28)
         const { score, biasBoost } = computeScore(row, similarity, project);
         if (score >= minScore) {
             results.push({
@@ -390,8 +455,10 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
                 tier: row.tier || 'standard',
                 parentId: row.parent_id || null,
                 score, similarity: Math.round(similarity * 1000) / 1000,
-                basis: 'vector', // 2026-10-28:向量命中必须自带 basis,否则注入层按默认
-                // (向量)门槛之外的量纲判它,且统计里查不出走了哪条路
+                // 2026-10-28:向量/片段各自标 basis —— 两者量纲不同(短片段之间余弦天然偏高约 0.1),
+                // 注入层必须按来源取不同门槛,否则分块会把噪音也抬过线(实测噪音 top 从 0.41~0.49
+                // 抬到 0.50~0.57,原来那道 0.50 的证据门当场失效)。
+                basis: fromChunk.has(row.rowid) ? 'chunk' : 'vector',
                 createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
                 accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
             });
@@ -415,6 +482,32 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
     const haystack = `(COALESCE(m.title, '') || ' ' || m.text)`;
     const matchExpr = `(${terms.map(() => `CASE WHEN ${haystack} LIKE ? THEN 1 ELSE 0 END`).join(' + ')})`;
     const likeParams = terms.map(t => `%${t}%`);
+    // 2026-10-28:IDF 加权。原来 lexSim = 命中个数 / min(词数,4),把「母亲」「黑潮」这种**罕见**
+    // 词和「自己」「记得」这种高频 bigram 一视同仁 —— 于是实体问句(黑潮是什么 / 你的生日是哪天)
+    // 只共享 1 个实体词时只有 0.25,被高频词拼出来的行反而更高,要点的行排到 15~39 名。
+    // 权重取 log(1 + N/(1+df)):df 小(罕见)权重高,df 大(高频)权重接近 0。
+    const dfSql = `SELECT COUNT(*) c FROM memory m WHERE m.is_active = 1 AND m.project = ?`
+        + ` AND COALESCE(m.status, '') <> 'superseded'`
+        + (options.memType ? ' AND m.mem_type = ?' : '')
+        + (options.characterId ? ' AND m.character_id = ?' : '');
+    const dfBase = [project, ...(options.memType ? [String(options.memType)] : []), ...(options.characterId ? [options.characterId] : [])];
+    let corpusN = 1;
+    try {
+        corpusN = Number(db.prepare(dfSql).get(...dfBase)?.c) || 1;
+    }
+    catch {
+        corpusN = 1;
+    }
+    const idf = terms.map((t) => {
+        let df = 0;
+        try {
+            df = Number(db.prepare(`${dfSql} AND ${haystack} LIKE ?`).get(...dfBase, `%${t}%`)?.c) || 0;
+        }
+        catch {
+            df = 0;
+        }
+        return Math.log(1 + corpusN / (1 + df));
+    });
     const conds = [`m.is_active = 1`, `m.project = ?`, "COALESCE(m.status, '') <> 'superseded'", `${matchExpr} >= 1`];
     const params = [project, ...likeParams];
     if (options.memType) {
@@ -458,8 +551,9 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
         // 改成真实词法覆盖率:命中词数 / min(词数, 4)(分母封顶 4,长问句的 bigram 数会虚高,
         // 否则「你母亲是怎么死的」这种只共享一个词的问句永远过不了线)。
         const lower = `${String(row.title || '')} ${String(row.text || '')}`.toLowerCase();
-        const matched = terms.reduce((n, t) => n + (lower.includes(t.toLowerCase()) ? 1 : 0), 0);
-        const lexSim = Math.min(1, matched / Math.min(terms.length, 4));
+        const matchedWeight = terms.reduce((n, t, i) => n + (lower.includes(t.toLowerCase()) ? idf[i] : 0), 0);
+        const totalWeight = idf.reduce((a, b) => a + b, 0) || 1;
+        const lexSim = Math.min(1, matchedWeight / totalWeight);
         const { score, biasBoost } = computeScore(row, lexSim, project);
         return {
             id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,

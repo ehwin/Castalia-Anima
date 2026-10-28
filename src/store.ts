@@ -8,6 +8,7 @@ import { DatabaseManager, generateId, listMemTypeDirs } from './db.js';
 import { linkFactEntities, linkMemoryToEntities } from './entities.js';
 import type Database from 'better-sqlite3';
 import { embed, getEmbeddingCached } from './ollama.js';
+import { ensureChunksForRow } from './chunkIndex.js';
 import { recordTopics } from './bias.js';
 import { PROJECT_ID, CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
 import { MemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
@@ -512,6 +513,8 @@ export async function batchEmbedPending(characterId: string = CHAR_ID, project?:
       const vec = new Float32Array(await embed(row.text, project));
       db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(BigInt(row.rowid), vec);
       db.prepare('UPDATE memory SET embed_fail_count = 0 WHERE rowid = ?').run(row.rowid);
+      // 2026-10-28:整行向量之外再建句级片段索引(长记忆的整行余弦被稀释,详见 chunkIndex.ts)
+      try { await ensureChunksForRow(db, Number(row.rowid), String(row.text)); } catch { /* 片段失败不影响整行 */ }
       embedded++;
     } catch (e: any) {
       try { db.prepare('UPDATE memory SET embed_fail_count = COALESCE(embed_fail_count, 0) + 1 WHERE rowid = ?').run(row.rowid); } catch { /* 旧库无列 */ }

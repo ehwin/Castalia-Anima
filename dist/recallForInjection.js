@@ -8,6 +8,16 @@ export const INJECTION_DEFAULTS = {
     // 任何绝对阈值都分不开),0.5 等于把真实语义命中全丢。降到 0.45 并保留词法路 0.2 作为
     // 精确信号;噪音里 top≥0.45 的少数问句会注入 1~2 条她自己的记忆,已实测记录。
     minSimilarityVector: 0.45,
+    // 片段门槛(2026-10-28):短片段之间的余弦天然比整行高约 0.1(实测同一行:整行 0.405~0.52,
+    // 最佳句 0.51~0.69)。门开在 0.60:相关问句 11/14 至少有一段 ≥0.60,噪音问句 8/8 一段都没有。
+    minSimilarityChunk: 0.60,
+    // 2026-10-28(4) 证据门槛:必须有**至少一条**强命中才注入。
+    // 实测 22 条探针(14 条关于她的真问题 + 8 条日常任务):"sim ≥ 0.50 的命中条数"这一项
+    // 相关问句 14/14 ≥ 1、噪音问句 8/8 = 0 —— 完全可分;而 top 余弦本身(相关 0.476~0.522
+    // vs 噪音 0.415~0.487)是重叠的。所以门开在"有没有一条真的贴得近",而不是"最高分够不够高"。
+    strongEvidence: 0.50,
+    // 强词法证据:词法覆盖率 ≥ 60%(IDF 加权后,罕见实体词命中权重高)也算数,给"没有向量"的部署兜底
+    strongLexical: 0.60,
     capChars: 1200,
     maxItemChars: 200,
 };
@@ -21,6 +31,20 @@ export function injectionMinSimilarity() {
  * 向量相关通常 ≥0.5,而自然问句的词法命中经常只有 0.2~0.4。以前两者共用 0.5,
  * 于是**没配嵌入 key 时每一条文本命中都被判"不够像"丢掉**,她的记忆一条都注入不了。
  */
+/** 片段门槛(env MEMORY_INJECT_MIN_SIM_CHUNK,默认 0.60):见 INJECTION_DEFAULTS 里的实测分布 */
+export function injectionMinSimilarityChunk() {
+    const raw = parseFloat(process.env.MEMORY_INJECT_MIN_SIM_CHUNK || '');
+    return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : INJECTION_DEFAULTS.minSimilarityChunk;
+}
+/** 证据门槛(env MEMORY_INJECT_STRONG,默认 0.50):至少一条命中要真的贴得近,否则不注入 */
+export function injectionStrongEvidence() {
+    const raw = parseFloat(process.env.MEMORY_INJECT_STRONG || '');
+    return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : INJECTION_DEFAULTS.strongEvidence;
+}
+export function injectionStrongLexical() {
+    const raw = parseFloat(process.env.MEMORY_INJECT_STRONG_LEXICAL || '');
+    return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : INJECTION_DEFAULTS.strongLexical;
+}
 /** 向量门槛(env MEMORY_INJECT_MIN_SIM_VECTOR,默认 0.45):见 INJECTION_DEFAULTS 里的实测说明 */
 export function injectionMinSimilarityVector() {
     const raw = parseFloat(process.env.MEMORY_INJECT_MIN_SIM_VECTOR || '');
@@ -60,10 +84,20 @@ export function renderInjectionBlock(hits, options = {}) {
     const maxItemChars = Math.max(20, options.maxItemChars ?? INJECTION_DEFAULTS.maxItemChars);
     const minSimilarity = options.minSimilarity ?? injectionMinSimilarity();
     const minSimLexical = options.minSimilarityLexical ?? injectionMinSimilarityLexical();
-    const minSimVector = options.minSimilarityVector ?? injectionMinSimilarityVector();
+    // 兼容:老调用方(含既有测试)用 minSimilarity 表示"向量余弦门槛",显式传入时它优先于内置默认
+    const minSimVector = options.minSimilarityVector ?? options.minSimilarity ?? injectionMinSimilarityVector();
+    const minSimChunk = options.minSimilarityChunk ?? injectionMinSimilarityChunk();
+    const strongEvidence = options.strongEvidence ?? injectionStrongEvidence();
+    const strongLexical = options.strongLexical ?? injectionStrongLexical();
     const topK = Math.max(0, options.topK ?? INJECTION_DEFAULTS.topK);
     // 按命中来源取门槛:向量用余弦门槛,标签/词法用词法门槛。undefined 视为向量(老调用方语义不变)
-    const gateOf = (h) => (h?.basis && h.basis !== 'vector' ? minSimLexical : minSimVector);
+    const gateOf = (h) => {
+        if (h?.basis === 'chunk')
+            return minSimChunk;
+        if (h?.basis && h.basis !== 'vector')
+            return minSimLexical;
+        return minSimVector;
+    };
     const stats = {
         count: 0, chars: 0, topSim: 0, dropped: 0, belowThreshold: 0, minSimilarity,
     };
@@ -71,7 +105,21 @@ export function renderInjectionBlock(hits, options = {}) {
         return { text: '', stats: { ...stats, skipped: 'no-hits' } };
     }
     stats.topSim = Math.max(...hits.map(h => Number(h.similarity) || 0));
+    // 2026-10-28(4):先看证据。没有任何一条命中贴得够近(向量 ≥0.50)、也没有一条词法上
+    // 高度重合(≥60%),就**一条都不注入** —— 宁可少注入,也不要拿"最不像话的那条"去污染提示词。
+    // 这条门槛把 8/8 噪音问句挡在外面(它们的 sim≥0.50 计数恒为 0),而 14/14 真问题都能过。
+    // 2026-10-28:证据门只对"有向量能力"的部署生效。纯词法部署(EMBED_MODE=none)里没有向量命中,
+    // 硬要一条 ≥0.60 的词法覆盖率会把正常召回全挡掉 —— 那正是本轮最早修掉的那个 bug,别绕回去。
+    const hasVectorBasis = hits.some(h => !h.basis || h.basis === 'vector' || h.basis === 'chunk');
+    const strongVec = hits.some(h => (!h.basis || h.basis === 'vector') && (Number(h.similarity) || 0) >= strongEvidence);
+    const strongChunk = hits.some(h => h.basis === 'chunk' && (Number(h.similarity) || 0) >= minSimChunk);
+    const strongLex = hits.some(h => h.basis && h.basis !== 'vector' && h.basis !== 'chunk' && (Number(h.similarity) || 0) >= strongLexical);
+    if (hasVectorBasis && !strongVec && !strongChunk && !strongLex) {
+        const below = hits.filter(h => (Number(h.similarity) || 0) < gateOf(h)).length;
+        return { text: '', stats: { ...stats, belowThreshold: below, skipped: 'no-strong-evidence' } };
+    }
     const kept = hits.filter(h => (Number(h.similarity) || 0) >= gateOf(h)).slice(0, topK);
+    // 2026-10-28:先算 belowThreshold 再返回 —— 证据门提前返回时也得留下"挡掉几条"的诊断数字
     stats.belowThreshold = hits.length - hits.filter(h => (Number(h.similarity) || 0) >= gateOf(h)).length;
     if (kept.length === 0) {
         return { text: '', stats: { ...stats, skipped: 'below-threshold' } };
