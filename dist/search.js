@@ -202,13 +202,33 @@ export async function searchMemoryAcross(options) {
 // ═══════════════════════════════════════════════════════════════════
 // 标签搜索 — 从 query 提取关键词，SQL tag LIKE 匹配
 // ═══════════════════════════════════════════════════════════════════
+const QUERY_STOP_WORDS = new Set(['的', '了', '是', '我', '你', '他', '她', '吗', '呢', '吧', '啊',
+    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'in', 'on', 'at', 'to', 'of', 'and', 'or',
+    '有', '在', '不', '要', '会', '能', '就', '都', '也', '还', '和', '与', '这', '那', '什么', '怎么']);
+/**
+ * 检索词切分(2026-10-28):中文没有空格,整句会被切成一个超长 token,`text LIKE`/`tags LIKE`
+ * 就永远匹配不到 —— 实测「你还记得自己是谁吗」召回 0 条,而「谕女 月食 127」召回 5 条。
+ * 所以 CJK 连续段按 **bigram** 切分,其它语言仍按空白/标点切;词数封顶,避免 SQL 条件爆炸。
+ */
+export function queryTerms(query, max = 16) {
+    const out = new Set();
+    for (const raw of String(query ?? '').split(/[\s,，。！？、；：""''（）()\[\]【】\-\/\\|]+/)) {
+        const seg = raw.trim();
+        if (seg.length < 2)
+            continue;
+        if (!/[\u4e00-\u9fff]/.test(seg))
+            out.add(seg);
+        else
+            for (let i = 0; i + 2 <= seg.length; i++)
+                out.add(seg.slice(i, i + 2));
+        if (out.size >= max)
+            break;
+    }
+    return [...out].slice(0, max);
+}
 /** 从中文/英文 query 中提取关键词 */
 function extractKeywords(query) {
-    const stopWords = new Set(['的', '了', '是', '我', '你', '他', '她', '吗', '呢', '吧', '啊',
-        'the', 'a', 'an', 'is', 'are', 'was', 'were', 'in', 'on', 'at', 'to', 'of', 'and', 'or',
-        '有', '在', '不', '要', '会', '能', '就', '都', '也', '还', '和', '与', '这', '那', '什么', '怎么']);
-    const tokens = query.split(/[\s,，。！？、；：""''（）()\[\]【】\-\/\\|]+/);
-    return [...new Set(tokens.filter(t => t.length >= 2 && !stopWords.has(t.toLowerCase())))];
+    return queryTerms(query).filter(t => !QUERY_STOP_WORDS.has(t.toLowerCase()));
 }
 /** SQL 标签搜索：匹配 memory.tags JSON 数组 */
 function tagSearch(db, options) {
@@ -362,13 +382,17 @@ function vectorKnnSearch(db, options, floatQuery, excludeIds, topK, minScore) {
 }
 /** 文本回退搜索(向量不可用时) */
 function textFallbackSearch(db, options, excludeIds, topK, minScore) {
-    const terms = options.query.split(/\s+/).filter(t => t.length > 0);
+    const terms = queryTerms(options.query);
     if (terms.length === 0)
         return [];
     const project = normalizeProject(options.project);
-    const likeConditions = terms.map(() => 'm.text LIKE ?').join(' OR ');
+    // bigram 会带出「记得」「自己」这类高频词,却也正因为如此,短问句往往只共享 1 个 bigram
+    // ("你母亲是怎么死的" 与行文只共享「母亲」)。所以这里**召回优先**:命中 ≥1 词就进候选,
+    // 精度交给排序 —— 命中词多的排前面(ORDER BY 命中数 DESC),而不是把候选直接丢掉。
+    // 之前试过 need=2,结果自然问句又变成 0 条,等于没修(2026-10-28)。
+    const matchExpr = `(${terms.map(() => 'CASE WHEN m.text LIKE ? THEN 1 ELSE 0 END').join(' + ')})`;
     const likeParams = terms.map(t => `%${t}%`);
-    const conds = [`m.is_active = 1`, `m.project = ?`, "COALESCE(m.status, '') <> 'superseded'", `(${likeConditions})`];
+    const conds = [`m.is_active = 1`, `m.project = ?`, "COALESCE(m.status, '') <> 'superseded'", `${matchExpr} >= 1`];
     const params = [project, ...likeParams];
     if (options.memType) {
         conds.push('m.mem_type = ?');
@@ -400,8 +424,9 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
       m.vad_valence, m.vad_arousal, m.vad_dominance, m.tsundere_level
     FROM memory m
     WHERE ${conds.join(' AND ')}
-    ORDER BY m.created_at DESC LIMIT ?
-  `).all(...params, topK * 2);
+    ORDER BY (${terms.map(() => 'CASE WHEN m.text LIKE ? THEN 1 ELSE 0 END').join(' + ')}) DESC, m.created_at DESC
+    LIMIT ?
+  `).all(...params, ...likeParams, topK * 2);
     return rows
         .filter(row => !excludeIds.has(row.id))
         .map(row => {
