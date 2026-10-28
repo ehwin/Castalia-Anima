@@ -34,6 +34,7 @@ process.env.EMBED_MODE = 'none';
 
 const { DatabaseManager } = await import(pathToFileURL(path.join(ROOT, 'dist', 'db.js')).href);
 const { searchMemory, queryTerms } = await import(pathToFileURL(path.join(ROOT, 'dist', 'search.js')).href);
+const { recallForInjection } = await import(pathToFileURL(path.join(ROOT, 'dist', 'recallForInjection.js')).href);
 
 let pass = 0;
 let fail = 0;
@@ -103,6 +104,13 @@ check('只有正文匹配时也能召回(tags 为空)', textOnly.some(r => r.id 
 
 const scattered = await search('你把手镯交给谁了');
 check('会被打散的自然问句能召回(空白切词必红)', scattered.some(r => r.id === 'r5'), `命中 ${scattered.length}: ${scattered.map(r => r.id).join(',')}`);
+
+// 注入层:没向量时,文本命中带的是词法相似度(0.2~1),以前被向量门槛 0.5 全数丢掉,
+// 于是"检索命中 8 条、注入 0 条"。这条断言钉住那一层(2026-10-28)。
+const inj = await recallForInjection('你母亲是怎么死的', { project: PROJ, characterId: 'cjk' });
+check('无向量时文本命中能被注入(修复前为空)', (inj.text || '').includes('母亲'), `chars=${inj.stats?.chars} belowThreshold=${inj.stats?.belowThreshold}`);
+const injJunk = await recallForInjection('量子纠缠 弦理论', { project: PROJ, characterId: 'cjk' });
+check('无关问句不注入', !(injJunk.text || '').trim(), `chars=${injJunk.stats?.chars}`);
 
 console.log(`\n通过 ${pass} / 失败 ${fail}`);
 if (!KEEP) { try { fs.rmSync(TMP, { recursive: true, force: true }); } catch { /* Windows 上 db 句柄未释放时会 EPERM,清理失败不影响结论 */ } }

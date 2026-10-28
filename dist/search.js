@@ -285,7 +285,9 @@ function tagSearch(db, options) {
     return rows.map(row => {
         const memTags = parseTagsSafe(row.tags);
         const matchedTags = keywords.filter(k => memTags.some((t) => t.toLowerCase().includes(k.toLowerCase()))).length;
-        const tagScore = Math.min(1.0, matchedTags / Math.max(1, keywords.length));
+        // 标签是人工挑的词:命中 1 个就已经是强信号,不能拿问句词数当分母(自然问句会被切成
+        // 6~8 个 bigram,1/6=0.167 反而被判成"不够像")。分母封顶 3(2026-10-28)。
+        const tagScore = Math.min(1.0, matchedTags / Math.max(1, Math.min(keywords.length, 3)));
         const { score, biasBoost } = computeScore(row, tagScore, project);
         return {
             id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
@@ -296,7 +298,7 @@ function tagSearch(db, options) {
             subject: row.subject || 'user', agentMood: row.agent_mood, agentDesire: row.agent_desire,
             tier: row.tier || 'standard',
             parentId: row.parent_id || null,
-            score, similarity: Math.round(tagScore * 1000) / 1000,
+            score, similarity: Math.round(tagScore * 1000) / 1000, basis: 'tag',
             createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
             accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
         };
@@ -430,7 +432,14 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
     return rows
         .filter(row => !excludeIds.has(row.id))
         .map(row => {
-        const { score, biasBoost } = computeScore(row, 0.3, project);
+        // 2026-10-28: 原来这里硬写 similarity: 0.3,而注入门槛是 0.5(向量余弦量纲) ——
+        // 于是没向量时**每一条文本命中都被当成"不够像"丢掉**,她的记忆一条也进不了提示词。
+        // 改成真实词法覆盖率:命中词数 / min(词数, 4)(分母封顶 4,长问句的 bigram 数会虚高,
+        // 否则「你母亲是怎么死的」这种只共享一个词的问句永远过不了线)。
+        const lower = String(row.text || '').toLowerCase();
+        const matched = terms.reduce((n, t) => n + (lower.includes(t.toLowerCase()) ? 1 : 0), 0);
+        const lexSim = Math.min(1, matched / Math.min(terms.length, 4));
+        const { score, biasBoost } = computeScore(row, lexSim, project);
         return {
             id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type || 'general', category: row.category,
             subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
@@ -440,7 +449,7 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
             subject: row.subject || 'user', agentMood: row.agent_mood, agentDesire: row.agent_desire,
             tier: row.tier || 'standard',
             parentId: row.parent_id || null,
-            score, similarity: 0.3,
+            score, similarity: Math.round(lexSim * 1000) / 1000, basis: 'lexical',
             createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
             accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
         };
@@ -525,7 +534,7 @@ function supersededRecall(db, options, excludeIds, limit) {
             tier: row.tier || 'standard',
             parentId: row.parent_id || null,
             score: Math.round(score * SUPERSEDED_PENALTY * 1000) / 1000,
-            similarity: 0.3,
+            similarity: 0.3, basis: 'lexical',
             createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
             accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
             superseded: true,
