@@ -21,6 +21,7 @@ import { makeLlmChannel, callLlm, REFLECT_DEEP_MAX_TOKENS } from './reflectionLl
 import { normalizeMemType, MemType } from './memType.js';
 import { EMOTIONAL_FIDELITY, wholeRecordBatches } from './reflectionFidelity.js';
 import { CHAR_ID } from './env.js';
+import crypto from 'node:crypto';
 import { serializeTags } from './tags.js';
 
 export interface ReflectAllOptions {
@@ -28,6 +29,7 @@ export interface ReflectAllOptions {
   maxPerLib?: number;  // 每库上限,默认 100
   dryRun?: boolean;    // true = 只分析不写入
   projects?: string[]; // 只反思指定 project 库(如 ['hermes']),默认全部库
+  all?: boolean;       // true = 忽略增量账本,全量反思(逃生门)
 }
 
 export interface ReflectAllInsightSource {
@@ -64,6 +66,81 @@ export interface ReflectAllResult {
   errors: string[];
   /** dryRun 时附 LLM 分析结果(每条含 sources);非 dryRun 也附上便于核对 */
   insightList: ReflectAllInsight[];
+  /** 增量账本:本轮实际送去反思的条数 / 因未变化而跳过的条数 */
+  fresh?: number;
+  unchanged?: number;
+  /** 'no-new' = 账本里全部已反思过,零次 LLM 调用 */
+  skipReason?: string;
+}
+
+/**
+ * 增量反思账本(v1.29,移植自 Lite 的同款设计,但落在**进程内文件**上:
+ * Anima 没有 web 任务表,也不需要 —— 账本就住在 bank 根,谁跑谁读)。
+ *
+ * 键 = instance|project|id|sha1(text)[:12]:带内容哈希,所以记忆被 update 后会重新入列,
+ * 只按 id 记会永久漏掉改动后的内容。
+ */
+export interface ReflectLedger { version: 1; seen: Record<string, string>; updatedAt?: string }
+
+export function reflectRecordKey(r: { instance: string; project: string; id: string; text: string }): string {
+  const h = crypto.createHash('sha1').update(String(r.text || '')).digest('hex').slice(0, 12);
+  return `${r.instance}|${r.project}|${r.id}|${h}`;
+}
+
+/** 账本路径:REFLECT_LEDGER_FILE > <REFLECT_DIR|MEMORY_DB_DIR>/reflect-ledger.json */
+export function reflectLedgerPath(): string {
+  const explicit = (process.env.REFLECT_LEDGER_FILE || '').trim();
+  if (explicit) return explicit;
+  const root = (process.env.REFLECT_DIR || process.env.MEMORY_DB_DIR || '').trim();
+  return path.join(root || currentMemDir(), 'reflect-ledger.json');
+}
+
+/**
+ * 读账本。损坏/版本不符 → 返回空账本并给出 error:**宁可多花一次钱全量跑,也不漏记忆**。
+ */
+export function loadReflectLedger(file: string): { ledger: ReflectLedger; error?: string } {
+  const empty: ReflectLedger = { version: 1, seen: {} };
+  try {
+    if (!fs.existsSync(file)) return { ledger: empty };
+    const raw = JSON.parse(fs.readFileSync(file, 'utf-8').replace(/^﻿+/, ''));
+    if (!raw || raw.version !== 1 || typeof raw.seen !== 'object' || !raw.seen) {
+      return { ledger: empty, error: `账本格式不符(${file}),按全量处理` };
+    }
+    return { ledger: { version: 1, seen: raw.seen, updatedAt: raw.updatedAt } };
+  } catch (e: any) {
+    return { ledger: empty, error: `账本读取失败(${file}): ${e.message},按全量处理` };
+  }
+}
+
+export function selectNewRecords<T extends { instance: string; project: string; id: string; text: string }>(
+  records: T[], ledger: ReflectLedger,
+): { fresh: T[]; skipped: number } {
+  const fresh: T[] = [];
+  let skipped = 0;
+  for (const r of records) {
+    if (ledger.seen[reflectRecordKey(r)]) skipped++;
+    else fresh.push(r);
+  }
+  return { fresh, skipped };
+}
+
+export function mergeReflectLedger<T extends { instance: string; project: string; id: string; text: string }>(
+  ledger: ReflectLedger, records: T[],
+): ReflectLedger {
+  const seen = { ...ledger.seen };
+  for (const r of records) seen[reflectRecordKey(r)] = new Date().toISOString();
+  return { version: 1, seen, updatedAt: new Date().toISOString() };
+}
+
+export function saveReflectLedger(file: string, ledger: ReflectLedger): void {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(ledger));
+    fs.renameSync(tmp, file);
+  } catch (e: any) {
+    console.warn(`[reflect_all] 账本写入失败(不影响本轮结果): ${e.message}`);
+  }
 }
 
 const DEFAULT_MAX_TOTAL = 300;
@@ -211,6 +288,8 @@ export async function runReflectAll(opts?: ReflectAllOptions): Promise<ReflectAl
     llm: { insights: 0, skipped: 0, saved: 0 },
     errors: [],
     insightList: [],
+    fresh: 0,
+    unchanged: 0,
   };
 
   // 1. 库清单(跳过 reflect 自身;projects 指定时只保留匹配库)
@@ -254,13 +333,29 @@ export async function runReflectAll(opts?: ReflectAllOptions): Promise<ReflectAl
     return { ...base, ok: base.errors.length === 0, errors: base.errors.length ? base.errors : ['各库均无活跃记忆,无可反思内容'] };
   }
 
+  // 2.5 增量过滤:账本里已反思过的(同内容)不再送 LLM
+  const ledgerFile = reflectLedgerPath();
+  const ledgerRead = loadReflectLedger(ledgerFile);
+  if (ledgerRead.error) base.errors.push(ledgerRead.error);
+  const useLedger = opts?.all !== true;
+  const selected = useLedger
+    ? selectNewRecords(records, ledgerRead.ledger)
+    : { fresh: records, skipped: 0 };
+  const freshRecords = selected.fresh;
+  base.fresh = freshRecords.length;
+  base.unchanged = selected.skipped;
+  if (freshRecords.length === 0) {
+    // 零 LLM 调用:这是"常态成本 ≈ 0"的关键路径,不是错误
+    return { ...base, ok: base.errors.length === 0, skipReason: 'no-new' };
+  }
+
   // 3+4. LLM 跨库反思
   const channel = makeLlmChannel('REFLECT');
   if (!channel.apiKey) {
     return { ...base, errors: ['REFLECT LLM 未配置(REFLECT_LLM_API_KEY 缺失),无法执行跨库反思'] };
   }
   // Batch entire records. Never truncate an individual record or the prompt tail.
-  const batches = wholeRecordBatches(records, 30000, 12);
+  const batches = wholeRecordBatches(freshRecords, 30000, 12);
   const insightList: ReflectAllInsight[] = [];
   for (const batch of batches) {
     const policies = EMOTIONAL_FIDELITY;
@@ -340,5 +435,9 @@ export async function runReflectAll(opts?: ReflectAllOptions): Promise<ReflectAl
   base.llm.skipped = skipped;
   base.llm.saved = saved;
   base.ok = base.errors.length === 0;
+  // 只把**本轮真正送进 LLM 且成功**的记录记入账本;失败批次不记,下次重跑
+  if (base.ok && useLedger) {
+    saveReflectLedger(ledgerFile, mergeReflectLedger(ledgerRead.ledger, freshRecords));
+  }
   return base;
 }
