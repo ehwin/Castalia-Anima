@@ -15,6 +15,7 @@
  * 渲染与召回分开：renderInjectionBlock 是纯函数（无 IO、无时间源），可以被断言钉死。
  */
 import type { SearchResult } from './search.js';
+import { recallFactsForQuery } from './factRecall.js';
 import { searchMemory } from './search.js';
 
 export interface InjectionOptions {
@@ -30,6 +31,10 @@ export interface InjectionOptions {
   minSimilarityChunk?: number;
   /** 反刍/抽取产出的行(reflect_*)的向量门槛，默认 0.60（env MEMORY_INJECT_MIN_SIM_REFLECT） */
   minSimilarityReflect?: number;
+  /** 关掉事实路（默认开）：facts 表的稳定事实单独成块 */
+  includeFacts?: boolean;
+  /** 事实路最多注入几条，默认 4 */
+  maxFacts?: number;
   strongEvidence?: number;
   strongLexical?: number;
   /** 整块字符预算，默认 1200 */
@@ -67,6 +72,8 @@ export interface InjectionStats {
   /** 整块没注入时的原因 */
   skipped?: 'no-hits' | 'below-threshold' | 'no-room' | 'no-strong-evidence';
   minSimilarity: number;
+  /** 事实路注入了几条稳定事实（facts 表），没有事实路时为空 */
+  facts?: number;
   /** 因 recentIds 去重跳过的条数 */
   deduped: number;
   /** top1 - top2(只有一个命中时为 top1) */
@@ -329,6 +336,26 @@ export async function recallForInjection(query: string, options: InjectionOption
   }
   const t0 = Date.now();
   const out = renderInjectionBlock(hits, { ...options, topK });
+
+  // 事实路（2026-10-29）：facts 表里是已经确认过的稳定事实，之前完全没有参与注入。
+  // 独立成块而不是混进 <memory>：memory 块的语义是"过去对话的片段"，事实块是"已确认的结论"，
+  // 两者冲突时的处置方式不同。预算独立（默认 420 字），不挤占记忆块的 capChars。
+  if (options.includeFacts !== false) {
+    try {
+      const facts = recallFactsForQuery(trimmed, {
+        project: options.project,
+        characterId: options.characterId,
+        limit: options.maxFacts ?? 4,
+      });
+      if (facts.text) {
+        out.text = out.text ? `${out.text}\n${facts.text}` : facts.text;
+        out.stats.facts = facts.facts.length;
+        out.stats.chars = out.text.length;
+      }
+    }
+    catch { /* 事实路失败不能影响记忆注入 */ }
+  }
+
   out.stats.ms = Date.now() - t0;
   // 观测:整条链路以前完全不可见(报告里 P0 的一条)。默认静默,env/选项开。
   if (options.log === true || process.env.MEMORY_RECALL_LOG === '1') {
