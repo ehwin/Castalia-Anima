@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { resolveFedLibraries, type FedLibrary } from './federation/index.js';
 import { currentMemDir, DatabaseManager, generateId, initProjectSchema, memTypeDir } from './db.js';
+import { evaluateInsight, charNgrams } from './insightQuality.js';
 import { makeLlmChannel, callLlm, REFLECT_DEEP_MAX_TOKENS } from './reflectionLlm.js';
 import { normalizeMemType, MemType } from './memType.js';
 import { EMOTIONAL_FIDELITY, wholeRecordBatches } from './reflectionFidelity.js';
@@ -55,6 +56,10 @@ export interface ReflectAllInsight {
   importance: number;
   tags: string[];
   sources: ReflectAllInsightSource[];
+  /** 证据原句(必须在被引用的来源正文里逐字出现),质检第 1 闸 */
+  evidence?: string;
+  /** 这条洞察新增了什么:rule/decision/causal/contrast/integration/summary */
+  adds?: string;
 }
 
 export interface ReflectAllResult {
@@ -71,6 +76,21 @@ export interface ReflectAllResult {
   unchanged?: number;
   /** 'no-new' = 账本里全部已反思过,零次 LLM 调用 */
   skipReason?: string;
+  /** 质检闸统计:被拦掉的洞察与理由(全部确定性判定,不调 LLM) */
+  quality?: {
+    evaluated: number;
+    written: number;
+    restatement: number;
+    evidenceMissing: number;
+    nearDuplicate: number;
+    noveltyMean: number;
+    /** 只统计真正写入的那些的新颖度均值(和"候选"分开,避免被拒的拉低口径) */
+    noveltyWritten?: number;
+    /** 写入的洞察里引用 ≥2 条来源的条数(跨库整合是否真的发生) */
+    crossSource?: number;
+    /** 近重复闸是否真的跑了(dryRun 下不读目标库则为 false) */
+    dupChecked?: boolean;
+  };
 }
 
 /**
@@ -172,6 +192,11 @@ export function buildReflectAllSystemPrompt(): string {
 1. 去重合并:语义重复的记忆只保留一条整合后的洞察,sources 列出所有来源库
 2. 提炼洞察:从零散记忆中提炼有长期价值的高层洞察(用户画像/偏好/情感经历/关系约定/行为纠正/外部指针)
 3. 摘要只作导航;逐条保留有价值的事实、原话、证据、修正、适用范围和未解决事项。按内容分条，长度以保留信息所需为准。
+4. 只写"新增了什么":规则/结论/决定/因果/对比/跨源整合。**不要复述来源句子**——已经能检索到的原句不需要你再写一遍。没有可提炼的新信息就不要生成洞察。
+
+【证据约束(硬性)】每条洞察必须带 evidence:从它引用的某条来源里**逐字复制**的一句原文(4~60 字,不要改写、不要拼接)。找不到可引用的原句,说明这条洞察是模型自己的发挥,不要输出。
+
+【配额】每 1 条来源记录最多产出 1 条洞察;能跨 ≥2 条来源合并的优先;整批洞察数不得超过来源数的 1/2(向下取整,至少 1 条)。宁少勿滥。
 
 【记忆类型(mem_type)】每条洞察归入 5 种封闭类型之一:
 - user — AI 对用户的画像及用户身份/偏好；区分 AI 自身与用户
@@ -193,6 +218,8 @@ export function buildReflectAllSystemPrompt(): string {
       "text": "跨库整合后的洞察/合并后的记忆",
       "memType": "user|feedback|project|reference|general",
       "importance": 0.0-1.0,
+      "evidence": "从某条来源逐字复制的原句(4~60 字)",
+      "adds": "rule|decision|causal|contrast|integration|summary",
       "tags": ["标签1", "标签2"],
       "sources": [{"instance": "库所在实例名", "project": "库名", "memType": "来源分类", "id": "输入来源的精确ID"}]
     }
@@ -265,6 +292,8 @@ function normalizeInsight(raw: any): ReflectAllInsight | null {
     importance: Number.isFinite(importance) ? Math.min(1, Math.max(0, importance)) : 0.5,
     tags: tagsDedup,
     sources,
+    evidence: typeof raw.evidence === 'string' && raw.evidence.trim() ? raw.evidence.trim().slice(0, 120) : undefined,
+    adds: typeof raw.adds === 'string' && raw.adds.trim() ? raw.adds.trim().slice(0, 24) : undefined,
   };
 }
 
@@ -405,22 +434,70 @@ export async function runReflectAll(opts?: ReflectAllOptions): Promise<ReflectAl
     dbs.set(mt, db);
     return db;
   };
+  const quality = { evaluated: 0, written: 0, restatement: 0, evidenceMissing: 0, nearDuplicate: 0, noveltyMean: 0, noveltyWritten: 0, crossSource: 0, dupChecked: false };
+  const recMeta = new Map<string, { text: string; importance: number }>();
+  for (const r of records) recMeta.set(`${r.instance}|${r.project}|${r.id}`, { text: r.text, importance: r.importance });
+  const existingByType = new Map<MemType, Array<{ id: string; text: string }>>();
   try {
     const now = new Date().toISOString();
+    quality.dupChecked = true;
     for (const ins of insightList) {
       try {
         const mt = normalizeMemType(ins.memType);
         const db = openReflect(mt);
+        if (!existingByType.has(mt)) {
+          let rows: Array<{ id: string; text: string }> = [];
+          try { rows = db.prepare('SELECT id, text FROM memory WHERE is_active = 1 AND character_id = ? LIMIT 5000').all(CHAR_ID) as any[]; } catch {}
+          existingByType.set(mt, rows);
+        }
+        // —— 质量闸(确定性,零 LLM):证据 / 复述 / 近重复 / 验证器重要度 ——
+        const srcTexts = ins.sources.map(s => recMeta.get(`${s.instance}|${s.project}|${s.id}`)?.text || '');
+        const srcImps = ins.sources.map(s => recMeta.get(`${s.instance}|${s.project}|${s.id}`)?.importance)
+          .filter((x): x is number => Number.isFinite(x));
+        const verdict = evaluateInsight({
+          text: ins.text,
+          evidence: ins.evidence,
+          sources: ins.sources.map((s, i) => ({ id: String(s.id || ''), text: srcTexts[i] || '' })),
+          existing: existingByType.get(mt)!,
+          srcImportance: srcImps.length ? srcImps.reduce((a, b) => a + b, 0) / srcImps.length : 0.5,
+        });
+        quality.evaluated++;
+        quality.noveltyMean += verdict.novelty;
+        if (verdict.evidenceOk === false) {
+          // 声明的证据在来源里找不到 = 编造(ExpeL 消融里的失败模式),硬拒
+          quality.evidenceMissing++;
+          continue;
+        }
+        if (verdict.reasons.includes('restatement')) { quality.restatement++; continue; }
+        if (verdict.duplicateOf) {
+          quality.nearDuplicate++;
+          try { db.prepare('UPDATE memory SET reference_count = COALESCE(reference_count, 0) + 1, updated_at = ? WHERE id = ?').run(now, verdict.duplicateOf); } catch {}
+          continue;
+        }
         const exists = db.prepare('SELECT 1 FROM memory WHERE is_active = 1 AND text = ? AND character_id = ?').get(ins.text, CHAR_ID);
         if (exists) { skipped++; continue; }
         const markers = ins.sources.map(s => `${s.instance}:${s.project}`);
         const tags = [...new Set([...ins.tags, ...markers])];
+        const id = generateId();
         // v1.24: 跨库整合产物打当前实例角色 —— 否则 reflect 总库里它会变成无人可见的孤儿行
         db.prepare(`
           INSERT INTO memory (id, text, project, type, mem_type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, metadata)
           VALUES (?, ?, 'reflect', 'semantic', ?, 'general', ?, ?, ?, 'reflect-all', 'user', 'standard', 1, ?, ?, ?, 0, 0, ?)
-        `).run(generateId(), ins.text, mt, serializeTags(tags), ins.importance, CHAR_ID, now, now, now, JSON.stringify({ reflection: { sources: ins.sources } }));
+        `).run(id, ins.text, mt, serializeTags(tags), verdict.importance, CHAR_ID, now, now, now, JSON.stringify({
+          reflection: { sources: ins.sources, evidence: ins.evidence, adds: ins.adds },
+          quality: {
+            novelty: verdict.novelty,
+            anchor: verdict.anchor,
+            evidenceOk: verdict.evidenceOk,
+            llmImportance: ins.importance,
+            verifierImportance: verdict.importance,
+          },
+        }));
+        existingByType.get(mt)!.push({ id, text: ins.text });
         saved++;
+        quality.written++;
+        quality.noveltyWritten += verdict.novelty;
+        if (ins.sources.length >= 2) quality.crossSource++;
       } catch (e: any) {
         base.errors.push(`写入洞察失败: ${e.message}`);
       }
@@ -434,6 +511,11 @@ export async function runReflectAll(opts?: ReflectAllOptions): Promise<ReflectAl
   }
   base.llm.skipped = skipped;
   base.llm.saved = saved;
+  base.quality = {
+    ...quality,
+    noveltyMean: quality.evaluated ? Number((quality.noveltyMean / quality.evaluated).toFixed(3)) : 0,
+    noveltyWritten: quality.written ? Number((quality.noveltyWritten / quality.written).toFixed(3)) : 0,
+  };
   base.ok = base.errors.length === 0;
   // 只把**本轮真正送进 LLM 且成功**的记录记入账本;失败批次不记,下次重跑
   if (base.ok && useLedger) {
