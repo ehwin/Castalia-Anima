@@ -95,5 +95,28 @@ check('重新遇到 → 提取强度大幅回升', re.retrieval > 0.8, `got ${re
 check('bjorkStrength 有存储兜底(不会归零)', m.bjorkStrength({ storage: 1, retrieval: 0 }) > 0.2, `got ${m.bjorkStrength({ storage: 1, retrieval: 0 }).toFixed(3)}`);
 check('bjorkStrength 单调:提取强度高者更高', m.bjorkStrength({ storage: 0.5, retrieval: 0.9 }) > m.bjorkStrength({ storage: 0.5, retrieval: 0.2 }));
 
+console.log('8) 激活用绝对标度,不是候选集 min-max');
+check('1 小时前单次 ≈ 0.80', close(m.activationScore([now - 3600000], now), 0.80, 0.06), `got ${m.activationScore([now - 3600000], now).toFixed(3)}`);
+check('30 天前单次 < 0.10', m.activationScore([now - 30 * DAY], now) < 0.10, `got ${m.activationScore([now - 30 * DAY], now).toFixed(3)}`);
+check('从没被提起 = 0', m.activationScore([], now) === 0);
+check('分散 3 次 > 单次', m.activationScore(spread, now) > m.activationScore([spread[2]], now));
+const staleSet = m.rankBySalience([
+  { id: 'a', intensity: 0.2, importance: 0.3, accessTimes: [now - 200 * DAY] },
+  { id: 'b', intensity: 0.2, importance: 0.3, accessTimes: [now - 400 * DAY] },
+], now, null);
+check('全是陈年记忆时不会有 1.0 分', staleSet[0].score < 0.9, `got ${staleSet[0].score.toFixed(3)}`);
+check('陈年 vs 陈年仍能看到相对差', staleSet[0].parts.activation > staleSet[1].parts.activation);
+
+console.log('9) agentState 的 −10..+10 心情可直接用');
+const m1 = m.moodFromScalar(-8);
+check('moodFromScalar(-8).valence = -0.8', close(m1.valence, -0.8, 0.01), `got ${m1.valence}`);
+check('负心情时与悲伤记忆更同调', m.moodCongruence(m1, { valence: -0.7, arousal: 0.8 }) > m.moodCongruence(m1, { valence: 0.7, arousal: 0.5 }));
+check('moodFromScalar 越界被夹住', m.moodFromScalar(-99).valence === -1 && m.moodFromScalar(99).valence === 1);
+
+console.log('10) 只有用户侧才算强化(注入不算)');
+check('user_reference 算', m.shouldReinforce('user_reference') === true);
+check('injection 不算', m.shouldReinforce('injection') === false);
+check('空字符串不算', m.shouldReinforce('') === false);
+
 console.log(`\n[emotional-ranking] ${pass} 通过 / ${fail} 失败`);
 process.exit(fail === 0 ? 0 : 1);

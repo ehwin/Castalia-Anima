@@ -10,6 +10,8 @@
  * 情感提取不再用正则 → 全部走 Ollama 本地模型
  */
 import { normalizeProject, CHAR_ID } from './env.js';
+import { scoreAffect, affectImpact } from './affectLexicon.js';
+import { DatabaseManager } from './db.js';
 import { serializeTags } from './tags.js';
 // ═══════════════════════════════════════════════════════════════════
 // Constants
@@ -332,12 +334,46 @@ export function queueForVad(text, project, memoryId) {
         flushVadQueue(proj, { force: true }).catch(e => console.warn('[emotion] auto-flush failed:', e.message));
     }
 }
+let localAffectWarned = false;
 /**
  * 消费 VAD 队列（按 project 分组，不同 project 永不进同一批 prompt）。
  * - 传 project：只处理该项目的分组；默认立即处理，opts.force=false 时才应用
  *   “攒够 5 条或最老 10 分钟”的批量阈值（digest 周期调用走这条）。
  * - 不传 project：显式全量 flush，逐组分析；管理/测试入口。
  */
+/**
+ * 离线兜底:按词表给每条记忆打 VAD 并写库(只在 ollamaDetectVAD 不可用时调用)。
+ *
+ * 实测背景:airi bank 262 条活跃记忆里 0 条有 vad_valence —— 唯一来源是 Ollama,
+ * 而本机没跑 Ollama,于是情感维度整体空转。词表兜底的目标是"让争吵和吃了面分开";
+ * confidence 故意压低(0.25~0.75),不与模型结果混淆。
+ */
+export function tagWithLocalAffect(entries, project) {
+    const proj = normalizeProject(project);
+    const db = DatabaseManager.getInstance(proj);
+    let updated = 0;
+    const stmt = db.prepare(`UPDATE memory SET vad_valence = ?, vad_arousal = ?, vad_dominance = ?,
+      emotional_impact = ?, tags = CASE WHEN tags IS NULL OR tags = '[]' THEN ? ELSE tags END
+      WHERE id = ? AND project = ?`);
+    for (const e of entries) {
+        if (!e.memoryId)
+            continue;
+        const sc = scoreAffect(e.text);
+        if (sc.confidence <= 0)
+            continue;
+        const tags = JSON.stringify(sc.matched.slice(0, 3));
+        try {
+            const r = stmt.run(sc.valence, sc.arousal, sc.dominance, affectImpact(sc), tags, e.memoryId, proj);
+            if (r.changes > 0)
+                updated++;
+        }
+        catch (err) {
+            console.warn('[emotion] local affect write failed:', err.message);
+            break;
+        }
+    }
+    return updated;
+}
 export async function flushVadQueue(project, opts = {}) {
     if (vadQueue.length === 0)
         return null;
@@ -379,7 +415,29 @@ export async function flushVadQueue(project, opts = {}) {
         const batchText = 'Analyze the emotional trajectory across these ' + batch.entries.length
             + ' recent messages:\n' + lines
             + '\n\nOutput a SINGLE VAD and tsundere_level representing the current overall emotional state.';
-        const result = await ollamaDetectVAD(batchText);
+        // Ollama 不可用时 ollamaDetectVAD **不抛错**,而是返回 confidence≈0 的默认值
+        // (实测日志:"[emotion] Ollama VAD failed: fetch failed");旧代码随后 `confidence<0.3 → continue`
+        // 就静默跳过了 —— 这正是 airi bank 262 条记忆 0 条 VAD 的直接原因。所以两条路都要兜底。
+        let result = null;
+        try {
+            result = await ollamaDetectVAD(batchText);
+        }
+        catch (e) {
+            result = null;
+            if (!localAffectWarned)
+                console.warn('[emotion] Ollama VAD 抛错:', e.message);
+        }
+        // 注意:ollamaDetectVAD 失败时返回 fallbackVAD,它的 confidence **正好是 0.3**,
+        // 而下面原来的 `confidence < 0.3` 判不到它 —— 于是继续调用 batchClassifyAndTag(第二次 Ollama),
+        // 再失败一次,整批静默丢弃。这就是 0 条 VAD 的完整链路。用 <= 0.35 把它接住。
+        if (!result || result.confidence <= 0.35) {
+            if (!localAffectWarned) {
+                console.warn('[emotion] Ollama 不可用或置信度过低,改用本地情感词表兜底(只影响 VAD,不改其他字段)');
+                localAffectWarned = true;
+            }
+            processed += tagWithLocalAffect(batch.entries, batch.project);
+            continue;
+        }
         lastResult = result;
         if (result.confidence < 0.3)
             continue;

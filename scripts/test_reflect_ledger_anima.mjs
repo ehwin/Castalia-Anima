@@ -125,7 +125,10 @@ const k2 = ra.reflectRecordKey({ instance: 'i', project: 'p', id: 'x', text: 'b'
 check('同 id 不同正文 → 不同键', k1 !== k2, `${k1} vs ${k2}`);
 check('if 不含正文原文(只存前缀)', !k1.includes('a|'), k1);
 
-server.close();
+// 先彻底关掉 mock 服务器再退出:Node 24 上 process.exit() 撞上仍在关闭的
+// libuv async handle 会触发 `Assertion failed: !(flags & UV_HANDLE_CLOSING)`。
+try { server.closeAllConnections?.(); } catch (_e) {}
+await new Promise(res => server.close(res));
 try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_e) {}
 console.log(`\n[reflect-ledger-anima] ${pass} 通过 / ${fail} 失败`);
-process.exit(fail === 0 ? 0 : 1);
+process.exitCode = fail === 0 ? 0 : 1;

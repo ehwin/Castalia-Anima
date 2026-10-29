@@ -9,10 +9,20 @@
  *   2. 标记重要性(importance)                        —— 用户/程序判定"这件事重要"
  *   3. ACT-R 基础激活 ln(Σ (now−t_k)^−d)              —— 频次+近因,比单纯 exp 衰减更贴人脑
  *   4. 情绪一致性(mood congruence)                   —— 当前心情筛出同调记忆(Affective Field Theory)
- *   5. 共振(Hebbian 共激活)                          —— 一起被想起过的记忆互相加强
+ *   5. 扩散激活(共享实体/被一起提起)                 —— 联想,不是"共激活计数"
  *   6. 锚点(pinned)                                  —— 被钉住的那一刻永不衰减(Character.AI Story Memory)
  *
- * 这些量都**不需要向量检索准确**:即便词法只命中一条,锚点与共振也能把该在场的记忆带上来。
+ * ── 与现有引擎的关系(2026-10-29 逐行核对结论,证据表见 docs/emotional-memory.md)──
+ * search.ts 的 computeScore 已是「一致性 1.00 + 情感 0.12 + 时间 0.15 + 偏离 0.10」,
+ * 且用 last_accessed_at 刷新时间时钟;所以本模块**不替代 computeScore**,只补它缺的三样:
+ * 情绪一致性、扩散激活、锚点/沉默策略。
+ *
+ * 两个实现决定来自核对,不是照抄论文:
+ * - **激活用绝对标度**(sigmoid(lnΣ)),不用候选集 min-max:min-max 会让"全是陈年记忆"的
+ *   集合里最高者也拿 1.0,而情感记忆要能表达"这段时间没什么值得提的"。
+ * - **系统注入不算强化**:nooa-memory 明确 "injected entry is observability data, not
+ *   reinforcement"。Anima 2026-10-28 已踩过这个坑(search.ts 里的正反馈注释),
+ *   所以共振只认用户主动提起/显式回忆。
  */
 
 export interface AffectVector { valence: number; arousal: number } // 各 -1..1 / 0..1
@@ -51,17 +61,24 @@ export const SALIENCE_WEIGHTS: SalienceWeights = {
   resonance: 0.15,
 };
 
-/** ACT-R 基础激活衰减率(默认 0.5,与 ACT-R 文献一致) */
+/** ACT-R 基础激活衰减率(ACT-R 文献常用 0.5) */
 export const ACTR_D = 0.5;
-/** 每次被召回视为一次"呈现";同一秒内的重复不重复计数 */
+/** 同一轮内的重复引用不重复计数 */
 export const ACTR_MIN_CONTEXT_GAP_MS = 1000;
+/**
+ * 激活 → 0..1 的标定常数(**工程标定,不是论文常数**)。
+ * 以**小时**为单位:d=0.5 时"1 小时前单次"ln=0、"30 天前单次"ln≈−3.29。
+ * sigmoid(1.2x+1.3) 把两者映到 ≈0.80 / ≈0.02,并由测试锁定。
+ */
+export const ACT_SLOPE = 1.2;
+export const ACT_OFFSET = 1.3;
 
 /**
- * ACT-R base-level activation: A = ln( Σ_k (now − t_k)^−d )
+ * ACT-R base-level activation: A = ln( Σ_k (now − t_k)^−d ),单位小时。
  *
  * 与"最后访问时间 + 次数"相比,它天然表达**间隔效应**:同一件事被反复想起(且分散在
  * 不同时间)比一次性想起更"记得住";越久没想起衰减越快。
- * 返回负值或 -Infinity(从未召回)—— 排序时会做集合内归一化,所以量纲不重要。
+ * 从未被提起 → -Infinity;要 0..1 请用 activationScore()。
  */
 export function baseLevelActivation(accessTimes: readonly number[], now: number, d: number = ACTR_D): number {
   if (!accessTimes.length) return Number.NEGATIVE_INFINITY;
@@ -72,10 +89,37 @@ export function baseLevelActivation(accessTimes: readonly number[], now: number,
     if (t < 0 || !Number.isFinite(t)) continue;
     if (t - prev < ACTR_MIN_CONTEXT_GAP_MS) continue; // 同一轮内多次引用算一次
     prev = t;
-    const ageSec = Math.max(1, (now - t) / 1000);
-    sum += Math.pow(ageSec, -d);
+    const ageHours = Math.max(1 / 3600, (now - t) / 3600000);
+    sum += Math.pow(ageHours, -d);
   }
   return sum > 0 ? Math.log(sum) : Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * 激活 → 0..1 的**绝对**映射(不随候选集变化)。
+ *
+ * 为什么不用 min-max:一个全是陈年记忆的候选集里,min-max 也会把最高的那条算成 1.0,
+ * 于是"最近没什么值得提的"这种状态根本无法表达。绝对标度能表达它。
+ */
+export function activationScore(accessTimes: readonly number[], now: number, d: number = ACTR_D): number {
+  const a = baseLevelActivation(accessTimes, now, d);
+  if (!Number.isFinite(a)) return 0;
+  return clamp(1 / (1 + Math.exp(-(ACT_SLOPE * a + ACT_OFFSET))), 0, 1);
+}
+
+/** agentState 的 currentMood 是 −10..+10 标量;转成 VAD 以便与记忆情绪比较(arousal 用强度代理)。 */
+export function moodFromScalar(currentMood: number): AffectVector {
+  const v = clamp(currentMood / 10, -1, 1);
+  return { valence: v, arousal: Math.min(1, Math.abs(v)) };
+}
+
+/**
+ * 哪些渠道算"强化":只有用户侧/显式回忆。系统注入是观测数据,不计入 —— 否则就是
+ * search.ts 里 2026-10-28 修掉的那个正反馈(注入→计数→更容易被注入)。
+ */
+export const REINFORCEMENT_CHANNELS = new Set(['user_reference', 'explicit_recall', 'user_repeat']);
+export function shouldReinforce(channel: string): boolean {
+  return REINFORCEMENT_CHANNELS.has(String(channel || '').toLowerCase());
 }
 
 /**
@@ -142,28 +186,13 @@ export function rankBySalience(
   seeds: readonly string[] = [],
   weights: SalienceWeights = SALIENCE_WEIGHTS,
 ): SalienceResult[] {
-  const raw = candidates.map(c => ({
-    c,
-    act: baseLevelActivation(c.accessTimes, now),
-    res: resonanceBoost(c.id, seeds, c.resonance),
-    con: moodCongruence(mood, c.vad),
-  }));
-  // 激活做集合内 min-max(有从未召回的候选时,它们落到 0)
-  const acts = raw.map(r => r.act).filter(a => Number.isFinite(a)) as number[];
-  const maxA = acts.length ? Math.max(...acts) : 0;
-  const minA = acts.length ? Math.min(...acts) : 0;
-  const norm = (a: number) => {
-    if (!Number.isFinite(a)) return 0;
-    if (maxA - minA < 1e-9) return 0.5;
-    return clamp((a - minA) / (maxA - minA), 0, 1);
-  };
-  const out: SalienceResult[] = raw.map(({ c, act, res, con }) => {
+  const out: SalienceResult[] = candidates.map(c => {
     const parts = {
       intensity: clamp(c.intensity, 0, 1),
       importance: clamp(c.importance, 0, 1),
-      activation: norm(act),
-      congruence: con,
-      resonance: res,
+      activation: activationScore(c.accessTimes, now),
+      congruence: moodCongruence(mood, c.vad),
+      resonance: resonanceBoost(c.id, seeds, c.resonance),
     };
     if (c.pinned) {
       // 锚点不被权重稀释:钉住的那一刻就是必须在场

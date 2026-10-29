@@ -52,7 +52,25 @@ function rank(scores, topK = 5) {
   return [...scores.entries()].sort((a, b) => b[1] - a[1]).slice(0, topK).map(([id]) => id);
 }
 
+
+/** Anima 现役口径(search.ts L544-595):按 IDF 加权的覆盖率 = Σ idf(命中) / Σ idf(查询词) */
+function idfCoverageScores(idx, queryTerms) {
+  const uniq = [...new Set(queryTerms)];
+  const total = uniq.reduce((n, t) => n + idfMod.idf(idx, t), 0) || 1;
+  const hits = new Map();
+  for (const t of uniq) {
+    const p = idx.postings.get(t);
+    if (!p) continue;
+    const w = idfMod.idf(idx, t);
+    for (const docId of p.keys()) hits.set(docId, (hits.get(docId) || 0) + w);
+  }
+  const out = new Map();
+  for (const [docId, w] of hits) out.set(docId, Math.min(1, w / total));
+  return out;
+}
+
 let covHit = 0, bm25Hit = 0, covRr = 0, bm25Rr = 0, covCand = 0, bm25Cand = 0, skipped = 0;
+let idfHit = 0, idfRr = 0;
 const detail = [];
 for (const d of sample) {
   // 两种查询构造:random=随机抽 3 个 bigram(考"能不能找到");phrase=取正文里一段连续短语
@@ -75,7 +93,11 @@ for (const d of sample) {
   }
   const c = idfMod.coverageScores(idx, picked);
   const b = idfMod.bm25Scores(idx, picked);
-  const rc = rank(c), rb = rank(b);
+  const i2 = idfCoverageScores(idx, picked);
+  const rc = rank(c), rb = rank(b), ri = rank(i2);
+  const pi = ri.indexOf(d.id);
+  if (pi >= 0) { idfHit++; idfRr += 1 / (pi + 1); }
+  detail.push({ q: picked.join(' '), gold: d.id, idfRank: pi < 0 ? '-' : pi + 1 });
   covCand += c.size; bm25Cand += b.size;
   const pc = rc.indexOf(d.id), pb = rb.indexOf(d.id);
   if (pc >= 0) { covHit++; covRr += 1 / (pc + 1); }
@@ -89,6 +111,7 @@ console.log(`\n查询 ${n} 条(跳过 ${skipped} 条词太少的)\n`);
 console.log('口径            recall@5   MRR     平均候选数');
 console.log(`覆盖率(现状)    ${pct(covHit).padStart(5)}    ${(covRr / Math.max(1, n)).toFixed(3)}   ${(covCand / Math.max(1, n)).toFixed(1)}`);
 console.log(`BM25+IDF        ${pct(bm25Hit).padStart(5)}    ${(bm25Rr / Math.max(1, n)).toFixed(3)}   ${(bm25Cand / Math.max(1, n)).toFixed(1)}`);
+console.log(`IDF覆盖率(现役) ${pct(idfHit).padStart(5)}    ${(idfRr / Math.max(1, n)).toFixed(3)}   ${(covCand / Math.max(1, n)).toFixed(1)}`);
 const improved = detail.filter(d => typeof d.bm25Rank === 'number' && (typeof d.covRank !== 'number' || d.bm25Rank < d.covRank)).length;
 const worse = detail.filter(d => typeof d.covRank === 'number' && (typeof d.bm25Rank !== 'number' || d.bm25Rank > d.covRank)).length;
 console.log(`\n逐条:BM25 更好 ${improved} 条,更差 ${worse} 条`);
