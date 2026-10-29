@@ -221,9 +221,13 @@ export async function consolidate(): Promise<ConsolidateResult> {
     // ═══ Phase 1: sigmoid 时间衰减 ═══
     // v1.23.2-fix: 从 base_importance 基线算（否则衰减取决于 consolidate 运行次数）；
     // identity_locked 与 forgetMemory 同款保护，不参与自动剪枝。
+    // 2026-10-29: 对话流水(conversation_log)与状态快照(agent_state)不参与衰减/剪枝。
+    //   它们是反刍的**原料**，不是"记忆"：旧对话 importance=0.5，60 天后就够被清，
+    //   reflect 还没来得及抽，内容就没了 —— 那批对话永远进不了 facts。
     const activeRecords = db.prepare(`
       SELECT id, importance, COALESCE(base_importance, importance) AS base_importance, last_accessed_at
-      FROM memory WHERE is_active = 1 AND character_id = ? AND COALESCE(source, '') != 'manual_lore'
+      FROM memory WHERE is_active = 1 AND character_id = ?
+        AND COALESCE(source, '') NOT IN ('manual_lore', 'conversation_log', 'agent_state')
         AND COALESCE(tier, 'standard') != 'critical' AND (locked IS NULL OR locked = 0)
         AND COALESCE(identity_locked, 0) = 0
     `).all(cid) as any[];
