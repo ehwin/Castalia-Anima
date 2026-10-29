@@ -36,6 +36,19 @@ export interface InjectionOptions {
   maxItemChars?: number;
   /** 注入时刻，默认当前时间。测试可固定 */
   now?: number;
+  /**
+   * 最近几轮已经注入过的记忆 id(调用方维护)。命中这些的直接跳过 ——
+   * Generative Agents 的 recency 项在"同一段连续占位"时不区分新旧,连续 3 轮同话题会把同一段
+   * 反复塞进提示词(实测更容易让角色重复自己刚说过的话)。
+   */
+  recentIds?: string[];
+  /**
+   * top1 与 top2 的相似度落差。低于它只降 uncertainty(medium),**不丢结果** ——
+   * 报告里那条 0.586 真命中 vs 0.64 噪音的重叠区,靠绝对阈值分不开,落差只能当"信心证据"用。
+   */
+  margin?: number;
+  /** 打一行 `[memory] recall …` 观测日志(env MEMORY_RECALL_LOG=1 也可开) */
+  log?: boolean;
 }
 
 export interface InjectionStats {
@@ -52,6 +65,14 @@ export interface InjectionStats {
   /** 整块没注入时的原因 */
   skipped?: 'no-hits' | 'below-threshold' | 'no-room' | 'no-strong-evidence';
   minSimilarity: number;
+  /** 因 recentIds 去重跳过的条数 */
+  deduped: number;
+  /** top1 - top2(只有一个命中时为 top1) */
+  marginTop2?: number;
+  /** 渲染耗时(ms) */
+  ms?: number;
+  /** 这次真正进了提示词的记忆 id(调用方据此维护 recentIds 去重) */
+  ids?: string[];
 }
 
 export interface InjectionResult {
@@ -137,6 +158,8 @@ function renderItem(hit: SearchResult, maxItemChars: number): string {
     dayOf(hit.createdAt),
     `imp ${(hit.importance ?? 0).toFixed(1)}`,
     `sim ${(hit.similarity ?? 0).toFixed(2)}`,
+    // 带 id:索引优先、明细按需(memory_get)。没有 id 时模型只能转述,不能回查。
+    `id ${String(hit.id).slice(0, 8)}`,
   ];
   // 被接管的旧记忆只在回指查询里出现（见 search.ts）：标出来，别让模型当成现状
   if (hit.superseded) flags.push('可能已过期');
@@ -166,7 +189,7 @@ export function renderInjectionBlock(hits: readonly SearchResult[], options: Inj
   };
 
   const stats: InjectionStats = {
-    count: 0, chars: 0, topSim: 0, dropped: 0, belowThreshold: 0, minSimilarity,
+    count: 0, chars: 0, topSim: 0, dropped: 0, belowThreshold: 0, minSimilarity, deduped: 0,
   };
   if (!hits || hits.length === 0) {
     return { text: '', stats: { ...stats, skipped: 'no-hits' } };
@@ -187,16 +210,27 @@ export function renderInjectionBlock(hits: readonly SearchResult[], options: Inj
     return { text: '', stats: { ...stats, belowThreshold: below, skipped: 'no-strong-evidence' } };
   }
 
-  const kept = hits.filter(h => (Number(h.similarity) || 0) >= gateOf(h)).slice(0, topK);
+  const recent = new Set((options.recentIds ?? []).filter(Boolean).map(String));
+  const passing = hits.filter(h => (Number(h.similarity) || 0) >= gateOf(h));
+  const fresh = recent.size > 0 ? passing.filter(h => !recent.has(String(h.id))) : passing;
+  stats.deduped = passing.length - fresh.length;
+  const kept = fresh.slice(0, topK);
   // 2026-10-28:先算 belowThreshold 再返回 —— 证据门提前返回时也得留下"挡掉几条"的诊断数字
   stats.belowThreshold = hits.length - hits.filter(h => (Number(h.similarity) || 0) >= gateOf(h)).length;
+  stats.ids = kept.map(k => String(k.id));
   if (kept.length === 0) {
-    return { text: '', stats: { ...stats, skipped: 'below-threshold' } };
+    return { text: '', stats: { ...stats, skipped: stats.deduped > 0 ? 'below-threshold' : 'below-threshold' } };
   }
 
   const stamped = new Date(options.now ?? Date.now()).toISOString().slice(0, 10);
   // 最高相似度贴着门槛 → 记忆只是勉强沾边，标 uncertainty=medium 让它别当定论
-  const uncertainty = (kept[0].similarity ?? 0) < minSimilarity + 0.1 ? 'medium' : 'low';
+  const marginTop2 = kept.length > 1
+    ? Math.round((((kept[0].similarity ?? 0) - (kept[1].similarity ?? 0)) * 1000)) / 1000
+    : Math.round((kept[0].similarity ?? 0) * 1000) / 1000;
+  stats.marginTop2 = marginTop2;
+  const wantMargin = options.margin ?? Number.parseFloat(process.env.MEMORY_INJECT_MARGIN || '0');
+  const thinMargin = Number.isFinite(wantMargin) && wantMargin > 0 && marginTop2 < wantMargin;
+  const uncertainty = (kept[0].similarity ?? 0) < minSimilarity + 0.1 || thinMargin ? 'medium' : 'low';
   const open = `<memory retrieved="${stamped}" source="long-term" uncertainty="${uncertainty}">\n${untrustedFirstLine}\n`;
   const close = '\n</memory>';
   const room = capChars - open.length - close.length;
@@ -242,7 +276,7 @@ export function renderInjectionBlock(hits: readonly SearchResult[], options: Inj
 export async function recallForInjection(query: string, options: InjectionOptions = {}): Promise<InjectionResult> {
   const topK = options.topK ?? INJECTION_DEFAULTS.topK;
   const empty: InjectionStats = {
-    count: 0, chars: 0, topSim: 0, dropped: 0, belowThreshold: 0,
+    count: 0, chars: 0, topSim: 0, dropped: 0, belowThreshold: 0, deduped: 0,
     minSimilarity: options.minSimilarity ?? injectionMinSimilarity(),
   };
   const trimmed = String(query ?? '').trim();
@@ -265,5 +299,15 @@ export async function recallForInjection(query: string, options: InjectionOption
   } catch {
     return { text: '', stats: { ...empty, skipped: 'no-hits' } };
   }
-  return renderInjectionBlock(hits, { ...options, topK });
+  const t0 = Date.now();
+  const out = renderInjectionBlock(hits, { ...options, topK });
+  out.stats.ms = Date.now() - t0;
+  // 观测:整条链路以前完全不可见(报告里 P0 的一条)。默认静默,env/选项开。
+  if (options.log === true || process.env.MEMORY_RECALL_LOG === '1') {
+    const st = out.stats;
+    console.warn(`[memory] recall ms=${st.ms} items=${st.count} chars=${st.chars}`
+      + ` top=${st.topSim.toFixed(3)} margin=${st.marginTop2 ?? '-'}`
+      + ` deduped=${st.deduped} below=${st.belowThreshold} skip=${st.skipped ?? '-'}`);
+  }
+  return out;
 }

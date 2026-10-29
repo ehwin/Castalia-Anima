@@ -69,6 +69,8 @@ function renderItem(hit, maxItemChars) {
         dayOf(hit.createdAt),
         `imp ${(hit.importance ?? 0).toFixed(1)}`,
         `sim ${(hit.similarity ?? 0).toFixed(2)}`,
+        // 带 id:索引优先、明细按需(memory_get)。没有 id 时模型只能转述,不能回查。
+        `id ${String(hit.id).slice(0, 8)}`,
     ];
     // 被接管的旧记忆只在回指查询里出现（见 search.ts）：标出来，别让模型当成现状
     if (hit.superseded)
@@ -99,7 +101,7 @@ export function renderInjectionBlock(hits, options = {}) {
         return minSimVector;
     };
     const stats = {
-        count: 0, chars: 0, topSim: 0, dropped: 0, belowThreshold: 0, minSimilarity,
+        count: 0, chars: 0, topSim: 0, dropped: 0, belowThreshold: 0, minSimilarity, deduped: 0,
     };
     if (!hits || hits.length === 0) {
         return { text: '', stats: { ...stats, skipped: 'no-hits' } };
@@ -118,15 +120,26 @@ export function renderInjectionBlock(hits, options = {}) {
         const below = hits.filter(h => (Number(h.similarity) || 0) < gateOf(h)).length;
         return { text: '', stats: { ...stats, belowThreshold: below, skipped: 'no-strong-evidence' } };
     }
-    const kept = hits.filter(h => (Number(h.similarity) || 0) >= gateOf(h)).slice(0, topK);
+    const recent = new Set((options.recentIds ?? []).filter(Boolean).map(String));
+    const passing = hits.filter(h => (Number(h.similarity) || 0) >= gateOf(h));
+    const fresh = recent.size > 0 ? passing.filter(h => !recent.has(String(h.id))) : passing;
+    stats.deduped = passing.length - fresh.length;
+    const kept = fresh.slice(0, topK);
     // 2026-10-28:先算 belowThreshold 再返回 —— 证据门提前返回时也得留下"挡掉几条"的诊断数字
     stats.belowThreshold = hits.length - hits.filter(h => (Number(h.similarity) || 0) >= gateOf(h)).length;
+    stats.ids = kept.map(k => String(k.id));
     if (kept.length === 0) {
-        return { text: '', stats: { ...stats, skipped: 'below-threshold' } };
+        return { text: '', stats: { ...stats, skipped: stats.deduped > 0 ? 'below-threshold' : 'below-threshold' } };
     }
     const stamped = new Date(options.now ?? Date.now()).toISOString().slice(0, 10);
     // 最高相似度贴着门槛 → 记忆只是勉强沾边，标 uncertainty=medium 让它别当定论
-    const uncertainty = (kept[0].similarity ?? 0) < minSimilarity + 0.1 ? 'medium' : 'low';
+    const marginTop2 = kept.length > 1
+        ? Math.round((((kept[0].similarity ?? 0) - (kept[1].similarity ?? 0)) * 1000)) / 1000
+        : Math.round((kept[0].similarity ?? 0) * 1000) / 1000;
+    stats.marginTop2 = marginTop2;
+    const wantMargin = options.margin ?? Number.parseFloat(process.env.MEMORY_INJECT_MARGIN || '0');
+    const thinMargin = Number.isFinite(wantMargin) && wantMargin > 0 && marginTop2 < wantMargin;
+    const uncertainty = (kept[0].similarity ?? 0) < minSimilarity + 0.1 || thinMargin ? 'medium' : 'low';
     const open = `<memory retrieved="${stamped}" source="long-term" uncertainty="${uncertainty}">\n${untrustedFirstLine}\n`;
     const close = '\n</memory>';
     const room = capChars - open.length - close.length;
@@ -169,7 +182,7 @@ export function renderInjectionBlock(hits, options = {}) {
 export async function recallForInjection(query, options = {}) {
     const topK = options.topK ?? INJECTION_DEFAULTS.topK;
     const empty = {
-        count: 0, chars: 0, topSim: 0, dropped: 0, belowThreshold: 0,
+        count: 0, chars: 0, topSim: 0, dropped: 0, belowThreshold: 0, deduped: 0,
         minSimilarity: options.minSimilarity ?? injectionMinSimilarity(),
     };
     const trimmed = String(query ?? '').trim();
@@ -193,6 +206,16 @@ export async function recallForInjection(query, options = {}) {
     catch {
         return { text: '', stats: { ...empty, skipped: 'no-hits' } };
     }
-    return renderInjectionBlock(hits, { ...options, topK });
+    const t0 = Date.now();
+    const out = renderInjectionBlock(hits, { ...options, topK });
+    out.stats.ms = Date.now() - t0;
+    // 观测:整条链路以前完全不可见(报告里 P0 的一条)。默认静默,env/选项开。
+    if (options.log === true || process.env.MEMORY_RECALL_LOG === '1') {
+        const st = out.stats;
+        console.warn(`[memory] recall ms=${st.ms} items=${st.count} chars=${st.chars}`
+            + ` top=${st.topSim.toFixed(3)} margin=${st.marginTop2 ?? '-'}`
+            + ` deduped=${st.deduped} below=${st.belowThreshold} skip=${st.skipped ?? '-'}`);
+    }
+    return out;
 }
 //# sourceMappingURL=recallForInjection.js.map
