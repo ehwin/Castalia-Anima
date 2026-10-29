@@ -92,7 +92,7 @@ export interface SearchResult {
   score: number;
   similarity: number;
   /** 命中来源:向量 / 标签 / 文本词法 / 最近 —— 注入门槛必须按来源换量纲(2026-10-28) */
-  basis?: 'vector' | 'chunk' | 'tag' | 'lexical' | 'recency';
+  basis?: 'vector' | 'chunk' | 'tag' | 'lexical' | 'recency' | 'entity';
   createdAt: string;
   lastAccessedAt: string;
   accessedCount: number;
@@ -162,6 +162,83 @@ function computeScore(row: any, similarity: number, project?: string): { score: 
  * 标签优先搜索 → 不足时回退向量 KNN
  */
 /** 单库搜索主体(标签 → 向量 KNN → 文本回退),按分类库调用 */
+/**
+ * 实体扩散召回(v1.29,2026-10-29)—— 联想,不是相似度
+ *
+ * 情感记忆里"想起一件事"常常是因为它和当前话题共享人物/地点/事件,而不是措辞相近。
+ * 引擎早就有 memory_entities + entities.expandEntityGraph(entities.ts L214/L234),
+ * 但 search.ts 一处都没用 —— 这里把它接进候选池。
+ *
+ * 量纲:structural similarity = 0.3 + 0.1×(共享实体数-1),封顶 0.7,并标 basis:'entity',
+ * 这样 recallForInjection 的 gateOf() 会按词法门槛(0.2)判它 —— 结构命中天然比余弦弱,
+ * 不该用 0.45 的余弦门槛去卡它,也不该独自构成"强证据"。
+ */
+function entityExpandedSearch(
+  db: Database.Database,
+  options: SearchOptions,
+  seedIds: string[],
+  excludeIds: Set<string>,
+  limit: number,
+): SearchResult[] {
+  if (seedIds.length === 0 || limit <= 0) return [];
+  const project = options.project;
+  const cid = options.characterId;
+  try {
+    const ph = seedIds.map(() => '?').join(',');
+    const seedEnts = db.prepare(`SELECT DISTINCT entity_id FROM memory_entities WHERE memory_id IN (${ph})`)
+      .all(...seedIds) as any[];
+    const entIds = seedEnts.map(r => String(r.entity_id)).slice(0, 32);
+    if (entIds.length < 2) return [];
+
+    const ph2 = entIds.map(() => '?').join(',');
+    const notIn = [...excludeIds];
+    const notPh = notIn.length ? `AND m.id NOT IN (${notIn.map(() => '?').join(',')})` : '';
+    const charCond = cid && cid !== 'any' ? 'AND m.character_id = ?' : '';
+    const params: any[] = [...entIds];
+    if (project) params.push(project);
+    params.push(...notIn);
+    if (charCond) params.push(cid);
+    params.push(limit);
+
+    const rows = db.prepare(`
+      SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
+        m.emotional_impact, m.importance, m.character_id, m.source,
+        m.subject, m.agent_mood, m.agent_desire, m.tier,
+        m.created_at, m.last_accessed_at, m.accessed_count, m.parent_id,
+        m.vad_valence, m.vad_arousal, m.vad_dominance, m.tsundere_level,
+        COUNT(DISTINCT me.entity_id) AS shared
+      FROM memory_entities me
+      JOIN memory m ON m.id = me.memory_id
+      WHERE me.entity_id IN (${ph2}) AND m.is_active = 1
+        ${project ? 'AND m.project = ?' : ''}
+        ${notPh} ${charCond}
+      GROUP BY m.id
+      HAVING shared >= 2
+      ORDER BY shared DESC, m.importance DESC
+      LIMIT ?
+    `).all(...params) as any[];
+
+    return rows.map(row => {
+      const shared = Number(row.shared) || 0;
+      const structural = Math.min(0.7, 0.3 + 0.1 * (shared - 1));
+      const { score, biasBoost } = computeScore(row, structural, project);
+      return {
+        id: row.id, text: row.text, project: row.project || 'default', type: row.type, memType: row.mem_type,
+        category: row.category, subcategory: row.subcategory, tags: parseTagsSafe(row.tags),
+        emotionalImpact: row.emotional_impact ?? 0, importance: row.importance,
+        characterId: row.character_id, source: row.source, subject: row.subject || 'user',
+        agentMood: row.agent_mood, agentDesire: row.agent_desire, tier: row.tier || 'standard',
+        parentId: row.parent_id || null,
+        score, similarity: Math.round(structural * 1000) / 1000, basis: 'entity' as const,
+        createdAt: row.created_at, lastAccessedAt: row.last_accessed_at,
+        accessedCount: row.accessed_count, biasBoost: Math.round(biasBoost * 1000) / 1000,
+      } as SearchResult;
+    });
+  } catch {
+    return [];   // 没有 memory_entities 表(旧库)/查询失败:扩散是增益,不是前置条件
+  }
+}
+
 async function searchInDb(db: Database.Database, options: SearchOptions): Promise<SearchResult[]> {
   const profile = options.profile ? SEARCH_PROFILES[options.profile] : null;
   const topK = options.topK ?? profile?.topK ?? 10;
@@ -223,6 +300,13 @@ async function searchInDb(db: Database.Database, options: SearchOptions): Promis
   if (isBackReferenceQuery(scoped.query)) {
     merged.push(...supersededRecall(db, scoped, new Set(merged.map(r => r.id)), Math.min(3, topK)));
   }
+  // v1.29:实体扩散 —— 用已召回的头部当种子,把共享 ≥2 个实体的记忆带进来。
+  // 放在排序前,让它们与其它来源同场竞争(它们分数天然偏低,不会挤掉强命中)。
+  if (!(options as any).noEntityExpand && merged.length > 0) {
+    const seedIds = merged.slice(0, 5).map(r => r.id);
+    merged.push(...entityExpandedSearch(db, scoped, seedIds, new Set(merged.map(r => r.id)), Math.min(3, topK)));
+  }
+
   merged.sort((a, b) => b.score - a.score);
 
   // 2026-10-28:接管关系要有硬保证。降权系数是乘法(0.6),而相关性权重提到 1.0 之后,被接管的旧记忆
