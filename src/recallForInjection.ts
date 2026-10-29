@@ -28,6 +28,8 @@ export interface InjectionOptions {
   minSimilarityLexical?: number;
   minSimilarityVector?: number;
   minSimilarityChunk?: number;
+  /** 反刍/抽取产出的行(reflect_*)的向量门槛，默认 0.60（env MEMORY_INJECT_MIN_SIM_REFLECT） */
+  minSimilarityReflect?: number;
   strongEvidence?: number;
   strongLexical?: number;
   /** 整块字符预算，默认 1200 */
@@ -92,6 +94,10 @@ export const INJECTION_DEFAULTS = {
   // 片段门槛(2026-10-28):短片段之间的余弦天然比整行高约 0.1(实测同一行:整行 0.405~0.52,
   // 最佳句 0.51~0.69)。门开在 0.60:相关问句 11/14 至少有一段 ≥0.60,噪音问句 8/8 一段都没有。
   minSimilarityChunk: 0.60,
+  // 反刍门槛(2026-10-29):reflect_* 是改写过的稠密摘要,同话题余弦天然偏高。开抽取后实测
+  // 噪音问句以 0.540 命中「汇报偏好」摘要、把噪音从 0/8 推到 1/8;而真问题命中同一条是 0.699。
+  // 门开在 0.60(与片段门槛同量级)正好分开这两者。
+  minSimilarityReflect: 0.60,
   // 2026-10-28(4) 证据门槛:必须有**至少一条**强命中才注入。
   // 实测 22 条探针(14 条关于她的真问题 + 8 条日常任务):"sim ≥ 0.50 的命中条数"这一项
   // 相关问句 14/14 ≥ 1、噪音问句 8/8 = 0 —— 完全可分;而 top 余弦本身(相关 0.476~0.522
@@ -102,6 +108,20 @@ export const INJECTION_DEFAULTS = {
   capChars: 1200,
   maxItemChars: 200,
 };
+
+/**
+ * 反刍行来源:抽取/反刍/合并产出的都是改写文本,不是原文。
+ * 用前缀而不是枚举:实测漏了 `reflect_merge`(整合合并出来的稠密摘要),正是它把噪音带进了注入。
+ */
+export function isReflectDerived(hit: any): boolean {
+  return String(hit?.source ?? '').startsWith('reflect_')
+}
+
+/** 反刍行门槛(env MEMORY_INJECT_MIN_SIM_REFLECT,默认 0.60):见 INJECTION_DEFAULTS 里的实测 */
+export function injectionMinSimilarityReflect(): number {
+  const raw = Number.parseFloat(process.env.MEMORY_INJECT_MIN_SIM_REFLECT ?? '');
+  return Number.isFinite(raw) && raw >= 0 && raw <= 1 ? raw : INJECTION_DEFAULTS.minSimilarityReflect;
+}
 
 /** 门槛：env 优先，便于线上不改代码调参；非法值回退默认 */
 export function injectionMinSimilarity(): number {
@@ -178,13 +198,19 @@ export function renderInjectionBlock(hits: readonly SearchResult[], options: Inj
   // 兼容:老调用方(含既有测试)用 minSimilarity 表示"向量余弦门槛",显式传入时它优先于内置默认
   const minSimVector = options.minSimilarityVector ?? options.minSimilarity ?? injectionMinSimilarityVector();
   const minSimChunk = options.minSimilarityChunk ?? injectionMinSimilarityChunk();
+  const minSimReflect = options.minSimilarityReflect ?? injectionMinSimilarityReflect();
   const strongEvidence = options.strongEvidence ?? injectionStrongEvidence();
   const strongLexical = options.strongLexical ?? injectionStrongLexical();
   const topK = Math.max(0, options.topK ?? INJECTION_DEFAULTS.topK);
   // 按命中来源取门槛:向量用余弦门槛,标签/词法用词法门槛。undefined 视为向量(老调用方语义不变)
+  // 2026-10-29:反刍产出的行(reflect_*)是"改写过的稠密摘要",同一话题的余弦天然比原文高;
+  // 实测在大库副本上开了抽取之后,噪音问句「下周要交的报表怎么做」以 0.540 命中一条
+  // 「汇报偏好」摘要(刚过 0.50 证据门),把噪音从 0/8 推到 1/8。给这类行单独的门槛 0.60
+  // (与片段门槛同量级):真问题「我喜欢什么样的汇报方式」命中同一条是 0.699,不受影响。
   const gateOf = (h: any) => {
     if (h?.basis === 'chunk') return minSimChunk;
     if (h?.basis && h.basis !== 'vector') return minSimLexical;
+    if (isReflectDerived(h)) return minSimReflect;
     return minSimVector;
   };
 
@@ -201,8 +227,10 @@ export function renderInjectionBlock(hits: readonly SearchResult[], options: Inj
   // 这条门槛把 8/8 噪音问句挡在外面(它们的 sim≥0.50 计数恒为 0),而 14/14 真问题都能过。
   // 2026-10-28:证据门只对"有向量能力"的部署生效。纯词法部署(EMBED_MODE=none)里没有向量命中,
   // 硬要一条 ≥0.60 的词法覆盖率会把正常召回全挡掉 —— 那正是本轮最早修掉的那个 bug,别绕回去。
+  // 证据门也要认这条:一条 reflect_* 命中即使 ≥0.50 也不算强证据,必须够 0.60。
   const hasVectorBasis = hits.some(h => !h.basis || h.basis === 'vector' || h.basis === 'chunk');
-  const strongVec = hits.some(h => (!h.basis || h.basis === 'vector') && (Number(h.similarity) || 0) >= strongEvidence);
+  const strongVec = hits.some(h => (!h.basis || h.basis === 'vector') && (Number(h.similarity) || 0) >= strongEvidence
+    && (!isReflectDerived(h) || (Number(h.similarity) || 0) >= minSimReflect));
   const strongChunk = hits.some(h => h.basis === 'chunk' && (Number(h.similarity) || 0) >= minSimChunk);
   const strongLex = hits.some(h => h.basis && h.basis !== 'vector' && h.basis !== 'chunk' && (Number(h.similarity) || 0) >= strongLexical);
   if (hasVectorBasis && !strongVec && !strongChunk && !strongLex) {
