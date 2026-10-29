@@ -12,8 +12,27 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-const CONFIG_PATH = process.env.MEMORY_CONFIG
-    || path.join(process.cwd(), 'memory', 'config.json');
+/**
+ * 配置路径解析(2026-10-29,与 Lite 同构):
+ *   MEMORY_CONFIG > <MEMORY_DB_DIR>/config.json > <cwd>/memory/config.json
+ *
+ * 为什么要有中间那级:宿主(桌面 app / 插件 / 任何 `MEMORY_DB_DIR=<bank> node dist/index.js`)
+ * 往往只给 MEMORY_DB_DIR,不给 MEMORY_CONFIG。旧实现直接落到 cwd/memory/config.json ——
+ * 找不到就按内置默认模型算空间指纹,把库里别的模型建的向量判成"空间变化"并清空
+ * (实测事故:817 条记忆向量被清、且没有 key 无法重嵌)。
+ */
+const CONFIG_PATH = (() => {
+    const explicit = (process.env.MEMORY_CONFIG || '').trim();
+    if (explicit)
+        return explicit;
+    const bankDir = (process.env.MEMORY_DB_DIR || '').trim();
+    if (bankDir) {
+        const inBank = path.join(bankDir, 'config.json');
+        if (fs.existsSync(inBank))
+            return inBank;
+    }
+    return path.join(process.cwd(), 'memory', 'config.json');
+})();
 /**
  * 解密 memory/keys.enc(由 scripts/keygen.js 生成)注入环境变量。
  * 密钥:CASTALIA_KEY_FILE 或 <cwd>/memory/keys.key(32 字节 hex)
@@ -22,10 +41,15 @@ const CONFIG_PATH = process.env.MEMORY_CONFIG
  * 解密失败/文件缺失:静默跳过,console.warn 一次。
  */
 function loadEncryptedSecrets() {
+    // keys.enc 与 config.json 同住 bank 根(memory-banks/<bank>/keys.enc);只认 cwd 时
+    // 宿主用 MEMORY_DB_DIR 指定库就永远找不到 key → 有 key 也当没有 → 云端嵌入全部失效。
+    const bankDir = (process.env.MEMORY_DB_DIR || '').trim();
+    const keysInBank = bankDir ? path.join(bankDir, 'keys.enc') : '';
+    const keyInBank = bankDir ? path.join(bankDir, 'keys.key') : '';
     const keysFile = process.env.CASTALIA_KEYS_FILE
-        || path.join(process.cwd(), 'memory', 'keys.enc');
+        || (keysInBank && fs.existsSync(keysInBank) ? keysInBank : path.join(process.cwd(), 'memory', 'keys.enc'));
     const keyFile = process.env.CASTALIA_KEY_FILE
-        || path.join(process.cwd(), 'memory', 'keys.key');
+        || (keyInBank && fs.existsSync(keyInBank) ? keyInBank : path.join(process.cwd(), 'memory', 'keys.key'));
     const keyMissing = !fs.existsSync(keyFile);
     const encMissing = !fs.existsSync(keysFile);
     if (keyMissing && encMissing)

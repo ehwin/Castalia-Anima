@@ -47,8 +47,27 @@ function vecDimIsExplicit() {
     return !!((process.env.EMBEDDING_DIM || process.env.VEC_DIM || '').trim());
 }
 /** 当前嵌入模型名(惰性读取,configLoader 注入 EMBEDDING_MODEL 后也能生效) */
+/** 库内已记录的嵌入模型(未显式配置时沿用,避免"默认模型"销毁别人建好的索引) */
+let _embedModelOverride = '';
+/** 嵌入模型是否来自显式配置(env EMBEDDING_MODEL,含 config.json 注入)。未设置 = 只是内置默认值。 */
+function embedModelIsExplicit() {
+    return !!((process.env.EMBEDDING_MODEL || '').trim());
+}
+/**
+ * 目标嵌入后端是否**真的能重嵌**。清空向量索引不可恢复(原文不在 vec 表),
+ * 只有确认能重嵌时才允许清:
+ * - EMBED_MODE=api:必须有 EMBEDDING_API_KEY,否则每次请求都 401/fetch failed
+ * - EMBED_MODE=none:已在 isEmbedEnabled() 挡掉
+ * - 其余(ollama/本地):无法在清空前探活,保持原行为
+ */
+function embedTargetUsable() {
+    const mode = (process.env.EMBED_MODE || '').toLowerCase().trim();
+    if (mode === 'api')
+        return !!((process.env.EMBEDDING_API_KEY || '').trim());
+    return true;
+}
 export function embedModelName() {
-    return (process.env.EMBEDDING_MODEL || 'yuan-embedding-2.0-zh').trim();
+    return (_embedModelOverride || process.env.EMBEDDING_MODEL || 'yuan-embedding-2.0-zh').trim();
 }
 /**
  * 嵌入空间指纹(v1.28-fix,移植自 Lite 修 E4)。
@@ -84,8 +103,26 @@ export function ensureEmbedSpace(db) {
         }
         if (row.space_hash === to)
             return { changed: false, to };
+        // 2026-10-29(移植自 Lite 同款修复):模型**未显式配置**时,绝不因为「内置默认模型」
+        // 与库内不同就销毁索引。默认值只是历史常量,含义是"没人告诉我要用哪个模型",
+        // 不代表库里的向量是错的;沿用库内模型即可。真换模型必须显式设置 EMBEDDING_MODEL
+        // 或 config.json 的 embedding.api_model/model。
+        if (!embedModelIsExplicit() && row.model && String(row.model).trim()
+            && String(row.model).trim() !== embedModelName()) {
+            _embedModelOverride = String(row.model).trim();
+            console.warn(`[db] 未显式配置嵌入模型,沿用库内 ${_embedModelOverride}(不清向量);`
+                + '要换模型请显式设置 EMBEDDING_MODEL 或 config.json 的 embedding.api_model/model');
+            return { changed: false, to: embedSpaceHash() };
+        }
         if (!isEmbedEnabled()) {
             console.warn(`[db] 嵌入空间变化(库内 ${row.model}/${row.dim} → 配置 ${embedModelName()}/${vecDim()}),但 EMBED_MODE=none 无法重嵌,暂不改动向量与缓存`);
+            return { changed: false, to };
+        }
+        // 同类第二道闸:目标是云端 API 但没拿到 key 时,清空是不可恢复的
+        // (清了也没法重嵌,只会把可用索引变成空索引),按 EMBED_MODE=none 处理。
+        if (!embedTargetUsable()) {
+            console.warn(`[db] 嵌入空间变化(库内 ${row.model}/${row.dim} → 配置 ${embedModelName()}/${vecDim()}),`
+                + '但 EMBED_MODE=api 且没有 EMBEDDING_API_KEY,无法重嵌,暂不改动向量与缓存');
             return { changed: false, to };
         }
         console.warn(`[db] 嵌入空间变化: ${row.model}/${row.dim} → ${embedModelName()}/${vecDim()}(维度可能相同,旧向量属于另一语义空间),清空向量索引与嵌入缓存,稍后按新空间重嵌`);

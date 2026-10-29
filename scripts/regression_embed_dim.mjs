@@ -77,6 +77,7 @@ const count = (t) => { try { return db.prepare('SELECT COUNT(*) c FROM ' + t).ge
 const sm = await import(dbEntry.replace(/db\.js$/, 'search.js'));
 console.log(JSON.stringify({
   dim: m.vecDim(),
+  model: m.embedModelName(),
   tableDim: m2 ? Number(m2[1]) : 0,
   memory: count('memory'),
   vec: count('vec_memory'),
@@ -89,7 +90,7 @@ console.log(JSON.stringify({
 `);
 
 /** 跑一个场景;mode='api' 表示嵌入可用(指向必然拒绝的本地端口,不产生外网流量) */
-function run(dim, { seed = false, configPath = '', mode = 'none' } = {}) {
+function run(dim, { seed = false, configPath = '', mode = 'none', model = '', dir = tmpRoot } = {}) {
   const env = { ...process.env };
   delete env.EMBEDDING_DIM;
   delete env.VEC_DIM;
@@ -99,9 +100,11 @@ function run(dim, { seed = false, configPath = '', mode = 'none' } = {}) {
     env.OLLAMA_URL = 'http://127.0.0.1:1';
     env.EMBEDDING_API_KEY = 'regression-only';
   }
+  if (model) env.EMBEDDING_MODEL = model;
+  else delete env.EMBEDDING_MODEL;
   if (dim) env.EMBEDDING_DIM = String(dim);
   const out = execFileSync(process.execPath, [
-    childPath, tmpRoot, dim ? String(dim) : '', seed ? 'seed' : 'check', DB_ENTRY, configPath, LOADER_ENTRY,
+    path.join(dir, 'child.mjs'), dir, dim ? String(dim) : '', seed ? 'seed' : 'check', DB_ENTRY, configPath, LOADER_ENTRY,
   ], { encoding: 'utf8', env });
   return { json: JSON.parse(out.trim().split(/\r?\n/).pop()) };
 }
@@ -164,6 +167,44 @@ check('旧 2048 索引已消失', s7.json.tableDim !== 2048, `got ${s7.json.tabl
 check('memory 仍 1 行', s7.json.memory === 1, `got ${s7.json.memory}`);
 const s7b = run('', { configPath: cfgPath, mode: 'api' });
 check('重开后 vec0 表 3072', s7b.json.tableDim === 3072, `got ${s7b.json.tableDim}`);
+
+console.log('\n8) 模型未显式配置(只给库)→ 沿用库内模型,不清向量');
+// 独立临时库:前面场景把 vec0 建成了 3072 维,直接复用会撞维度不匹配
+const tmp8 = fs.mkdtempSync(path.join(os.tmpdir(), 'castalia-model-'))
+fs.writeFileSync(path.join(tmp8, 'child.mjs'), fs.readFileSync(childPath))
+const DB8 = DB_ENTRY
+// 事故原型:宿主只给 MEMORY_DB_DIR、不给 EMBEDDING_MODEL,内置默认 yuan-embedding-2.0-zh
+// 与库内 BAAI/bge-m3 不同 → 旧实现判"空间变化"并清空,且无 key 无法重嵌。
+const s8seed = run('', { seed: true, mode: 'api', model: 'BAAI/bge-m3', dir: tmp8 });
+check('种子库模型 = BAAI/bge-m3', s8seed.json.model === 'BAAI/bge-m3', `got ${s8seed.json.model}`);
+const s8 = run('', { mode: 'api', dir: tmp8 });   // 不带 EMBEDDING_MODEL
+check('未显式配置时不新建空索引(vec 仍 1)', s8.json.vec === 1, `got ${s8.json.vec}`);
+check('未显式配置时缓存不丢', s8.json.cache === 1, `got ${s8.json.cache}`);
+check('未显式配置时沿用库内模型', s8.json.model === 'BAAI/bge-m3', `got ${s8.json.model}`);
+
+console.log('\n9) 显式切换到同一模型 → 仍不清');
+const s9 = run('', { mode: 'api', model: 'BAAI/bge-m3', dir: tmp8 });
+check('同模型重开 vec 仍 1', s9.json.vec === 1, `got ${s9.json.vec}`);
+
+console.log('\n10) 显式换模型 → 允许清空重嵌');
+const s10 = run('', { mode: 'api', model: 'BAAI/bge-small-zh-v1.5', dir: tmp8 });
+check('显式换模型后 vec 清空', s10.json.vec === 0, `got ${s10.json.vec}`);
+check('显式换模型后缓存清空', s10.json.cache === 0, `got ${s10.json.cache}`);
+check('原文未丢(memory 仍 1)', s10.json.memory === 1, `got ${s10.json.memory}`);
+
+console.log('\n11) 云端 API 但没 key → 不清(不可恢复)');
+// 换回 bge-m3 建库,再用 api 模式但没有 key 重开
+run('', { mode: 'api', model: 'BAAI/bge-m3', seed: true, dir: tmp8 });
+const s11 = (() => {
+  const env = { ...process.env };
+  delete env.EMBEDDING_DIM; delete env.VEC_DIM; delete env.MEMORY_CONFIG;
+  delete env.EMBEDDING_API_KEY; delete env.OLLAMA_API_KEY;
+  env.EMBED_MODE = 'api'; env.EMBEDDING_MODEL = 'BAAI/bge-small-zh-v1.5';
+  const out = execFileSync(process.execPath, [path.join(tmp8, 'child.mjs'), tmp8, '', 'check', DB_ENTRY, '', LOADER_ENTRY],
+    { encoding: 'utf8', env });
+  return { json: JSON.parse(out.trim().split(String.fromCharCode(10)).pop()) };
+})();
+check('api 无 key 时 vec 不清空', s11.json.vec === 1, `got ${s11.json.vec}`);
 
 if (!KEEP) {
   try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_e) {}
