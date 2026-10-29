@@ -499,7 +499,8 @@ export function tagWithLocalAffect(
   const db = DatabaseManager.getInstance(proj);
   let updated = 0;
   const stmt = db.prepare(`UPDATE memory SET vad_valence = ?, vad_arousal = ?, vad_dominance = ?,
-      emotional_impact = ?, tags = CASE WHEN tags IS NULL OR tags = '[]' THEN ? ELSE tags END
+      emotional_impact = CASE WHEN COALESCE(emotional_impact, 0) = 0 THEN ? ELSE emotional_impact END,
+      tags = CASE WHEN tags IS NULL OR tags = '[]' THEN ? ELSE tags END
       WHERE id = ? AND project = ?`);
   for (const e of entries) {
     if (!e.memoryId) continue;

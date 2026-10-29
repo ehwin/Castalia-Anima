@@ -11,6 +11,7 @@ import { embed, getEmbeddingCached } from './ollama.js';
 import { ensureChunksForRow } from './chunkIndex.js';
 import { recordTopics } from './bias.js';
 import { PROJECT_ID, CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
+import { scoreAffect, affectImpact } from './affectLexicon.js';
 import { MemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
 import { parseTagsSafe, normalizeTagsForWrite, serializeTags } from './tags.js';
 import { estimatePredicateVolatility, needsEvidence, shouldSupersede } from './volatility.js';
@@ -163,17 +164,31 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
     createdAt: now, updatedAt: now, lastAccessedAt: now, accessedCount: 0,
   };
 
+  // 写路径补情感(2026-10-29):嵌入形态下没有 autoProcess/digest 周期,VAD 的唯一来源
+  // Ollama 通常不在跑(实测 airi bank 262 条 0 条 VAD)。所以落库时用词表补一次:
+  // 只补空缺(调用方给了 emotionalImpact 就尊重),只影响 vad_*/emotional_impact。
+  // 放在 store 层而不是宿主层:bank.save、store-tools、MCP、直连引擎都走这里,只写一处。
+  let writeVad: { valence: number; arousal: number; dominance: number } | null = null;
+  if (process.env.SKIP_WRITE_AFFECT !== '1') {
+    const aff = scoreAffect(text);
+    if (aff.confidence > 0) {
+      writeVad = { valence: aff.valence, arousal: aff.arousal, dominance: aff.dominance };
+      if (!(record.emotionalImpact > 0)) record.emotionalImpact = affectImpact(aff);
+    }
+  }
+
   const storeTx = db.transaction(() => {
     db.prepare(`
-      INSERT INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, emotional_impact, importance, base_importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, emotional_impact, importance, base_importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, vad_valence, vad_arousal, vad_dominance)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       record.id, record.text, record.project, record.sessionId, record.type, record.memType, record.category, record.subcategory,
       serializeTags(record.tags), record.emotionalImpact,
       record.importance, record.importance,
       record.characterId, record.source, record.subject,
       record.tier, record.expiresAt, 1,
-      record.createdAt, record.updatedAt, record.lastAccessedAt, 0, 0
+      record.createdAt, record.updatedAt, record.lastAccessedAt, 0, 0,
+      writeVad ? writeVad.valence : null, writeVad ? writeVad.arousal : null, writeVad ? writeVad.dominance : null
     );
 
     // v5.0: 仅在非 skipEmbed 时写入向量
