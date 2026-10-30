@@ -319,11 +319,12 @@ export async function recallForInjection(query, options = {}) {
     out.stats.ms = Date.now() - t0;
     if (vectorRouteFailed)
         out.stats.vectorFailed = true;
-    // 三路都空才算 no-hits：向量挂了但时间/事实有货时不能报 no-hits（否则调用方以为"库里没有"）
+    // 三路有货 → 不能报 skipped；三路全空 → 保留 render 给出的更具体原因
+    // （below-threshold / no-strong-evidence），只在它没给原因时才落 no-hits。
     const anyRoute = out.stats.count > 0 || (out.stats.temporal ?? 0) > 0 || (out.stats.facts ?? 0) > 0;
     if (anyRoute)
         delete out.stats.skipped;
-    else
+    else if (!out.stats.skipped)
         out.stats.skipped = 'no-hits';
     // 观测:整条链路以前完全不可见(报告里 P0 的一条)。默认静默,env/选项开。
     if (options.log === true || process.env.MEMORY_RECALL_LOG === '1') {
