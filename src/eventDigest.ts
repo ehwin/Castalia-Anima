@@ -95,6 +95,21 @@ function quoteIsReal(quote: string, haystack: string): boolean {
   return haystack.replace(/\s/g, '').includes(q);
 }
 
+/**
+ * progress 该记哪些对话（纯函数，便于钉死）。
+ * - 这一天没出错：整天都算整理过（模型说"没什么可记"也是有效结论）。
+ * - 出了错且有对话被覆盖：只记被覆盖的，其余留待下一轮重试。
+ * - 出了错但一条都没覆盖：仍记整天 —— 空集会让同一批原料每轮重烧 token，而错误已在日志里。
+ */
+export function progressIdsToMark(
+  dayRows: Array<{ id: string }>,
+  dayFailed: boolean,
+  covered: Set<string>,
+): Array<{ id: string }> {
+  if (!dayFailed || covered.size === 0) return dayRows;
+  return dayRows.filter(r => covered.has(r.id));
+}
+
 export async function runEventDigest(options: EventDigestOptions = {}): Promise<EventDigestResult> {
   const proj = normalizeProject(options.project);
   const cid = options.characterId || CHAR_ID;
@@ -160,13 +175,21 @@ export async function runEventDigest(options: EventDigestOptions = {}): Promise<
     if (!parsed || !Array.isArray(parsed.events)) { result.errors.push(`${day}: 输出解析失败`); continue }
 
     const haystack = dayRows.map(r => r.text).join('\n');
-    /** 来源只取真正包含这条摘录的流水行 —— 全天所有 rowid 都挂上去等于没来源 */
+    /** 来源只取真正包含这条摘录的流水行 —— 全天所有 id 都挂上去等于没来源。
+     *  写的是 **conversation id 的前 8 位**（UUID 前缀足够唯一），回查用 `id LIKE 'xxxxxxxx%'`；
+     *  不是 rowid：rowid 在每个 memType 库里各自从 1 开始，跨库不唯一。 */
     const sourcesFor = (quote: string): string[] => {
       const q = String(quote || '').replace(/[「」"\s]/g, '');
       if (q.length < 4) return [];
       return dayRows.filter(r => r.text.replace(/\s/g, '').includes(q)).map(r => r.id.slice(0, 8));
     };
-    const consumedIds: string[] = [];
+    /** 真正被事件覆盖到的对话 id：progress 只该记这些，不该把整天一股脑标成已整理 */
+    const consumedIds = new Set<string>();
+    const covers = (quote: string): void => {
+      const q = String(quote || '').replace(/[「」"\s]/g, '');
+      if (q.length < 4) return;
+      for (const r of dayRows) if (r.text.replace(/\s/g, '').includes(q)) consumedIds.add(r.id);
+    };
     let kept = 0;
 
     for (const ev of parsed.events.slice(0, maxEventsPerDay)) {
@@ -224,6 +247,8 @@ export async function runEventDigest(options: EventDigestOptions = {}): Promise<
         subject: 'user',
         tier: 'standard',
       });
+      covers(userQuote);
+      covers(assistantQuote);
       kept++;
     }
 
@@ -233,7 +258,16 @@ export async function runEventDigest(options: EventDigestOptions = {}): Promise<
     if (!options.dryRun) {
       const now = new Date().toISOString();
       const mark = db.prepare('INSERT OR REPLACE INTO event_digest_progress (conversation_id, project, day, digested_at) VALUES (?, ?, ?, ?)');
-      for (const row of dayRows) { mark.run(row.id, proj, day, now); consumedIds.push(row.id) }
+      // progress 的记账粒度 = "真正被事件覆盖到的对话"，不是整天的行。
+      // 事件因摘录校验/写入失败被丢时（errors 里有这天的记录）：只标记已被接受事件覆盖的那些对话，
+      // 其余留到下一轮重试 —— 否则一次模型打偏就把那批原料永久标成"已整理"、再也回不来。
+      // 全天一条都没保住（covered 为空）时不收缩：空集标记等于每轮重烧同一批 token，而日志已记下错误。
+      const dayFailed = result.errors.some(e => e.startsWith(`${day}:`));
+      const toMark = progressIdsToMark(dayRows, dayFailed, consumedIds);
+      if (dayFailed && toMark.length < dayRows.length) {
+        result.errors.push(`${day}: 仅 ${toMark.length}/${dayRows.length} 条对话被事件覆盖，其余留待重试`);
+      }
+      for (const row of toMark) mark.run(row.id, proj, day, now);
     }
   }
 
