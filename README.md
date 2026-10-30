@@ -195,7 +195,7 @@ score = (1.00 × consistency + 0.12 × emotion + 0.15 × time_decay + 0.10 × de
 | 联邦 | `FEDERATION_MEMBERS`（JSON 数组）、`FEDERATION_DIRS`（旧版逗号分隔） |
 | 服务 | `MCP_TOOLS`（`all` / `agent` / `harness` / `admin` / `store` / `entity` 或工具名）、`MCP_LOG_TOOLS`、`MCP_SERVER_NAME`、`MCP_SERVER_VERSION`、`HEALTH_PORT`、`CASTALIA_KEY_FILE` / `CASTALIA_KEYS_FILE` |
 
-`MCP_TOOLS` 的分组就是注册表本身：`agent` 7 个只读工具（检索 / 取回 / 事实 / 图谱），`harness` 13 个写入与管线工具，`admin` 18 个管理与跨库工具，`store` 4 个前端存储桥工具，`entity` 2 个实体层工具；合计 44 个，不设 `MCP_TOOLS` 时全部注册（宿主按最小暴露面自己开 `agent`）。
+`MCP_TOOLS` 的分组就是注册表本身：分组表就是 `TOOL_GROUPS`：`agent` 8 个只读工具（检索 / 取回 / 事实 / 图谱，含 `entity_lookup`），`harness` 13 个写入与管线工具，`admin` 18 个管理与跨库工具，`store` 4 个前端存储桥工具，`entity` 2 个实体层工具（`entity_lookup` 同时属于 `agent` 与 `entity`）；45 个挂载 / 44 个去重。与 Lite 不同，本仓不设 `MCP_TOOLS` 时**全部注册**（宿主代理依赖 harness/admin 组），要最小暴露面得显式写 `MCP_TOOLS=agent`。
 
 ## 维护与回归
 
