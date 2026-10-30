@@ -16,6 +16,7 @@
  */
 import type { SearchResult } from './search.js';
 import { recallFactsForQuery } from './factRecall.js';
+import { recallTemporalForQuery } from './temporalRecall.js';
 import { searchMemory } from './search.js';
 
 export interface InjectionOptions {
@@ -35,6 +36,10 @@ export interface InjectionOptions {
   includeFacts?: boolean;
   /** 事实路最多注入几条，默认 4 */
   maxFacts?: number;
+  /** 关掉时间路（默认开）：问句里的"昨天/今天/最近"按日期直取事件层 */
+  includeTemporal?: boolean;
+  /** 本轮问句原文：时间词（昨天/今天/最近…）会用来给对应日期的事件行加权 */
+  query?: string;
   strongEvidence?: number;
   strongLexical?: number;
   /** 整块字符预算，默认 1200 */
@@ -74,6 +79,8 @@ export interface InjectionStats {
   minSimilarity: number;
   /** 事实路注入了几条稳定事实（facts 表），没有事实路时为空 */
   facts?: number;
+  /** 时间路按日期直取了几条事件记录 */
+  temporal?: number;
   /** 因 recentIds 去重跳过的条数 */
   deduped: number;
   /** top1 - top2(只有一个命中时为 top1) */
@@ -117,11 +124,31 @@ export const INJECTION_DEFAULTS = {
 };
 
 /**
+ * 问句里的时间词 → 目标日期集合（本地时区的 YYYY-MM-DD）。
+ * 只认最常见的几个说法，宁缺勿滥：认错时间比不认更糟。
+ */
+export function temporalDaysOf(query: string): Set<string> {
+  const out = new Set<string>();
+  const day = (offset: number) => {
+    const d = new Date(Date.now() - offset * 86400000);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  };
+  if (/前天/.test(query)) out.add(day(2));
+  if (/昨天|昨晚|昨日/.test(query)) out.add(day(1));
+  if (/今天|今晚|刚才|刚刚/.test(query)) out.add(day(0));
+  if (/这几天|最近|前两天|这一周|本周/.test(query)) { out.add(day(0)); out.add(day(1)); out.add(day(2)) }
+  return out;
+}
+
+/**
  * 反刍行来源:抽取/反刍/合并产出的都是改写文本,不是原文。
  * 用前缀而不是枚举:实测漏了 `reflect_merge`(整合合并出来的稠密摘要),正是它把噪音带进了注入。
  */
 export function isReflectDerived(hit: any): boolean {
-  return String(hit?.source ?? '').startsWith('reflect_')
+  const src = String(hit?.source ?? '');
+  // daily_event 也是"压缩改写过的文本"：实测「团子怎么了」对事件行 0.606，
+  // 而噪音「下周要交的报表怎么做」对「下周三复查提醒」也有 0.587 —— 门槛必须比原文高。
+  return src.startsWith('reflect_') || src === 'daily_event';
 }
 
 /** 反刍行门槛(env MEMORY_INJECT_MIN_SIM_REFLECT,默认 0.60):见 INJECTION_DEFAULTS 里的实测 */
@@ -249,7 +276,21 @@ export function renderInjectionBlock(hits: readonly SearchResult[], options: Inj
   const passing = hits.filter(h => (Number(h.similarity) || 0) >= gateOf(h));
   const fresh = recent.size > 0 ? passing.filter(h => !recent.has(String(h.id))) : passing;
   stats.deduped = passing.length - fresh.length;
-  const kept = fresh.slice(0, topK);
+
+  // 时间偏好（2026-10-30）：「我昨天在忙什么」这类问句里，语义相似度比不过人设长文
+  // （实测 lore 0.706 vs 事件行 ~0.5），但用户问的是"昨天"。所以按问句里的时间词给
+  // 对应日期的事件行加权，再排序。只改排序，不改 similarity，门槛判定仍然照旧。
+  const wantedDays = temporalDaysOf(String(options.query ?? ''));
+  const bonusOf = (hit: any): number => {
+    if (wantedDays.size === 0) return 0;
+    const m = String(hit?.text ?? '').match(/^#\s*(\d{4}-\d{2}-\d{2})/);
+    return m && wantedDays.has(m[1]) ? 0.15 : 0;
+  };
+  const kept = [...fresh]
+    .map((hit, index) => ({ hit, index, score: (Number(hit.similarity) || 0) + bonusOf(hit) }))
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .slice(0, topK)
+    .map(entry => entry.hit);
   // 2026-10-28:先算 belowThreshold 再返回 —— 证据门提前返回时也得留下"挡掉几条"的诊断数字
   stats.belowThreshold = hits.length - hits.filter(h => (Number(h.similarity) || 0) >= gateOf(h)).length;
   stats.ids = kept.map(k => String(k.id));
@@ -335,11 +376,27 @@ export async function recallForInjection(query: string, options: InjectionOption
     return { text: '', stats: { ...empty, skipped: 'no-hits' } };
   }
   const t0 = Date.now();
-  const out = renderInjectionBlock(hits, { ...options, topK });
+  const out = renderInjectionBlock(hits, { ...options, topK, query: trimmed });
 
   // 事实路（2026-10-29）：facts 表里是已经确认过的稳定事实，之前完全没有参与注入。
   // 独立成块而不是混进 <memory>：memory 块的语义是"过去对话的片段"，事实块是"已确认的结论"，
   // 两者冲突时的处置方式不同。预算独立（默认 420 字），不挤占记忆块的 capChars。
+  // 时间路：问句带"昨天/今天/最近"时按日期直取，不跟人设长文比余弦。
+  if (options.includeTemporal !== false) {
+    try {
+      const temporal = recallTemporalForQuery(trimmed, {
+        project: options.project,
+        characterId: options.characterId,
+      });
+      if (temporal.text) {
+        out.text = out.text ? `${out.text}\n${temporal.text}` : temporal.text;
+        out.stats.temporal = temporal.hits.length;
+        out.stats.chars = out.text.length;
+      }
+    }
+    catch { /* 时间路失败不影响其它路 */ }
+  }
+
   if (options.includeFacts !== false) {
     try {
       const facts = recallFactsForQuery(trimmed, {
