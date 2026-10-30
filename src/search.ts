@@ -156,10 +156,10 @@ function computeScore(row: any, similarity: number, project?: string): { score: 
                  + WEIGHT_EMOTION * emotionalIntensity
                  + WEIGHT_TIME * timeDecay
                  + WEIGHT_DEVIATION * deviationBonus;
-  // 2026-10-28:派生摘要行(reflect_summary / reflect_reasoning 是"这段时间用户与尤诺…""这批记忆
+  // 2026-10-28:派生摘要行(reflect_summary / reflect_reasoning 是"这段时间用户与角色…""这批记忆
   // 全部…"这类第三人称概括)在语义上离任何问题都很近,会把第一人称正典挤出前几名 —— 实测
-  // 「你还记得自己是谁吗」的第一条注入就是"这段时间用户小托与尤诺建立了深厚的羁绊"。它们对
-  // 索引有用、对台词没用,给个**有界**降权(不动可检索性)。
+  // 「你还记得自己是谁吗」的第一条注入就是这类第三人称概括。它们对索引有用、对台词没用,
+  // 给个**有界**降权(不动可检索性)。
   const src = String(row.source || '');
   const sourceFactor = (src === 'reflect_summary' || src === 'reflect_reasoning') ? 0.85
     : (src.startsWith('reflect_') ? 0.93 : 1.0);
