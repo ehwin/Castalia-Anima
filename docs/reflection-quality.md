@@ -62,14 +62,31 @@
 
 **质量提升没有以成本为代价**:闸是纯字符串运算,零 LLM 调用;配额反而把写入量砍了一半。
 
-## 五、还没做的(明确列出,不含糊)
+## 五、历史库存已按"保守口径"清理(2026-10-30)
 
-1. **历史 1,532 条没清理**:按新闸 665 条应淘汰。清不清由数据主人定 —— 清是软删(`is_active=0`),可恢复。
-2. **`adds=summary` 仍占 4%**:这类是"摘要"而非洞察,下一步可以直接不写(或降权)。
-3. **跨会话去重只做了"字面近重复"**,语义近重复(同义改写)需要嵌入;当前 reflect 库没有向量表,要接得先补嵌入回填。
-4. **没有 freshness 趋势**(Hindsight 的 strengthening/weakening):要做得按 source 集合随时间变化算,属于下一轮。
+全量回测会说 665 条该淘汰,但**真正执行时只删了 299 条(19.4%)** —— 因为数据可能不可再生(LobeHub 等库在重装系统时丢过原始记忆,有些洞察是唯一幸存副本)。执行口径(脚本 `scripts/prune_insights.mjs`):
 
-## 六、复现
+| 规则 | 说明 | 拦下/保留 |
+|---|---|---|
+| 来源必须都还在且 `is_active=1` | 来源可检索 = 内容没丢;任一来源缺失或已软删 → 该洞察可能是最后一手,永不删 | 保留 **20** 条 |
+| 没有 `metadata.sources` | 无锚点即无依据 | 保留 **10** 条 |
+| 内容要能**逐字**在来源里找到(LCS ≥ 80%) | 4-gram 新颖度低但句子并不连续对应 → 不算复述,不删 | 保留 **186** 条 |
+| 术数 / 命理 / 古籍引用保护 | 卦爻、八字、紫微十二宫、禄存四化、《增删卜易》《千里命稿》等 —— 用户明示"不可压缩资产" | 保留 **143** 条 |
+| 近重复只删一方,且被删内容要在保留条里连续可查 | 避免"两条各有独有信息"被合并掉 | 删 **27** 条 |
+
+结果:`reflect` 活跃洞察 **1,542 → 1,243**;每条软删都写 `metadata.prunedAt/prunedReason/prunedBy`,备份落在 `memory-banks/insight-prune-<ts>.json`(202KB,含原文与原始 metadata)。
+
+**可逆性经过实测**:`--restore <backup>` 把 299 条全部恢复(活跃回到 1,542),再跑 `--apply` 又精确回到 1,243 —— 不是"理论上能恢复"。
+
+清理后仍被新闸标为"复述/近重复"的 402 条,正是上面几类**故意保留**的(143 + 186 + 20 + 53 属近重复但另一条被保护或内容不连续)。
+
+## 六、还没做的(明确列出,不含糊)
+
+1. **`adds=summary` 仍占 4%**:这类是"摘要"而非洞察,下一步可以直接不写(或降权)。
+2. **跨会话去重只做了"字面近重复"**,语义近重复(同义改写)需要嵌入;当前 reflect 库没有向量表,要接得先补嵌入回填。
+3. **没有 freshness 趋势**(Hindsight 的 strengthening/weakening):要做得按 source 集合随时间变化算,属于下一轮。
+
+## 七、复现
 
 ```bash
 # 基线分布(零 LLM,读真实库)
@@ -78,4 +95,8 @@ MEMORY_BANK_ROOT=D:/castalia/memory-banks node scripts/bench_reflect_quality.mjs
 MEMORY_BANK_ROOT=D:/castalia/memory-banks node scripts/bench_insight_gates.mjs
 # 四闸 + 提示词回归(本地 mock LLM,零费用)
 node scripts/test_reflect_quality_gates.mjs
+# 历史库存清理(默认 dry-run;--apply 前自动写备份;--restore 回滚)
+MEMORY_BANK_ROOT=D:/castalia/memory-banks node scripts/prune_insights.mjs --dump out.json
+MEMORY_BANK_ROOT=D:/castalia/memory-banks node scripts/prune_insights.mjs --apply
+MEMORY_BANK_ROOT=D:/castalia/memory-banks node scripts/prune_insights.mjs --restore memory-banks/insight-prune-<ts>.json
 ```
