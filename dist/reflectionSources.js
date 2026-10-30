@@ -67,6 +67,10 @@ limit = 30, project) {
                vad_valence, vad_arousal, vad_dominance, agent_mood, agent_desire, tsundere_level
         FROM memory
         WHERE source = 'conversation_log'
+          -- 2026-10-29:软删(is_active=0)的对话不再作为抽取来源。
+          -- 实测:被软删的自检对话仍被当成"待分析",抽出「自检习惯」这类事实写回库;
+          -- 删掉的东西又被反刍复活,是用户永远关不掉的污染源。
+          AND is_active = 1
           AND project = ?
           AND (? = 'any' OR character_id = ?)
           AND (? IS NULL OR created_at > ?)

@@ -25,6 +25,7 @@ import { saveMemory, forgetMemory, updateMemory, saveConversationTurn, cleanupEx
 import { consolidate } from './consolidate.js';
 import { DatabaseManager, listProjectNames, listMemTypeDirs, safeFilePart, currentMemDir, sweepExpiredSessionMemories } from './db.js';
 import { runDigest, getRecentConversations, maybeDigest } from './digest.js';
+import { runEventDigest } from './eventDigest.js';
 import { flushAllBuffers } from './buffer.js';
 import { reflect, getAllMemories, getMemoryGraph, REFLECT_SYSTEM_PROMPT, getUnanalyzedConversations } from './reflect.js';
 import { findEntities, entityFacts, entityMemories, entityGraphSlice, expandEntityGraph, conflictsReport, entityStats } from './entities.js';
@@ -1613,6 +1614,25 @@ async function main() {
     setInterval(() => {
         maybeDigest(CHAR_ID)?.catch((e) => console.error('digest error:', e));
     }, 60 * 1000);
+    // 事件层整理（P2）：每小时最多一次，没有"待整理的对话"时不调 LLM（runEventDigest 自己先查进度表）。
+    // 2026-10-30: 这段原本不存在 —— runEventDigest 在源码、部署产物、计划任务里都没有调用点，
+    //   真实库 daily_event 恒为 0、progress 表却已记满，事件层等于不在循环里。EVENT_DIGEST_AUTO=0 可关。
+    if (process.env.EVENT_DIGEST_AUTO !== '0') {
+        let lastEventDigestAt = 0;
+        setInterval(() => {
+            if (Date.now() - lastEventDigestAt < 60 * 60 * 1000)
+                return;
+            lastEventDigestAt = Date.now();
+            runEventDigest({})
+                .then(r => {
+                if (r.events > 0 || r.errors.length > 0) {
+                    console.error(`[event-digest] events=${r.events} inserted=${r.inserted} updated=${r.updated}`
+                        + ` errors=${r.errors.length}${r.skippedReason ? ` (${r.skippedReason})` : ''}`);
+                }
+            })
+                .catch((e) => console.error('[event-digest] error:', e.message));
+        }, 60 * 1000);
+    }
     // WAL checkpoint every 30 minutes
     setInterval(() => {
         try {

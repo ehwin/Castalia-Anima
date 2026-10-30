@@ -265,9 +265,11 @@ export async function applyReflectActions(actions, characterId = CHAR_ID, projec
                     let mergeInvalid = null;
                     for (const id of action.sourceIds) {
                         const sdb = memDbFor(id, project, db, characterId);
-                        const src = sdb.prepare("SELECT id FROM memory WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical'").get(id);
+                        // 原料行（对话流水 / 事件层 / 状态快照）不接受整合合并：它们是"原文与导航层"，
+                        // 不是可再生的摘要 —— 合并只留一份改写稿，原文就再也回不来了（2026-10-30）。
+                        const src = sdb.prepare("SELECT id FROM memory WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical' AND COALESCE(source, '') NOT IN ('conversation_log', 'daily_event', 'agent_state')").get(id);
                         if (!src) {
-                            mergeInvalid = `source not found, locked or critical: ${id}`;
+                            mergeInvalid = `source not found, locked, critical, or raw-material: ${id}`;
                             break;
                         }
                         mergeSources.push({ db: sdb, id: src.id });
@@ -321,6 +323,10 @@ export async function applyReflectActions(actions, characterId = CHAR_ID, projec
                     const row = source.db.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(source.id);
                     if (!row || row.locked || row.identity_locked)
                         throw new Error('split: target locked or inactive');
+                    // 2026-10-30: 原料行不可拆分/替换 —— 拆分会把源软删，原文与事件引文就没了。
+                    if (['conversation_log', 'daily_event', 'agent_state'].includes(String(row.source || ''))) {
+                        throw new Error('split: raw-material row is immutable');
+                    }
                     const children = [];
                     for (const frag of action.fragments) {
                         children.push(await saveMemory({
@@ -594,11 +600,13 @@ export async function applyReflectActions(actions, characterId = CHAR_ID, projec
                         continue;
                     }
                     // v1.23: critical 核心记忆不得被自动反思删除
-                    const _delR = memDbFor(action.targetId, project, db, characterId).prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical'").run(action.targetId);
+                    // 2026-10-30: 原料行（对话流水/事件层/状态快照）同样不得被删除 —— 原文永不删除是这套记忆的地基，
+                    //   事件层则带着逐字引文与来源 rowid，重建需要重跑且 progress 表已经挡掉重跑。
+                    const _delR = memDbFor(action.targetId, project, db, characterId).prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical' AND COALESCE(source, '') NOT IN ('conversation_log', 'daily_event', 'agent_state')").run(action.targetId);
                     receipt.rowsAffected = _delR.changes;
                     if (_delR.changes === 0) {
                         receipt.status = 'failed';
-                        receipt.reason = `target not found or locked: ${action.targetId}`;
+                        receipt.reason = `target not found, locked, or raw-material: ${action.targetId}`;
                     }
                     if (receipt.status === 'applied')
                         result.applied++;

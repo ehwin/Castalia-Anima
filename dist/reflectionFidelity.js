@@ -47,6 +47,10 @@ facts ${factExtraction === 'off' ? '本轮为空数组 []' : `最多 ${maxFacts}
 2. 每个 extract 必须带 quotes[]（至少 1 段原文逐字，用「」包裹）。系统会做子串校验，编造的引用直接丢弃。
 3. 相对日期按该来源的 createdAt 换算成绝对日期（"昨天"→具体日期）；无法确定就保留原话，不要猜。
 4. 不抽寒暄、空泛评价；助手说的话不得写成用户的事实，写成"用户被告知/被告知 X"。
+4b. **不得从助手的复述/回忆里抽事实**：若助手说"我记得你喜欢 X""你之前说过 Y"，那是它在引用注入的上下文，
+    不是用户新给出的信息。这类句子一律不产生 facts；只有用户自己说出的话才算新事实。
+    （2026-10-29 实测：事实注入后她复述了一遍，抽取把复述收成 "偏好 熬夜折腾技术（助手回忆，用户未确认）"，
+    形成 注入→复述→抽取 的自引用循环，置信度还只有 0.5。）
 输出：{"processedSourceIds":["已完整处理ID"],"summary":"导航摘要","highlights":[],"facts":[{"subject":"user","predicate":"称呼","object":"示例","confidence":0.9}],"insights":[],"actions":[{"action":"extract","sourceId":"输入ID","newText":"含关键原话、主体、时间和条件的完整事件","newMemType":"project","newCategory":"emotional","newSubject":"self","tier":"standard","quotes":["原文逐字片段"]}]}
 category 可选 identity/preference/relationship/milestone/emotional/mood_snapshot/knowledge/general。`;
 }
