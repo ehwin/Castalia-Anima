@@ -183,7 +183,8 @@ async function searchInDb(db, options) {
     const tagResults = tagSearch(db, scoped);
     // 标签结果足够好 → 直接返回
     if (tagResults.length >= topK && tagResults[0].score >= 0.5) {
-        updateAccessed(db, tagResults.slice(0, topK));
+        if (scoped.countAccess !== false)
+            updateAccessed(db, tagResults.slice(0, topK));
         return tagResults.slice(0, topK);
     }
     // ═══ Phase 2: 标签不够 → 向量 KNN 补充(EMBED_MODE=none 时跳过,纯文本回退) ═══
@@ -268,8 +269,14 @@ async function searchInDb(db, options) {
             bestById.set(r.id, r);
     }
     const unique = [...bestById.values()].sort((a, b) => b.score - a.score).slice(0, topK);
-    updateAccessed(db, unique.slice(0, topK));
+    updateAccessedGuard(db, unique.slice(0, topK), scoped.countAccess);
     return unique.slice(0, topK);
+}
+/** countAccess=false 时不记访问（注入路径），见 SearchOptions.countAccess */
+function updateAccessedGuard(db, results, countAccess) {
+    if (countAccess === false)
+        return;
+    updateAccessed(db, results);
 }
 export async function searchMemory(options) {
     const proj = normalizeProject(options.project);

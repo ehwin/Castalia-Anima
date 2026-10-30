@@ -61,6 +61,15 @@ export interface SearchOptions {
   topK?: number;
   minScore?: number;
   profile?: 'quick' | 'balanced' | 'deep';
+  /**
+   * 是否把本次命中记成"回忆"（accessed_count+1、刷新 last_accessed_at）。
+   *
+   * 系统注入不算强化（nooa-memory 的口径，也是 emotionalRanking 里那条原则）：
+   * 注入是"提示词里出现了这段"，不是"她想起来了"。原来注入路径照样刷新时钟与访问数，
+   * 于是 被注入 → 排名更高 → 更容易再被注入，形成正反馈（实测 lore 行滚到 200~306 次）。
+   * 注入路径（recallForInjection）一律传 false；用户主动检索保持默认 true。
+   */
+  countAccess?: boolean;
 }
 
 // minScore 阈值可配;harness 可用 SEARCH_MIN_SCORE 覆盖
@@ -254,7 +263,7 @@ async function searchInDb(db: Database.Database, options: SearchOptions): Promis
 
   // 标签结果足够好 → 直接返回
   if (tagResults.length >= topK && tagResults[0].score >= 0.5) {
-    updateAccessed(db, tagResults.slice(0, topK));
+    if (scoped.countAccess !== false) updateAccessed(db, tagResults.slice(0, topK));
     return tagResults.slice(0, topK);
   }
 
@@ -334,8 +343,14 @@ async function searchInDb(db: Database.Database, options: SearchOptions): Promis
   }
   const unique = [...bestById.values()].sort((a, b) => b.score - a.score).slice(0, topK);
 
-  updateAccessed(db, unique.slice(0, topK));
+  updateAccessedGuard(db, unique.slice(0, topK), scoped.countAccess);
   return unique.slice(0, topK);
+}
+
+/** countAccess=false 时不记访问（注入路径），见 SearchOptions.countAccess */
+function updateAccessedGuard(db: any, results: SearchResult[], countAccess: boolean | undefined): void {
+  if (countAccess === false) return;
+  updateAccessed(db, results);
 }
 
 export async function searchMemory(options: SearchOptions): Promise<SearchResult[]> {
