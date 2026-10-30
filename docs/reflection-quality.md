@@ -80,13 +80,41 @@
 
 清理后仍被新闸标为"复述/近重复"的 402 条,正是上面几类**故意保留**的(143 + 186 + 20 + 53 属近重复但另一条被保护或内容不连续)。
 
-## 六、还没做的(明确列出,不含糊)
+## 六、语义侧体检:该不该接语义去重?(2026-10-30 实测)
 
-1. **`adds=summary` 仍占 4%**:这类是"摘要"而非洞察,下一步可以直接不写(或降权)。
-2. **跨会话去重只做了"字面近重复"**,语义近重复(同义改写)需要嵌入;当前 reflect 库没有向量表,要接得先补嵌入回填。
+给 1,243 条洞察补上向量后(实际库里本来就有,只是来源库那一侧有问题,见下),跑了两组测量:
+
+| 指标 | 值 | 结论 |
+|---|---|---|
+| 语义近重复对(cos ≥ 0.92) | **37 对** | 占 1,243 条里的极小比例 |
+| 字面法(3-gram)检出的对 | 43 对 | — |
+| 两者重叠 | 12 对 | — |
+| **字面法漏掉的语义重复** | **25 对 = 67.6%** | 3-gram 确实只抓字面 |
+| 但绝对量 | 25 对 / 1,243 条 ≈ **2%** | 与 MMR 那次同一个结论:不值得为 2% 引入嵌入依赖 |
+
+**结论:语义去重暂不接入写入路径。** 真要接,应等语料翻倍或重复率上升后再评 —— 现在接等于给每条洞察加一次嵌入调用,换 2% 的去重收益。
+
+### 顺带查出一个真缺陷:两成向量来自另一个嵌入空间
+
+漂移测量时发现 47 条洞察与它引用的来源余弦 ≈ 0,而同一库里**随机两条**的均值是 0.479(bge-m3 的基线相似度)。逐条核对后确认:text 完全相同、来源向量的 KNN 自检也正常,唯一解释是**这条来源的存量向量不是当前模型产生的**(维度同为 1024,空间不同 —— 典型是 Ollama bge-m3 → 云端 bge-m3 这类"同名不同实现"的切换)。
+
+全量审计(`scripts/audit_vector_space.mjs`,用当前模型重算同一条文本比对存量向量):
+
+| bank | 抽样行数 | 向量空间不一致 | 比例 |
+|---|---|---|---|
+| airi | 254 | **69** | **27.2%** |
+| 其余(hermes/dsh/lobehub) | 见运行日志 | — | — |
+
+修复办法就是重新嵌入这 69 行:`--fix` 只覆盖不一致的行。修复后 airi 复测 **mismatched 0**。
+影响范围:统一检索索引(用当前模型重建过)不受影响,但**分库 KNN 检索**对这 27% 的行会返回错误邻居 —— 这是静默故障,不修就会一直错。
+
+## 七、还没做的(明确列出,不含糊)
+
+1. **`adds=summary` 已改为一律不写**(2026-10-30,正文无决定/规则/因果即拒),历史库里的 summary 类没清理。
+2. **语义去重不接**(实测只值 2%),但向量空间问题要盯:以后换嵌入 provider 必须整库重嵌,否则又是 27% 静默错配。
 3. **没有 freshness 趋势**(Hindsight 的 strengthening/weakening):要做得按 source 集合随时间变化算,属于下一轮。
 
-## 七、复现
+## 八、复现
 
 ```bash
 # 基线分布(零 LLM,读真实库)
@@ -99,4 +127,8 @@ node scripts/test_reflect_quality_gates.mjs
 MEMORY_BANK_ROOT=D:/castalia/memory-banks node scripts/prune_insights.mjs --dump out.json
 MEMORY_BANK_ROOT=D:/castalia/memory-banks node scripts/prune_insights.mjs --apply
 MEMORY_BANK_ROOT=D:/castalia/memory-banks node scripts/prune_insights.mjs --restore memory-banks/insight-prune-<ts>.json
+# 语义侧:近重复 + 漂移
+MEMORY_BANK_ROOT=D:/castalia/memory-banks node scripts/bench_insight_semantics.mjs
+# 向量空间审计(换过嵌入 provider 后必跑)
+MEMORY_BANK_ROOT=D:/castalia/memory-banks node scripts/audit_vector_space.mjs --bank airi
 ```

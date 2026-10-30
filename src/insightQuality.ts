@@ -101,6 +101,8 @@ export interface QualityVerdict {
 export function evaluateInsight(input: {
   text: string;
   evidence?: string;
+  /** 模型自报的新增成分类型(rule/decision/causal/contrast/integration/summary) */
+  adds?: string;
   sources: QualitySource[];
   existing?: Array<{ id: string; text: string }>;
   srcImportance?: number;
@@ -125,6 +127,10 @@ export function evaluateInsight(input: {
   // 闸 2:复述(低新颖度且无新增成分)
   if (novelty < p.minNovelty && !hasAdditiveContent(text)) reasons.push('restatement');
 
+  // 闸 2b:自报 summary 且正文里确实没有决定/规则/因果 → 这是摘要,不是洞察,不写
+  // (只信正文,不信自报:模型把"摘要"标成 integration 时,上面那条复述闸会兜住低新颖度)
+  if (String(input.adds || '').toLowerCase() === 'summary' && !hasAdditiveContent(text)) reasons.push('summary-only');
+
   // 闸 3:与已有洞察近重复 → 只累加引用,不新增
   let duplicateOf: string | undefined;
   const g3 = charNgrams(text, 3);
@@ -145,7 +151,8 @@ export function evaluateInsight(input: {
     + 0.2 * Math.min(1, cross / 2)
     + 0.3 * Math.min(1, novelty / 0.6)));
 
-  const blocking = reasons.filter(r => r === 'evidence-not-in-source' || r === 'restatement' || r === 'near-duplicate');
+  const blocking = reasons.filter(r => r === 'evidence-not-in-source' || r === 'restatement'
+    || r === 'summary-only' || r === 'near-duplicate');
   return {
     ok: blocking.length === 0,
     reasons: [...new Set(reasons)],

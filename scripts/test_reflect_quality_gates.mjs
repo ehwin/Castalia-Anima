@@ -74,6 +74,11 @@ const server = createServer((req, res) => {
           memType: 'project', importance: 0.8, tags: ['架构'],
           evidence: '改到 worker 里跑', sources: [src(0)],
         },
+        { // 6 摘要:自报 summary 且正文没有决定/规则/因果 → 不写
+          text: '这段时间用户主要在折腾记忆库的安装和配置,装了几次又重装过',
+          memType: 'project', importance: 0.5, adds: 'summary', tags: ['日常'],
+          evidence: '重装', sources: [src(1)],
+        },
         { // 5 合格:跨两条来源整合(检索慢的根因是切词 → 结论)
           text: '中文检索失效的根因是切词粒度:整句不切导致 LIKE 命中 0,不是缺向量,所以要先修切词再谈召回率',
           memType: 'general', importance: 0.85, tags: ['检索', '根因'],
@@ -134,6 +139,17 @@ check('编造证据被识别', vHall.evidenceOk === false, JSON.stringify(vHall)
 check('编造 → not ok', vHall.ok === false);
 const vRest = iq.evaluateInsight({ text: '上周三用户说检索慢', sources: [{ id: 'b', text: SRC_B }] });
 check('复述被判 restatement', vRest.reasons.includes('restatement'), JSON.stringify(vRest.reasons));
+const vSum = iq.evaluateInsight({
+  text: '用户最近在折腾记忆库的安装和配置,装了几次又重装过',
+  adds: 'summary', sources: [{ id: 'b', text: SRC_B }],
+});
+check('自报 summary 且无新增成分 → summary-only', vSum.reasons.includes('summary-only'), JSON.stringify(vSum.reasons));
+const vSumOk = iq.evaluateInsight({
+  text: '所以以后装记忆库必须先备份 memory-banks,不能直接覆盖',
+  adds: 'summary', sources: [{ id: 'b', text: SRC_B }],
+});
+check('自报 summary 但正文有规则 → 放行(只信正文)', vSumOk.reasons.includes('summary-only') === false, JSON.stringify(vSumOk.reasons));
+
 const vGood = iq.evaluateInsight({
   text: '中文检索失效的根因是切词粒度:整句不切导致 LIKE 命中 0',
   evidence: '中文整句不切', sources: [{ id: 'b', text: SRC_B }],
@@ -151,7 +167,8 @@ check('写入 2 条(合格 + 跨源整合)', r.quality?.written === 2, JSON.stri
 check('拦下 1 条编造', r.quality?.evidenceMissing === 1, JSON.stringify(r.quality));
 check('拦下 1 条复述', r.quality?.restatement === 1, JSON.stringify(r.quality));
 check('拦下 1 条近重复', r.quality?.nearDuplicate === 1, JSON.stringify(r.quality));
-check('统计口径 = 5 条', r.quality?.evaluated === 5, JSON.stringify(r.quality));
+check('统计口径 = 6 条', r.quality?.evaluated === 6, JSON.stringify(r.quality));
+check('拦下 1 条摘要(adds=summary 且无新增成分)', r.quality?.summaryOnly === 1, JSON.stringify(r.quality));
 
 // 洞察按 memType 落到不同库:跨源那条是 general,种子与架构那条是 project
 const generalFile = path.join(bank, 'reflect', 'general', 'memory.sqlite');

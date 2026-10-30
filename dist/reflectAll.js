@@ -363,7 +363,7 @@ export async function runReflectAll(opts) {
         dbs.set(mt, db);
         return db;
     };
-    const quality = { evaluated: 0, written: 0, restatement: 0, evidenceMissing: 0, nearDuplicate: 0, noveltyMean: 0, noveltyWritten: 0, crossSource: 0, dupChecked: false };
+    const quality = { evaluated: 0, written: 0, restatement: 0, evidenceMissing: 0, nearDuplicate: 0, summaryOnly: 0, noveltyMean: 0, noveltyWritten: 0, crossSource: 0, dupChecked: false };
     const recMeta = new Map();
     for (const r of records)
         recMeta.set(`${r.instance}|${r.project}|${r.id}`, { text: r.text, importance: r.importance });
@@ -390,6 +390,7 @@ export async function runReflectAll(opts) {
                 const verdict = evaluateInsight({
                     text: ins.text,
                     evidence: ins.evidence,
+                    adds: ins.adds,
                     sources: ins.sources.map((s, i) => ({ id: String(s.id || ''), text: srcTexts[i] || '' })),
                     existing: existingByType.get(mt),
                     srcImportance: srcImps.length ? srcImps.reduce((a, b) => a + b, 0) / srcImps.length : 0.5,
@@ -403,6 +404,10 @@ export async function runReflectAll(opts) {
                 }
                 if (verdict.reasons.includes('restatement')) {
                     quality.restatement++;
+                    continue;
+                }
+                if (verdict.reasons.includes('summary-only')) {
+                    quality.summaryOnly++;
                     continue;
                 }
                 if (verdict.duplicateOf) {
