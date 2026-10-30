@@ -18,6 +18,7 @@ import path from 'node:path';
 import { resolveFedLibraries, type FedLibrary } from './federation/index.js';
 import { currentMemDir, DatabaseManager, generateId, initProjectSchema, memTypeDir } from './db.js';
 import { evaluateInsight, charNgrams } from './insightQuality.js';
+import { localDayOffset } from './dayKey.js';
 import { makeLlmChannel, callLlm, REFLECT_DEEP_MAX_TOKENS } from './reflectionLlm.js';
 import { normalizeMemType, MemType } from './memType.js';
 import { EMOTIONAL_FIDELITY, wholeRecordBatches } from './reflectionFidelity.js';
@@ -233,7 +234,7 @@ export function buildReflectAllSystemPrompt(): string {
 
 /** 用户提示 — 按 [instance/project] 前缀分组列出各库记忆 */
 export function buildReflectAllUserPrompt(groups: { lib: string; items: string[] }[]): string {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localDayOffset(0);
   const body = groups.map(g =>
     `【${g.lib}】共 ${g.items.length} 条\n${g.items.map((t, i) => `${i + 1}. ${t}`).join('\n')}`
   ).join('\n\n');

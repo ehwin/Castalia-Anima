@@ -1,6 +1,6 @@
 import { recallFactsForQuery } from './factRecall.js';
 import { recallTemporalForQuery } from './temporalRecall.js';
-import { localDayOffset } from './dayKey.js';
+import { localDayOf, localDayOffset } from './dayKey.js';
 import { searchMemory } from './search.js';
 export const INJECTION_DEFAULTS = {
     topK: 5,
@@ -102,7 +102,9 @@ const dayOf = (iso) => {
     const parsed = Date.parse(iso ?? '');
     if (Number.isNaN(parsed))
         return 'date unknown';
-    return new Date(parsed).toISOString().slice(0, 10);
+    // 本地日历日：注入块里的每个日期都会被模型当成"那天"来算相对时间，
+    // 用 UTC 日会让凌晨那段落到前一天（与事件层同一口径，见 dayKey.ts）。
+    return localDayOf(parsed);
 };
 /** 单条渲染：`- [日期 · imp 0.8 · sim 0.74 · 可能已过期] 正文` */
 function renderItem(hit, maxItemChars) {
@@ -197,7 +199,7 @@ export function renderInjectionBlock(hits, options = {}) {
     if (kept.length === 0) {
         return { text: '', stats: { ...stats, skipped: stats.deduped > 0 ? 'below-threshold' : 'below-threshold' } };
     }
-    const stamped = new Date(options.now ?? Date.now()).toISOString().slice(0, 10);
+    const stamped = localDayOf(new Date(options.now ?? Date.now()));
     // 最高相似度贴着门槛 → 记忆只是勉强沾边，标 uncertainty=medium 让它别当定论
     const marginTop2 = kept.length > 1
         ? Math.round((((kept[0].similarity ?? 0) - (kept[1].similarity ?? 0)) * 1000)) / 1000
@@ -267,6 +269,9 @@ export async function recallForInjection(query, options = {}) {
             profile: 'deep',
             // 跟读取路径一致：本角色的 + owner 共享的都能被回忆起（否则一般记忆永远进不了注入）
             includeGeneral: true,
+            // 注入不算回忆（2026-10-30）：不刷新 accessed_count/last_accessed_at，
+            // 否则"被注入 → 排名更高 → 更常被注入"会自己滚雪球（实测 lore 行 200~306 次）。
+            countAccess: false,
         });
     }
     catch {

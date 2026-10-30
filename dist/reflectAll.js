@@ -18,6 +18,7 @@ import path from 'node:path';
 import { resolveFedLibraries } from './federation/index.js';
 import { currentMemDir, DatabaseManager, generateId, initProjectSchema, memTypeDir } from './db.js';
 import { evaluateInsight } from './insightQuality.js';
+import { localDayOffset } from './dayKey.js';
 import { makeLlmChannel, callLlm, REFLECT_DEEP_MAX_TOKENS } from './reflectionLlm.js';
 import { normalizeMemType } from './memType.js';
 import { EMOTIONAL_FIDELITY, wholeRecordBatches } from './reflectionFidelity.js';
@@ -150,7 +151,7 @@ export function buildReflectAllSystemPrompt() {
 }
 /** 用户提示 — 按 [instance/project] 前缀分组列出各库记忆 */
 export function buildReflectAllUserPrompt(groups) {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = localDayOffset(0);
     const body = groups.map(g => `【${g.lib}】共 ${g.items.length} 条\n${g.items.map((t, i) => `${i + 1}. ${t}`).join('\n')}`).join('\n\n');
     return `今天是 ${today}(相对日期转绝对日期时以此为准)。
 请对以下来自 ${groups.length} 个记忆库的记忆做跨库反思整合,输出严格 JSON。

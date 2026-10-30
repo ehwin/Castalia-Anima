@@ -19,6 +19,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { normalizeProject, isEmbedEnabled, CHAR_ID } from './env.js';
+import { localDayOf, localDayOffset } from './dayKey.js';
 import { isMemType } from './memType.js';
 import { findSimilarCandidates, SimilarCandidate, CONSOLIDATE_SIMILARITY, CONSOLIDATE_MAX_PAIRS } from './consolidate.js';
 import { getRecentConversations } from './digest.js';
@@ -309,7 +310,7 @@ export async function runDeepReflect(charId: string, limit = 500, project?: stri
       tags: m.tags || [], importance: m.importance ?? 0.5,
       emotionalImpact: m.emotionalImpact ?? 0, tier: m.tier || 'standard',
       locked: m.locked || 0, source: m.source || '',
-      date: (m.createdAt || '').slice(0, 10),
+      date: localDayOf(m.createdAt || ''), // 本地日历日：相对日期换算以此为准
     }));
     const chunk = Math.max(1, Number(process.env.REFLECT_DEEP_CHUNK || 12) || 12);
     const maxCalls = Math.max(1, Number(process.env.REFLECT_DEEP_MAXCALLS || 4) || 4);
@@ -550,12 +551,12 @@ export async function runConsolidate(
   const candidateIds = new Set<string>();
   for (const p of candidates) { candidateIds.add(p.idA); candidateIds.add(p.idB); }
   const inputMems = candidates.length > 0 ? mems.filter(m => candidateIds.has(m.id)) : mems;
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localDayOffset(0); // 本地日历日（UTC 日会让凌晨那段整体差一天）
   const itemsJson = JSON.stringify(inputMems.map(m => ({
     id: m.id,
     memType: m.mem_type || 'general',
     text: m.text || '',
-    createdAt: (m.created_at || '').slice(0, 10),
+    createdAt: localDayOf(m.created_at || ''),
   })), null, 1);
   const pairsJson = JSON.stringify(candidates, null, 1);
 

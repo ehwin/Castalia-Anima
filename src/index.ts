@@ -26,7 +26,7 @@ import { consolidate } from './consolidate.js';
 import { DatabaseManager, listProjectNames, listMemTypeDirs, safeFilePart, currentMemDir, sweepExpiredSessionMemories } from './db.js';
 import { getCategoryTree } from './category.js';
 import { runDigest, getRecentConversations, maybeDigest } from './digest.js';
-import { runEventDigest } from './eventDigest.js';
+import { localDayOf } from './dayKey.js';
 import { flushAllBuffers } from './buffer.js';
 import { reflect, getAllMemories, getMemoryGraph, REFLECT_SYSTEM_PROMPT, getUnanalyzedConversations, applyReflectResult } from './reflect.js';
 import { findEntities, entityFacts, entityMemories, entityGraphSlice, expandEntityGraph, conflictsReport, entityStats } from './entities.js';
@@ -90,7 +90,7 @@ function memorySnapshotWarn(createdAt: string): string | null {
   const diffDays = Math.floor((Date.now() - d.getTime()) / 86400000);
   if (diffDays < 1) return null;
   let dateText: string;
-  try { dateText = d.toISOString().slice(0, 10); } catch { return null; }
+  try { dateText = localDayOf(d); } catch { return null; }
   return `> ⚠️ [Memory Snapshot Warning] 该记忆记录于 ${dateText}(约 ${diffDays} 天前),属于历史快照,引用前请以最新对话/代码为准`;
 }
 
@@ -1723,24 +1723,10 @@ async function main() {
     maybeDigest(CHAR_ID)?.catch((e: any) => console.error('digest error:', e));
   }, 60 * 1000);
 
-  // 事件层整理（P2）：每小时最多一次，没有"待整理的对话"时不调 LLM（runEventDigest 自己先查进度表）。
-  // 2026-10-30: 这段原本不存在 —— runEventDigest 在源码、部署产物、计划任务里都没有调用点，
-  //   真实库 daily_event 恒为 0、progress 表却已记满，事件层等于不在循环里。EVENT_DIGEST_AUTO=0 可关。
-  if (process.env.EVENT_DIGEST_AUTO !== '0') {
-    let lastEventDigestAt = 0;
-    setInterval(() => {
-      if (Date.now() - lastEventDigestAt < 60 * 60 * 1000) return;
-      lastEventDigestAt = Date.now();
-      runEventDigest({})
-        .then(r => {
-          if (r.events > 0 || r.errors.length > 0) {
-            console.error(`[event-digest] events=${r.events} inserted=${r.inserted} updated=${r.updated}`
-              + ` errors=${r.errors.length}${r.skippedReason ? ` (${r.skippedReason})` : ''}`);
-          }
-        })
-        .catch((e: any) => console.error('[event-digest] error:', e.message));
-    }, 60 * 1000);
-  }
+  // 事件摘要层(P2)的调度**不在这里**：AIRI 与宿主都走 maintain()（in-process 由
+  // castalia-memory.ts 的 scheduleMemoryMaintenance 每晚 04:00–06:00 + 启动 catch-up 触发，
+  // 内部已调 runEventDigest）。曾经在这里加过每小时定时器 —— in-process 形态不加载 index.ts，
+  // 那是第二份调度器、纯死代码。stdio 形态若要事件层，应在宿主补触发点，不要加到引擎入口。
 
   // WAL checkpoint every 30 minutes
   setInterval(() => {
