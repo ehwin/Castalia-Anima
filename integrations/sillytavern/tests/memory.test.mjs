@@ -34,22 +34,25 @@ test('same chat in different users/characters is physically isolated', async () 
 
 test('swipe/edit/delete/retry synchronize only the currently selected version', async () => {
   const project = projectFor('alice', 'versions');
-  const message = { id: 'stable', role: 'assistant', name: '角色甲', text: 'abandoned-answer' };
-  const keep = { id: 'kept', role: 'assistant', name: '角色甲', text: 'kept-answer' };
+  // Tokens must not share a word stem: the lexical path matches per token, so
+  // `abandoned-answer` vs `selected-answer` would both hit on "answer" and the
+  // assertion below would fail even when the old version is really gone.
+  const message = { id: 'stable', role: 'assistant', name: '角色甲', text: 'abandoned-zinnia' };
+  const keep = { id: 'kept', role: 'assistant', name: '角色甲', text: 'kept-basalt' };
   assert.equal(syncTavernChat(project, [message]).changed, 1);
   assert.equal(syncTavernChat(project, [message]).changed, 0);
-  assert.equal(syncTavernChat(project, [{ ...message, text: 'selected-answer' }]).changed, 1);
-  assert.equal((await searchMemory({ query: 'abandoned-answer', project })).length, 0);
-  assert.equal((await searchMemory({ query: 'selected-answer', project })).length, 1);
+  assert.equal(syncTavernChat(project, [{ ...message, text: 'selected-quartz' }]).changed, 1);
+  assert.equal((await searchMemory({ query: 'abandoned-zinnia', project })).length, 0);
+  assert.equal((await searchMemory({ query: 'selected-quartz', project })).length, 1);
   // 删除：空快照被显式拒绝（防窗口化误清库），收缩必须走 replace:true 的更小快照
   assert.throws(() => syncTavernChat(project, []), /empty/);
   syncTavernChat(project, [message, keep]);
   assert.equal(syncTavernChat(project, [keep], { replace: true }).deleted, 1);
-  assert.equal((await searchMemory({ query: 'selected-answer', project })).length, 0);
-  assert.equal((await searchMemory({ query: 'kept-answer', project })).length, 1);
+  assert.equal((await searchMemory({ query: 'selected-quartz', project })).length, 0);
+  assert.equal((await searchMemory({ query: 'kept-basalt', project })).length, 1);
   // retry：同一条消息重新出现（replace:true 确认窗口收缩；keep 未变所以 changed=1）
-  assert.equal(syncTavernChat(project, [keep, { ...message, text: 'selected-answer' }], { replace: true }).changed, 1);
-  assert.equal((await searchMemory({ query: 'selected-answer', project })).length, 1);
+  assert.equal(syncTavernChat(project, [keep, { ...message, text: 'selected-quartz' }], { replace: true }).changed, 1);
+  assert.equal((await searchMemory({ query: 'selected-quartz', project })).length, 1);
 });
 
 test('invalid snapshot cannot erase a previously saved chat', () => {
