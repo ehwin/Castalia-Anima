@@ -260,6 +260,11 @@ export async function updateMemory(id, updates, characterId) {
         fields.push('importance = ?, base_importance = ?');
         values.push(updates.importance, updates.importance);
     }
+    // v1.29 情感锚点:钉住 / 取消钉住(pinned=1 的行注入时无条件在场)
+    if (updates.pinned !== undefined) {
+        fields.push('pinned = ?');
+        values.push(updates.pinned ? 1 : 0);
+    }
     if (fields.length === 0)
         return existing;
     fields.push('updated_at = ?');

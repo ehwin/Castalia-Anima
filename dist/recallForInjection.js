@@ -1,7 +1,8 @@
 import { recallFactsForQuery } from './factRecall.js';
 import { recallTemporalForQuery } from './temporalRecall.js';
 import { localDayOf, localDayOffset } from './dayKey.js';
-import { searchMemory } from './search.js';
+import { searchMemory, pinnedAnchors } from './search.js';
+import { injectionPolicy, moodFromScalar } from './emotionalRanking.js';
 export const INJECTION_DEFAULTS = {
     topK: 5,
     minSimilarity: 0.5,
@@ -155,27 +156,36 @@ export function renderInjectionBlock(hits, options = {}) {
     const stats = {
         count: 0, chars: 0, topSim: 0, dropped: 0, belowThreshold: 0, minSimilarity, deduped: 0,
     };
-    if (!hits || hits.length === 0) {
+    // 情感锚点(2026-10-30):钉住的那条不参与相似度门槛 —— 跟问句无关时也该在场。
+    // 去重口径与普通命中一致:最近几轮已经注入过的锚点同样跳过,免得连续 5 轮都在念同一句告白。
+    const recent = new Set((options.recentIds ?? []).filter(Boolean).map(String));
+    const anchorRaw = (options.anchors ?? []).filter(a => a && a.id);
+    const anchorIds = new Set(anchorRaw.map(a => String(a.id)));
+    const anchors = anchorRaw.filter(a => !recent.has(String(a.id)));
+    if (anchors.length > 0)
+        stats.pinned = anchors.length;
+    const hitList = (hits ?? []).filter(h => !anchorIds.has(String(h.id)));
+    if (hitList.length === 0 && anchors.length === 0) {
         return { text: '', stats: { ...stats, skipped: 'no-hits' } };
     }
-    stats.topSim = Math.max(...hits.map(h => Number(h.similarity) || 0));
+    stats.topSim = hitList.length > 0 ? Math.max(...hitList.map(h => Number(h.similarity) || 0)) : 0;
     // 2026-10-28(4):先看证据。没有任何一条命中贴得够近(向量 ≥0.50)、也没有一条词法上
     // 高度重合(≥60%),就**一条都不注入** —— 宁可少注入,也不要拿"最不像话的那条"去污染提示词。
     // 这条门槛把 8/8 噪音问句挡在外面(它们的 sim≥0.50 计数恒为 0),而 14/14 真问题都能过。
     // 2026-10-28:证据门只对"有向量能力"的部署生效。纯词法部署(EMBED_MODE=none)里没有向量命中,
     // 硬要一条 ≥0.60 的词法覆盖率会把正常召回全挡掉 —— 那正是本轮最早修掉的那个 bug,别绕回去。
     // 证据门也要认这条:一条 reflect_* 命中即使 ≥0.50 也不算强证据,必须够 0.60。
-    const hasVectorBasis = hits.some(h => !h.basis || h.basis === 'vector' || h.basis === 'chunk');
-    const strongVec = hits.some(h => (!h.basis || h.basis === 'vector') && (Number(h.similarity) || 0) >= strongEvidence
+    const hasVectorBasis = hitList.some(h => !h.basis || h.basis === 'vector' || h.basis === 'chunk');
+    const strongVec = hitList.some(h => (!h.basis || h.basis === 'vector') && (Number(h.similarity) || 0) >= strongEvidence
         && (!isReflectDerived(h) || (Number(h.similarity) || 0) >= minSimReflect));
-    const strongChunk = hits.some(h => h.basis === 'chunk' && (Number(h.similarity) || 0) >= minSimChunk);
-    const strongLex = hits.some(h => h.basis && h.basis !== 'vector' && h.basis !== 'chunk' && (Number(h.similarity) || 0) >= strongLexical);
-    if (hasVectorBasis && !strongVec && !strongChunk && !strongLex) {
-        const below = hits.filter(h => (Number(h.similarity) || 0) < gateOf(h)).length;
+    const strongChunk = hitList.some(h => h.basis === 'chunk' && (Number(h.similarity) || 0) >= minSimChunk);
+    const strongLex = hitList.some(h => h.basis && h.basis !== 'vector' && h.basis !== 'chunk' && (Number(h.similarity) || 0) >= strongLexical);
+    // 锚点在场时不再整体弃权:证据门管的是"召回准不准",锚点根本不需要召回。
+    if (hasVectorBasis && !strongVec && !strongChunk && !strongLex && anchors.length === 0) {
+        const below = hitList.filter(h => (Number(h.similarity) || 0) < gateOf(h)).length;
         return { text: '', stats: { ...stats, belowThreshold: below, skipped: 'no-strong-evidence' } };
     }
-    const recent = new Set((options.recentIds ?? []).filter(Boolean).map(String));
-    const passing = hits.filter(h => (Number(h.similarity) || 0) >= gateOf(h));
+    const passing = hitList.filter(h => (Number(h.similarity) || 0) >= gateOf(h));
     const fresh = recent.size > 0 ? passing.filter(h => !recent.has(String(h.id))) : passing;
     stats.deduped = passing.length - fresh.length;
     // 时间偏好（2026-10-30）：「我昨天在忙什么」这类问句里，语义相似度比不过人设长文
@@ -188,31 +198,51 @@ export function renderInjectionBlock(hits, options = {}) {
         const m = String(hit?.text ?? '').match(/^#\s*(\d{4}-\d{2}-\d{2})/);
         return m && wantedDays.has(m[1]) ? 0.15 : 0;
     };
-    const kept = [...fresh]
+    const keptHits = [...fresh]
         .map((hit, index) => ({ hit, index, score: (Number(hit.similarity) || 0) + bonusOf(hit) }))
         .sort((a, b) => b.score - a.score || a.index - b.index)
         .slice(0, topK)
         .map(entry => entry.hit);
+    // 情绪合宜性(2026-10-30):难过的当下不主动翻旧账。情绪显著度落在"中"档、且与当前心情同调的记忆
+    // 降为背景(不注入);锚点不受影响(sad 时更该记得约定,而不是回避)。
+    // 只在调用方给了 mood、且重排确实算出 salience 时生效 —— 没数据就不猜。
+    const moodVec = options.mood == null ? null : moodFromScalar(options.mood);
+    let kept = keptHits;
+    if (moodVec) {
+        kept = keptHits.filter(h => {
+            const s = Number(h.salience);
+            if (!Number.isFinite(s))
+                return true;
+            return injectionPolicy(s, { pinned: h.pinned, mood: moodVec }) !== 'context-only';
+        });
+        if (kept.length !== keptHits.length)
+            stats.moodSuppressed = keptHits.length - kept.length;
+    }
+    // 锚点无条件排在最前;它们不占 topK 的名额(钉了两条就当两条都在),但共用字符预算。
+    const keptIdSet = new Set(kept.map(h => String(h.id)));
+    const finalHits = [...anchors.filter(a => !keptIdSet.has(String(a.id))), ...kept];
     // 2026-10-28:先算 belowThreshold 再返回 —— 证据门提前返回时也得留下"挡掉几条"的诊断数字
-    stats.belowThreshold = hits.length - hits.filter(h => (Number(h.similarity) || 0) >= gateOf(h)).length;
-    stats.ids = kept.map(k => String(k.id));
-    if (kept.length === 0) {
+    stats.belowThreshold = hitList.length - hitList.filter(h => (Number(h.similarity) || 0) >= gateOf(h)).length;
+    stats.ids = finalHits.map(k => String(k.id));
+    if (finalHits.length === 0) {
         return { text: '', stats: { ...stats, skipped: stats.deduped > 0 ? 'below-threshold' : 'below-threshold' } };
     }
     const stamped = localDayOf(new Date(options.now ?? Date.now()));
-    // 最高相似度贴着门槛 → 记忆只是勉强沾边，标 uncertainty=medium 让它别当定论
+    // 最高相似度贴着门槛 → 记忆只是勉强沾边，标 uncertainty=medium 让它别当定论。
+    // 只有锚点在场时(topSim=0)**不该**被标成"勉强沾边":锚点不是召回结果,没有相似度这回事。
+    const basisSim = kept.length > 0 ? (kept[0].similarity ?? 0) : 1;
     const marginTop2 = kept.length > 1
         ? Math.round((((kept[0].similarity ?? 0) - (kept[1].similarity ?? 0)) * 1000)) / 1000
-        : Math.round((kept[0].similarity ?? 0) * 1000) / 1000;
+        : Math.round((basisSim) * 1000) / 1000;
     stats.marginTop2 = marginTop2;
     const wantMargin = options.margin ?? Number.parseFloat(process.env.MEMORY_INJECT_MARGIN || '0');
     const thinMargin = Number.isFinite(wantMargin) && wantMargin > 0 && marginTop2 < wantMargin;
-    const uncertainty = (kept[0].similarity ?? 0) < minSimilarity + 0.1 || thinMargin ? 'medium' : 'low';
+    const uncertainty = basisSim < minSimilarity + 0.1 || thinMargin ? 'medium' : 'low';
     const open = `<memory retrieved="${stamped}" source="long-term" uncertainty="${uncertainty}">\n${untrustedFirstLine}\n`;
     const close = '\n</memory>';
     const room = capChars - open.length - close.length;
     const lines = [];
-    for (const hit of kept) {
+    for (const hit of finalHits) {
         const line = renderItem(hit, maxItemChars);
         const next = lines.length === 0 ? line : `${lines.join('\n')}\n${line}`;
         if (next.length <= room) {
@@ -226,7 +256,7 @@ export function renderInjectionBlock(hits, options = {}) {
                 lines.push(`${line.slice(0, room - 1).trimEnd()}…`);
             }
         }
-        stats.dropped = kept.length - lines.length;
+        stats.dropped = finalHits.length - lines.length;
         break;
     }
     if (lines.length === 0) {
@@ -273,6 +303,8 @@ export async function recallForInjection(query, options = {}) {
             // 注入不算回忆（2026-10-30）：不刷新 accessed_count/last_accessed_at，
             // 否则"被注入 → 排名更高 → 更常被注入"会自己滚雪球（实测 lore 行 200~306 次）。
             countAccess: false,
+            // 心情参与情绪一致性重排(没给就按中性处理)
+            mood: options.mood,
         });
     }
     catch {
@@ -282,7 +314,23 @@ export async function recallForInjection(query, options = {}) {
         vectorRouteFailed = true;
     }
     const t0 = Date.now();
-    const out = renderInjectionBlock(hits, { ...options, topK, query: trimmed });
+    // 情感锚点(v1.29):钉住的记忆不靠召回 —— 与问句无关时也该在场。显式传入的优先(测试用)。
+    let anchors = [];
+    if (options.anchors) {
+        anchors = options.anchors;
+    }
+    else {
+        try {
+            anchors = pinnedAnchors({
+                project: options.project,
+                characterId: options.characterId,
+                includeGeneral: true,
+                limit: options.maxAnchors ?? 2,
+            });
+        }
+        catch { /* 锚点取不到不影响正常注入 */ }
+    }
+    const out = renderInjectionBlock(hits, { ...options, topK, query: trimmed, anchors });
     // 事实路（2026-10-29）：facts 表里是已经确认过的稳定事实，之前完全没有参与注入。
     // 独立成块而不是混进 <memory>：memory 块的语义是"过去对话的片段"，事实块是"已确认的结论"，
     // 两者冲突时的处置方式不同。预算独立（默认 420 字），不挤占记忆块的 capChars。

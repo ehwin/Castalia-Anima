@@ -29,7 +29,8 @@
 |---|---|---|
 | **VAD 情感标注** | `emotion.ts` + `affectLexicon.ts` | 写入时给记忆打 `vad_valence/arousal/dominance` + `emotional_impact`；VAD 模型不可用或置信度 ≤ 0.35 时回落本地情感词表（只写 VAD、不改正文），没有情感词就**不造情绪** |
 | **情绪加权检索** | `search.ts` | 情绪是"同等相关时的偏好"，不是主轴（见下方公式） |
-| **情感显著性排序** | `emotionalRanking.ts` | ACT-R 基础激活 + 情绪一致性 + 扩散激活 + 锚点，权重 `0.30 强度 + 0.20 重要度 + 0.20 激活 + 0.15 一致性 + 0.15 共振`，锚点直接 1.0；纯函数、零 IO，`scripts/test_emotional_ranking.mjs` 按行为断言。**尚未接进检索主链**（接线计划见 docs），线上排序仍是 `computeScore` |
+| **情感显著性排序** | `emotionalRanking.ts` + `search.ts` | ACT-R 基础激活 + 情绪一致性 + 扩散激活 + 锚点，权重 `0.30 强度 + 0.20 重要度 + 0.20 激活 + 0.15 一致性 + 0.15 共振`，锚点直接 1.0；纯函数、零 IO。**已接进检索主链**（2026-10-30）：`search.ts` 在候选合并后按 `rankBySalience` 重排，但只作 **±10% 的有界乘数**（相关性仍是主轴 —— 2026-10-28 那次元数据压死相关性的教训），强度取存储强度 `computeBaseIntensity`、新鲜度交给 ACT-R；ACT-R 的时间戳来自新表 `memory_access_log`，联想边复用 `edges`。`scripts/test_emotional_ranking.mjs` 管数学、`scripts/test_emotion_wiring.mjs` 管接线 |
+| **情感锚点（pinned）** | `memory.pinned` + `memory_update {pinned:true}` + `recallForInjection` | 「告白 / 转折 / 那句改变一切的话」可被钉住：注入时**无条件在场**，不参与相似度门槛，仍服从项目与角色隔离；去重口径与普通命中一致（`recentIds` 里的锚点同样跳过）。注入返回 `stats.pinned` |
 | **情绪自状态** | `agentState.ts` | mood / desire / energy，指数衰减聚合，绝对值 ≥ 7 自动落库；`mood_journal` 读写 |
 | **偏差层** | `bias.ts` | 话题权重按 `(project, character)` 累积，影响检索优先级（`1 + min(0.5, weight×0.05)`）；是涌现偏好，不是显式设置 |
 | **用户学习** | `userLearning.ts` | `user_observe` 观察用户表达方式与关注点，进 `user` 类记忆与画像 |
@@ -216,7 +217,7 @@ node scripts/memory_maintenance.mjs eval            [bank] [project]   # 小样�
 | `regression_*.mjs` | 13 | `role_isolation`、`entities`、`facts_bitemporal`、`facts_temporal`、`memory_injection`、`store_bridge`、`superseded_recall`、`v123_anima` |
 | `audit_*.mjs` | 3 | `scale`（只读盘点所有 bank 并给结论）、`orphans`、`vector_space` |
 | `bench_*.mjs` + `eval_*.mjs` | 6 | `reflect_quality`、`insight_gates`、`insight_semantics`、`anima_idf`、`anima_redundancy`、`injection` |
-| `test_*.mjs` | 9 | `emotional_ranking`、`affect_lexicon`、`reflect_quality_gates`、`entity_diffusion`、`injection_enrich` |
+| `test_*.mjs` | 10 | `emotional_ranking`（数学）、`emotion_wiring`（接线：锚点/显著度上界/访问日志/降级）、`affect_lexicon`、`reflect_quality_gates`、`entity_diffusion`、`injection_enrich` |
 | 其它 | 7 | `backfill_affect`（默认 dry-run）、`backfill_reflect_vectors`、`build_chunk_index`、`prune_insights`、`probe_intensity_decay`、`gen_version` |
 
 回归脚本贴着实现写断言（不是抽样）。改动检索 / 事实 / 隔离路径后，至少跑 `role_isolation` + `entities` + `facts_bitemporal` + `memory_injection`。
@@ -230,7 +231,6 @@ node scripts/memory_maintenance.mjs eval            [bank] [project]   # 小样�
 ### 已知缺口（写在这里，避免被当成已完成）
 
 - **情感衰减仍按 `created_at` 算**（`search.ts` 的 `hoursSinceCreated`）：高唤醒记忆 3 天后情感维度归零，而时间项已改按 `last_accessed_at` 刷新，两者不一致。修法两选一见 docs。
-- **`emotionalRanking.ts` 未接线**：显著度重排、情绪一致性、锚点都在模块与测试里，主链仍是 `computeScore`；`pinned` 锚点表尚未建。
 - **情感数据依赖写入时的 VAD 来源**：VAD 模型不自带，需要本地 Ollama 或自备端点；没有就只剩情感词表兜底，可用 `backfill_affect.mjs` 回填历史库，但词表会把叙事里的强词判成强情绪，所以回填默认 dry-run、由人决定。
 
 ## Credits & Upstream

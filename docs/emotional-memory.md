@@ -77,11 +77,22 @@
 
 测试覆盖的是**行为**而不是指标：分散出现 > 集中出现、难过时悲伤记忆 > 快乐记忆、锚点 > 强情感 > 陈年杂事、中分 + 强负心情 → context-only、30 天后高存储强度衰减更慢。
 
-## 四、接线计划（三步，每步可回滚）
+## 四、接线状态（2026-10-30：第 1、3 步已接，第 2 步改用现成的 `edges`）
 
-1. **锚点表**：`memory.pinned`（或独立 `memory_anchor` 表）+ 注入时无条件下发。验收：钉住的告白在 30 天后仍出现在注入块里。
-2. **共激活表**：召回成功后对"本轮所有被注入记忆"两两 +1（同轮只计一次）。验收：反复一起出现的两条记忆，其共振分随轮次上升。
-3. **合并层重排**：`search.ts` 的候选合并阶段用 `rankBySalience` 重排（相似度作为候选项来源，不再是最终排序）。验收：83 项 `regression_v123_anima` 不退化 + 情感连续性场景探针通过。
+1. **锚点表 —— 已接**。`memory.pinned` 列（`db.ts` 迁移，带索引）+ `memory_update {pinned:true}` 钉住 +
+   `search.ts` 的 `pinnedAnchors()` + `recallForInjection` 里**不参与相似度门槛**、排在最前。
+   去重口径与普通命中一致（`recentIds` 里的锚点同样跳过），项目/角色隔离照旧。注入返回 `stats.pinned`。
+   验收：`scripts/test_emotion_wiring.mjs` 里"只有锚点时也注入 / 证据门很弱的问句仍注入锚点 / 取消钉住后取不到"。
+2. **共激活表 —— 不新建**。`edges` 已经是"哪两条记忆被绑在一起"的现成记录，直接当共振边用
+   （`applySalienceRerank` 里一条 IN 查询取回来，按双方计数）。真需要"同轮共现计数"再加表，
+   在那之前多一张表只会多一处要维护的真相。
+3. **合并层重排 —— 已接，但有界**。`search.ts` 在 `bestById` 去重之后、`slice(topK)` 之前调
+   `applySalienceRerank`：显著度只作 `salienceBlendFactor(s) = 0.9 + 0.2s`（±10%）的乘数。
+   **不是**把相似度替换成显著度 —— 2026-10-28 那次 tier×3.0 / importance×1.x / access×1.5
+   已经把"元数据乘在总分上"这条路的代价演示过一遍（6 个字的垃圾行 score 4.3 排第一）。
+   强度取 `computeBaseIntensity`（存储强度），新鲜度交给 ACT-R 的 activation —— 这样这一层与
+   §七 那条"衰减该按哪个时钟算"的争论正交，不会互相牵制。
+   验收：`regression_v123_anima` 83 项 + `regression_memory_injection` 44 项 + 新增 `test_emotion_wiring` 35 项全绿。
 
 ## 五、评测台（不测 precision/recall）
 

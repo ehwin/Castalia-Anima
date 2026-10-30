@@ -35,6 +35,8 @@ export interface StoreParams {
   subject?: 'user' | 'self' | 'environment';
   tier?: 'temporary' | 'standard' | 'critical';
   expiresAt?: string;
+  /** v1.29 情感锚点:钉住的那条注入时无条件在场(Character.AI Story Memory) */
+  pinned?: boolean;
   skipEmbed?: boolean;  // v5.0: digest 暂不向量化
 }
 
@@ -326,6 +328,8 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>, ch
     fields.push('importance = ?, base_importance = ?');
     values.push(updates.importance, updates.importance);
   }
+  // v1.29 情感锚点:钉住 / 取消钉住(pinned=1 的行注入时无条件在场)
+  if (updates.pinned !== undefined) { fields.push('pinned = ?'); values.push(updates.pinned ? 1 : 0); }
 
   if (fields.length === 0) return existing;
 

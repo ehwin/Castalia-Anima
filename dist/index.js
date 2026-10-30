@@ -49,6 +49,19 @@ function ok(data) {
 function err(msg, code = 'ERROR') {
     return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: { code, message: msg } }, null, 2) }], isError: true };
 }
+/**
+ * 当前心情(-10..+10) —— 传给检索层做情绪一致性重排、传给注入层做"难过不翻旧账"。
+ * agentState 还没建/读库失败时返回 undefined(检索层按中性处理,行为与接线前一致)。
+ */
+function currentMood(project) {
+    try {
+        const m = Number(getAgentState(CHAR_ID, project).getSnapshot().currentMood);
+        return Number.isFinite(m) ? m : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
 // ── 可选 HTTP 健康检查(默认关闭;设 HEALTH_PORT 才监听,供容器/编排/验证探活)──
 const _healthPort = parseInt(process.env.HEALTH_PORT || '0', 10);
 if (_healthPort > 0) {
@@ -180,7 +193,7 @@ register('memory_search', 'agent', 'Search past memories using tag-first then ve
     try {
         const r = args.projects && args.projects.length > 0
             ? await searchMemoryAcross({ query: args.query, topK: args.topK ?? 5, category: args.category, memType: args.memType, projects: args.projects })
-            : await searchMemory({ query: args.query, topK: args.topK ?? 5, profile: 'balanced', category: args.category, memType: args.memType, characterId: CHAR_ID, project: args.project });
+            : await searchMemory({ query: args.query, topK: args.topK ?? 5, profile: 'balanced', category: args.category, memType: args.memType, characterId: CHAR_ID, project: args.project, mood: currentMood(args.project) });
         return ok({
             op: 'search',
             query: args.query,
@@ -270,6 +283,7 @@ register('memory_update', 'harness', 'Update memory fields (text, category, tags
     tags: z.array(z.string()).optional(),
     importance: z.number().optional(),
     tier: z.string().optional(),
+    pinned: z.boolean().optional().describe('情感锚点:钉住的那条注入时无条件在场(告白/转折/约定),不再依赖相似度'),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
@@ -1475,6 +1489,8 @@ register('memory_recall', 'store', 'Recall for one query and render a ready-to-i
             topK: args.topK,
             minSimilarity: args.minSimilarity,
             capChars: args.capChars,
+            // 心情 → 情绪一致性重排 + "难过不翻旧账";agentState 取不到就按中性处理
+            mood: currentMood(project),
         });
         return ok({
             op: 'recall',

@@ -541,6 +541,28 @@ export function initProjectSchema(db: Database.Database) {
   try { db.exec(`ALTER TABLE facts ADD COLUMN expired_at DATETIME`); } catch (_e) { /* already exists */ }
   try { db.exec(`ALTER TABLE facts ADD COLUMN evidence TEXT`); } catch (_e) { /* already exists */ }
 
+  // v1.29 情感锚点 + 访问日志(2026-10-30)
+  //
+  // pinned:Character.AI Story Memory 的口径 —— 「告白 / 转折 / 那句改变一切的话」可以被钉住,
+  // 永不衰减、注入时无条件在场。emotionalRanking.ts 里早就有 pinned 短路逻辑与测试,
+  // 但**库里没有这一列**,所以锚点此前只能是测试里的假设。这里补上列与索引。
+  //
+  // memory_access_log:ACT-R 的 base-level activation 要的是**多次访问的时间戳**,
+  // 而 memory 表只有 accessed_count + last_accessed_at(一次性快照)。没有日志时
+  // 「反复想起」和「只想起过一回」在运算上无法区分,间隔效应表达不出来。
+  // 只记 (memory_id, project, accessed_at, channel),不记查询内容;注入路径不写(countAccess=false)。
+  try { db.exec(`ALTER TABLE memory ADD COLUMN pinned INTEGER DEFAULT 0`); } catch (_e) { /* already exists */ }
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_pinned ON memory(project, is_active, pinned)`); } catch (_e) {}
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS memory_access_log (
+      memory_id TEXT NOT NULL,
+      project TEXT DEFAULT 'default',
+      accessed_at DATETIME NOT NULL,
+      channel TEXT DEFAULT 'search'
+    )`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_access_log_memory ON memory_access_log(memory_id, accessed_at)`);
+  } catch (_e) { /* 建表失败不影响主路径:日志只是排序的增益 */ }
+
   // v1.23.2: 衰减基线 + 向量化失败计数（与 Castalia 核心同步）
   try { db.exec(`ALTER TABLE memory ADD COLUMN base_importance REAL`); } catch (_e) { /* already exists */ }
   try { db.exec(`ALTER TABLE memory ADD COLUMN embed_fail_count INTEGER DEFAULT 0`); } catch (_e) { /* already exists */ }
