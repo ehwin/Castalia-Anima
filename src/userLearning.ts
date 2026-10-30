@@ -159,6 +159,7 @@ export function loadUserProfilesFromDb(characterId: string, project?: string): v
       SELECT text, tags, emotional_impact, created_at
       FROM memory
       WHERE project = ? AND subject = 'user' AND type = 'preference' AND character_id = ? AND is_active = 1
+        AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
       ORDER BY created_at DESC
       LIMIT 50
     `).all(proj, characterId) as any[];

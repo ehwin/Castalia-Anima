@@ -2,7 +2,7 @@
 //   1) VAD 队列带 project / memoryId，跨项目不混批、按 id 精确回写
 //   2) tavern_sync 快照契约：空数组拒绝、窗口化子集拒绝、replace:true 才允许收缩
 //   3) bias / userLearning 按 (project, charId) 分区，互不串味
-//   4) batchClassifyAndTag 把模型返回的 VAD 三维写入 memory 行并 clamp 到 [-1,1]
+//   4) batchClassifyAndTag 拒绝越界 VAD，并使用批次级合法 appraisal 兜底
 // 纯离线：临时库 + mock Ollama（EMBED_MODE=none），不触网、不写 memory-banks。
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -24,7 +24,7 @@ Object.assign(process.env, {
 });
 
 const load = name => import(pathToFileURL(path.join(root, 'dist', name + '.js')).href);
-const { DatabaseManager } = await load('db');
+const { DatabaseManager, generateId } = await load('db');
 const { saveConversationTurn, saveMemory } = await load('store');
 const { queueForVad, flushVadQueue, vadQueueStatus, getSmoothedVAD } = await load('emotion');
 const { autoProcess } = await load('autoProcessor');
@@ -34,6 +34,17 @@ const { observeUserMessage, getUserProfilePrompt, getUserProfile } = await load(
 
 let checks = 0;
 const check = (value, message) => { assert.ok(value, message); checks++; };
+
+const insertConversation = (project, text) => {
+  const db = DatabaseManager.getInstance(project, 'general');
+  const id = generateId();
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO memory
+    (id, text, project, type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, affect_status, affect_source)
+    VALUES (?, ?, ?, 'episodic', 'conversation', '[]', 0.5, 'airi', 'conversation_log', 'user', 'standard', 1, ?, ?, ?, 0, 0, 'pending', 'vad_queue')`)
+    .run(id, text, project, now, now, now);
+  return { id, db };
+};
 
 const ok = content => new Response(JSON.stringify({ message: { content } }), { status: 200 });
 let classifyReply = () => '[]';
@@ -45,7 +56,7 @@ globalThis.fetch = async (_url, init) => {
   const body = JSON.parse(init?.body || '{}');
   const system = body?.messages?.[0]?.content || '';
   const user = body?.messages?.[1]?.content || '';
-  if (system.includes('emotion analyzer')) {
+  if (system.includes('interaction-appraisal sensor')) {
     vadPrompts.push(user);
     const valence = user.includes('手冲咖啡') ? 1 : -1;
     return ok(JSON.stringify({
@@ -98,8 +109,8 @@ check(getSmoothedVAD(P1).vad.valence > getSmoothedVAD(P2).vad.valence, 'smoothed
 
 // 同文本两条不同 id：必须按 id 更新，而不是按 created_at DESC 猜最近一条
 const P3 = 'audit-p3';
-const older = await saveConversationTurn('同文本消息：重复内容', '第一次回复', 'airi', undefined, undefined, P3);
-const newer = await saveConversationTurn('同文本消息：重复内容', '第二次回复', 'airi', undefined, undefined, P3);
+const older = insertConversation(P3, '用户: 同文本消息：重复内容\n助手: 第一次回复');
+const newer = insertConversation(P3, '用户: 同文本消息：重复内容\n助手: 第二次回复');
 classifyReply = () => JSON.stringify([{ importance: 0.6, category: 'knowledge', tags: ['id-based'] }]);
 queueForVad('同文本消息：重复内容', P3, older.id);
 await flushVadQueue(P3, { force: true });
@@ -109,18 +120,18 @@ const newerRow = db3.prepare('SELECT * FROM memory WHERE id = ?').get(newer.id);
 check(olderRow.category === 'knowledge' && JSON.parse(olderRow.tags)[0] === 'id-based', 'entry with memoryId updates that exact row');
 check(newerRow.category === 'conversation' && newerRow.tags === '[]' && Number(newerRow.importance) === 0.5, 'same-text newer row is untouched (no positional guess)');
 
-// 没有 memoryId 的旧式条目：只在本项目内按 created_at DESC 回退，且不碰别的项目
+// 没有 memoryId 的旧式条目：拒绝入队，避免重启/并发时把情绪写回错误行
 const P4 = 'audit-p4';
 const P5 = 'audit-p5';
-const p4Turn = await saveConversationTurn('P4 无 id 回退测试', '回复', 'airi', undefined, undefined, P4);
-const p5Turn = await saveConversationTurn('P5 干扰行，保持原样', '回复', 'airi', undefined, undefined, P5);
+const p4Turn = insertConversation(P4, '用户: P4 无 id 回退测试\n助手: 回复');
+const p5Turn = insertConversation(P5, '用户: P5 干扰行，保持原样\n助手: 回复');
 classifyReply = () => JSON.stringify([{ importance: 0.4, category: 'preference', tags: ['fallback'] }]);
-queueForVad('P4 无 id 回退测试', P4); // 不传 memoryId
+queueForVad('P4 无 id 回退测试', P4); // 不传 memoryId，必须被拒绝
 await flushVadQueue(P4, { force: true });
 const p4Row = DatabaseManager.getInstance(P4).prepare('SELECT * FROM memory WHERE id = ?').get(p4Turn.id);
 const p5Row = DatabaseManager.getInstance(P5).prepare('SELECT * FROM memory WHERE id = ?').get(p5Turn.id);
-check(p4Row.category === 'preference' && JSON.parse(p4Row.tags)[0] === 'fallback', 'id-less entry falls back inside its own project');
-check(p5Row.category === 'conversation' && Number(p5Row.importance) === 0.5, 'id-less fallback never touches another project');
+check(p4Row.category === 'conversation' && p4Row.tags === '[]' && Number(p4Row.importance) === 0.5, 'id-less entry is rejected before classification');
+check(p5Row.category === 'conversation' && Number(p5Row.importance) === 0.5, 'id-less rejection never touches another project');
 
 // autoProcess 端到端：先落库再入队，flush 后本轮对话行被正确回写
 const P7 = 'audit-auto';
@@ -208,14 +219,15 @@ check(getUserProfile('airi', 'default', U2).interactionCount === 3, 'U2 interact
 check(getUserProfile('airi', 'default', 'audit-user-none') === null, 'unseen project has no profile');
 
 // ══════════════════════════════════════════════════════════════════
-// 4) VAD 维度落库 + clamp（第 4 组）
+// 4) VAD 维度落库 + 越界拒绝（第 4 组）
 // ══════════════════════════════════════════════════════════════════
-// P1 的分类结果带越界 VAD（valence=5, arousal=-3, dominance=0.5）
-check(p1Row.vad_valence === 1, 'VAD valence clamped to 1 (got ' + p1Row.vad_valence + ')');
-check(p1Row.vad_arousal === -1, 'VAD arousal clamped to -1 (got ' + p1Row.vad_arousal + ')');
-check(p1Row.vad_dominance === 0.5, 'VAD dominance stored as 0.5 (got ' + p1Row.vad_dominance + ')');
+// P1 的分类结果带越界 VAD（valence=5, arousal=-3, dominance=0.5）。
+// 它必须被视为无效，并使用同批次的合法 appraisal，而不是逐维 clamp。
+check(p1Row.vad_valence === 1, 'invalid row VAD uses batch valence fallback (got ' + p1Row.vad_valence + ')');
+check(p1Row.vad_arousal === 0.2, 'invalid row VAD uses batch arousal fallback (got ' + p1Row.vad_arousal + ')');
+check(p1Row.vad_dominance === 0, 'invalid row VAD uses batch dominance fallback (got ' + p1Row.vad_dominance + ')');
 check(p1Row.vad_valence != null && p1Row.vad_arousal != null && p1Row.vad_dominance != null, 'all three VAD columns are non-null');
-check(p2Row.vad_valence == null && p2Row.vad_arousal == null && p2Row.vad_dominance == null, 'result without vad keeps columns NULL');
+check(p2Row.vad_valence === -1 && p2Row.vad_arousal === 0.2 && p2Row.vad_dominance === 0, 'missing per-row VAD uses the batch appraisal fallback');
 
 check(vadQueueStatus().size === 0, 'queue is empty at the end');
 

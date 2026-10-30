@@ -63,7 +63,7 @@ export function deleteCategory(name, reassignTo, reassignChildrenTo) {
         throw new Error(`Cannot delete "${name}": has children [${children.map(c => c.name).join(', ')}]. Provide reassignChildrenTo.`);
     }
     // Check for memories (v1.24: 只算本角色的记忆,别把别的角色的分类占用算到自己头上)
-    const memCount = db.prepare('SELECT COUNT(*) as cnt FROM memory WHERE category = ? AND is_active = 1 AND character_id = ?').get(name, CHAR_ID);
+    const memCount = db.prepare("SELECT COUNT(*) as cnt FROM memory WHERE category = ? AND is_active = 1 AND character_id = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").get(name, CHAR_ID);
     if (memCount.cnt > 0 && !reassignTo) {
         throw new Error(`Cannot delete "${name}": ${memCount.cnt} memories use it. Provide reassignTo.`);
     }
@@ -74,7 +74,7 @@ export function deleteCategory(name, reassignTo, reassignChildrenTo) {
         }
         // Reassign memories (v1.24: 只改本角色的行)
         if (memCount.cnt > 0 && reassignTo) {
-            db.prepare('UPDATE memory SET category = ? WHERE category = ? AND character_id = ?').run(reassignTo, name, CHAR_ID);
+            db.prepare("UPDATE memory SET category = ? WHERE category = ? AND character_id = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").run(reassignTo, name, CHAR_ID);
         }
         // Delete category
         db.prepare('DELETE FROM categories WHERE name = ?').run(name);

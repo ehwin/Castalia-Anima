@@ -7,27 +7,53 @@ function ensureReflectionProgress(db: any): void {
     conversation_id TEXT NOT NULL,
     processed_at TEXT NOT NULL,
     project TEXT NOT NULL,
-    PRIMARY KEY (project, conversation_id)
+    character_id TEXT NOT NULL,
+    PRIMARY KEY (project, character_id, conversation_id)
   )`);
   const columns = db.prepare('PRAGMA table_info(reflection_progress)').all() as any[];
-  if (!columns.some(column => column.name === 'project' && column.pk)) {
+  const hasCharacter = columns.some(column => column.name === 'character_id');
+  const primaryKey = columns.filter(column => Number(column.pk) > 0).sort((a, b) => Number(a.pk) - Number(b.pk)).map(column => column.name);
+  const expectedPrimaryKey = ['project', 'character_id', 'conversation_id'];
+  if (!hasCharacter || primaryKey.join('|') !== expectedPrimaryKey.join('|')) {
+    // Older tables had no role key (or used only project + conversation_id).
+    // Their rows predate role isolation, so keep them under the process default
+    // role. Do not use the caller's role here: a new role must not inherit an
+    // old role's cursor just because it was the first one to trigger migration.
+    const legacy = `reflection_progress_legacy_${Date.now()}`;
     db.transaction(() => {
-      db.exec(`ALTER TABLE reflection_progress RENAME TO reflection_progress_legacy;
-        CREATE TABLE reflection_progress (conversation_id TEXT NOT NULL, processed_at TEXT NOT NULL, project TEXT NOT NULL, PRIMARY KEY (project, conversation_id));
-        INSERT INTO reflection_progress SELECT conversation_id, processed_at, project FROM reflection_progress_legacy;
-        DROP TABLE reflection_progress_legacy;`);
+      db.exec(`ALTER TABLE reflection_progress RENAME TO ${legacy};
+        CREATE TABLE reflection_progress (
+          conversation_id TEXT NOT NULL,
+          processed_at TEXT NOT NULL,
+          project TEXT NOT NULL,
+          character_id TEXT NOT NULL,
+          PRIMARY KEY (project, character_id, conversation_id)
+        );`);
+      const legacyColumns = db.prepare(`PRAGMA table_info(${legacy})`).all() as any[];
+      const hasLegacyCharacter = legacyColumns.some(column => column.name === 'character_id');
+      if (hasLegacyCharacter) {
+        db.prepare(`INSERT OR IGNORE INTO reflection_progress (conversation_id, processed_at, project, character_id)
+          SELECT conversation_id, processed_at, project, COALESCE(NULLIF(character_id, ''), ?) FROM ${legacy}`)
+          .run(CHAR_ID);
+      } else {
+        db.prepare(`INSERT OR IGNORE INTO reflection_progress (conversation_id, processed_at, project, character_id)
+          SELECT conversation_id, processed_at, project, ? FROM ${legacy}`)
+          .run(CHAR_ID);
+      }
+      db.exec(`DROP TABLE ${legacy};`);
     })();
   }
 }
 
-export function markConversationsReflected(ids: string[], project?: string): void {
+export function markConversationsReflected(ids: string[], project?: string, characterId: string = CHAR_ID): void {
   if (!ids.length) return;
   const proj = normalizeProject(project);
+  const cid = characterId || CHAR_ID;
   const now = new Date().toISOString();
   const db = DatabaseManager.getInstance(proj);
   ensureReflectionProgress(db);
-  const stmt = db.prepare('INSERT OR REPLACE INTO reflection_progress (conversation_id, processed_at, project) VALUES (?, ?, ?)');
-  db.transaction((values: string[]) => values.forEach(id => stmt.run(id, now, proj)))(ids);
+  const stmt = db.prepare('INSERT OR REPLACE INTO reflection_progress (conversation_id, processed_at, project, character_id) VALUES (?, ?, ?, ?)');
+  db.transaction((values: string[]) => values.forEach(id => stmt.run(id, now, proj, cid)))(ids);
 }
 
 export function deepReflectionCursor(project?: string, nextId?: string): string {
@@ -53,11 +79,19 @@ export function getUnanalyzedConversations(
   const processed = new Set<string>();
   try {
     const progressDb = DatabaseManager.getInstance(proj);
-    for (const row of progressDb.prepare('SELECT conversation_id FROM reflection_progress WHERE project = ?').all(proj) as any[]) processed.add(row.conversation_id);
+    ensureReflectionProgress(progressDb);
+    const progressRows = cid === 'any'
+      ? progressDb.prepare('SELECT conversation_id FROM reflection_progress WHERE project = ?').all(proj)
+      : progressDb.prepare('SELECT conversation_id FROM reflection_progress WHERE project = ? AND character_id = ?').all(proj, cid);
+    for (const row of progressRows as any[]) processed.add(row.conversation_id);
   } catch { /* use the per-library fallback below */ }
   for (const db of dbs) {
     try {
-      for (const row of db.prepare('SELECT conversation_id FROM reflection_progress WHERE project = ?').all(proj) as any[]) processed.add(row.conversation_id);
+      ensureReflectionProgress(db);
+      const progressRows = cid === 'any'
+        ? db.prepare('SELECT conversation_id FROM reflection_progress WHERE project = ?').all(proj)
+        : db.prepare('SELECT conversation_id FROM reflection_progress WHERE project = ? AND character_id = ?').all(proj, cid);
+      for (const row of progressRows as any[]) processed.add(row.conversation_id);
     } catch { /* older databases are created lazily */ }
   }
 
@@ -76,6 +110,8 @@ export function getUnanalyzedConversations(
           -- 删掉的东西又被反刍复活,是用户永远关不掉的污染源。
           AND is_active = 1
           AND project = ?
+          -- Legacy NULL rows are unowned; only an explicit cross-role caller
+          -- may inspect them.
           AND (? = 'any' OR character_id = ?)
           AND (? IS NULL OR created_at > ?)
         ORDER BY created_at ASC

@@ -13,8 +13,10 @@
  *   const snapshot = state.getSnapshot();
  */
 import { DatabaseManager } from './db.js';
-import { normalizeProject } from './env.js';
+import { normalizeCharacterId, normalizeProject } from './env.js';
 import { loadBiasesFromDb } from './bias.js';
+import { getPsycheState } from './psycheState.js';
+import { publicMemorySourceSql } from './memoryProvenance.js';
 // In-memory state per character (not persisted)
 const agentStates = new Map();
 class AgentState {
@@ -24,8 +26,8 @@ class AgentState {
     currentDesire = null;
     energy = 100;
     lastUpdated = Date.now();
-    // Mood decay: half-life ~7 hours
-    static MOOD_DECAY_RATE = 0.1;
+    // Mood events are signed impacts around a neutral baseline (0). A seven
+    // hour half-life makes an isolated event return to baseline over time.
     static MOOD_HALF_LIFE_HOURS = 7;
     constructor(characterId, project) {
         this.characterId = characterId;
@@ -47,6 +49,7 @@ class AgentState {
         SELECT text, emotional_impact, created_at
         FROM memory
         WHERE subject = 'self' AND agent_mood IS NOT NULL AND character_id = ? AND is_active = 1
+          AND ${publicMemorySourceSql()}
         ORDER BY created_at DESC
         LIMIT 20
       `).all(this.characterId);
@@ -61,7 +64,8 @@ class AgentState {
         }
     }
     /**
-     * Add a mood event. Automatically aggregates with decay.
+     * Add a signed mood-impact event. The current mood is the decayed sum of
+     * recent impacts around the neutral baseline (0), clamped to [-10, 10].
      */
     addMood(value, reason) {
         const clamped = Math.max(-10, Math.min(10, Number.isFinite(Number(value)) ? Number(value) : 0));
@@ -94,15 +98,16 @@ class AgentState {
         if (this.moodHistory.length === 0)
             return 0;
         const now = Date.now();
-        let totalWeight = 0;
         let totalMood = 0;
+        const halfLife = AgentState.MOOD_HALF_LIFE_HOURS;
         for (const event of this.moodHistory) {
-            const hoursAgo = (now - event.timestamp) / (1000 * 60 * 60);
-            const decay = Math.exp(-AgentState.MOOD_DECAY_RATE * hoursAgo);
+            const elapsedMs = Math.max(0, now - event.timestamp);
+            const hoursAgo = elapsedMs / (1000 * 60 * 60);
+            const decay = Math.pow(0.5, hoursAgo / halfLife);
             totalMood += event.value * decay;
-            totalWeight += decay;
         }
-        return totalWeight > 0 ? Math.round((totalMood / totalWeight) * 10) / 10 : 0;
+        const clamped = Math.max(-10, Math.min(10, totalMood));
+        return Math.round(clamped * 10) / 10;
     }
     /**
      * Get current energy (decreases over time, resets on interaction).
@@ -136,7 +141,13 @@ class AgentState {
      * Format state for prompt injection.
      */
     toPromptString() {
-        const mood = this.getCurrentMood();
+        const psyche = getPsycheState(this.characterId, this.project);
+        // Once the interaction sensor has evidence, it is the only affect source
+        // shown to the model. The legacy scalar mood remains a compatibility
+        // fallback for callers that have not produced sensor evidence yet.
+        const mood = psyche.hasEvidence
+            ? (psyche.band === 'neutral' ? 0 : Math.max(-10, Math.min(10, psyche.vad.valence * 10)))
+            : this.getCurrentMood();
         const energy = this.getCurrentEnergy();
         const desire = this.currentDesire;
         let moodDesc;
@@ -150,16 +161,19 @@ class AgentState {
             moodDesc = '有点低落';
         else
             moodDesc = '心情不好';
-        let lines = [
+        const lines = [
             `[Anima 当前状态]`,
             `情绪指数：${mood >= 0 ? '+' : ''}${mood.toFixed(1)}（${moodDesc}）`,
             `精力值：${energy}/100`,
         ];
+        if (psyche.hasEvidence) {
+            lines.splice(1, 1, `互动状态：${psyche.band}（v=${psyche.vad.valence.toFixed(2)} a=${psyche.vad.arousal.toFixed(2)} d=${psyche.vad.dominance.toFixed(2)}）`);
+        }
         if (desire) {
             lines.push(`当前想法：${desire}`);
         }
         // Add recent mood context
-        if (this.moodHistory.length > 0) {
+        if (this.moodHistory.length > 0 && !psyche.hasEvidence) {
             const recent = this.moodHistory.slice(-3);
             const reasons = recent.map(e => e.reason).join('、');
             lines.push(`最近经历：${reasons}`);
@@ -192,9 +206,10 @@ class AgentState {
  * Get or create AgentState for a character.
  */
 export function getAgentState(characterId, project) {
-    const key = `${normalizeProject(project)}|${characterId}`;
+    const canonicalCharacterId = normalizeCharacterId(characterId);
+    const key = `${normalizeProject(project)}|${canonicalCharacterId}`;
     if (!agentStates.has(key)) {
-        agentStates.set(key, new AgentState(characterId, project));
+        agentStates.set(key, new AgentState(canonicalCharacterId, project));
     }
     return agentStates.get(key);
 }

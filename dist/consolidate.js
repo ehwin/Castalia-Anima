@@ -48,6 +48,7 @@ function scanVectorPairs(db, proj, threshold, limit, seen, pairs, characterId = 
     const mems = db.prepare(`
     SELECT m.rowid, m.id FROM memory m
     WHERE m.is_active = 1 AND m.project = ? AND (? = 'any' OR m.character_id = ?) AND (m.locked IS NULL OR m.locked = 0)
+      AND COALESCE(m.source, '') NOT IN ('agent_diary', 'agent_state')
       AND COALESCE(m.tier, 'standard') <> 'critical'
       AND COALESCE(m.status, '') NOT IN ('cold', 'superseded')
     ORDER BY m.created_at DESC
@@ -129,6 +130,7 @@ function scanStructPairs(db, proj, limit, seen, pairs, characterId = CHAR_ID) {
             rows2 = db.prepare(`
         SELECT id, text, mem_type FROM memory
         WHERE is_active = 1 AND project = ? AND (? = 'any' OR character_id = ?) AND (locked IS NULL OR locked = 0)
+          AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
           AND COALESCE(tier, 'standard') <> 'critical'
           AND COALESCE(status, '') NOT IN ('cold', 'superseded')
         ORDER BY created_at DESC LIMIT 500
@@ -223,7 +225,7 @@ export async function consolidate() {
         const activeRecords = db.prepare(`
       SELECT id, importance, COALESCE(base_importance, importance) AS base_importance, last_accessed_at
       FROM memory WHERE is_active = 1 AND character_id = ?
-        AND COALESCE(source, '') NOT IN ('manual_lore', 'conversation_log', 'agent_state', 'daily_event')
+        AND COALESCE(source, '') NOT IN ('manual_lore', 'conversation_log', 'agent_state', 'daily_event', 'agent_diary')
         AND COALESCE(tier, 'standard') != 'critical' AND (locked IS NULL OR locked = 0)
         AND COALESCE(identity_locked, 0) = 0
     `).all(cid);
@@ -251,7 +253,7 @@ export async function consolidate() {
         });
         decayTx();
         // ═══ Phase 2: reference_count 升华 ═══
-        const dupes = db.prepare('SELECT id FROM memory WHERE is_active = 1 AND character_id = ? AND reference_count > 2 LIMIT 20').all(cid);
+        const dupes = db.prepare("SELECT id FROM memory WHERE is_active = 1 AND character_id = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state') AND reference_count > 2 LIMIT 20").all(cid);
         for (const dup of dupes) {
             db.prepare(`UPDATE memory SET reference_count = 0,
            importance = MIN(0.95, COALESCE(base_importance, importance) + 0.1),

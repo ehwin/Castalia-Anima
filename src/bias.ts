@@ -12,6 +12,7 @@
 import { DatabaseManager } from './db.js';
 import { normalizeProject } from './env.js';
 import { parseTagsSafe } from './tags.js';
+import { publicMemorySourceSql } from './memoryProvenance.js';
 
 interface TopicWeight {
   topic: string;
@@ -150,6 +151,7 @@ export function loadBiasesFromDb(characterId: string, project?: string): void {
         const db = DatabaseManager.getInstance(proj, mt);
         const rows = db.prepare(`
           SELECT tags FROM memory WHERE project = ? AND character_id = ? AND is_active = 1
+            AND ${publicMemorySourceSql()}
         `).all(proj, characterId) as any[];
         for (const row of rows) {
           try {

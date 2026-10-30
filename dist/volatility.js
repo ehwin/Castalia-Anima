@@ -77,9 +77,11 @@ export function estimatePredicateVolatility(db, project, subject, predicate, cha
     try {
         // 用事件时间（valid_from 优先，否则入库时间）：同一事实"什么时候成立"才是变化间隔。
         rows = db.prepare(`
-      SELECT object, COALESCE(valid_from, created_at) AS at FROM facts
-      WHERE project = ? AND COALESCE(character_id, '') = ? AND subject = ? AND predicate = ?
-      ORDER BY julianday(COALESCE(valid_from, created_at))
+      SELECT facts.object, COALESCE(facts.valid_from, facts.created_at) AS at FROM facts
+      LEFT JOIN memory source_memory ON source_memory.id = facts.source_memory_id
+      WHERE facts.project = ? AND COALESCE(facts.character_id, '') = ? AND facts.subject = ? AND facts.predicate = ?
+        AND COALESCE(facts.source_memory_source, source_memory.source, '') NOT IN ('agent_diary', 'agent_state')
+      ORDER BY julianday(COALESCE(facts.valid_from, facts.created_at))
     `).all(project, characterId ?? '', subject, predicate);
     }
     catch {

@@ -64,15 +64,18 @@ export function recallFactsForQuery(query, options = {}) {
         }
         try {
             const rows = db.prepare(`
-        SELECT id, subject, predicate, object, confidence, COALESCE(updated_at, created_at) AS updated_at
-        FROM facts
-        WHERE is_active = 1
-          AND valid_to IS NULL
-          AND (superseded_by IS NULL OR superseded_by = '')
-          AND project = ?
-          AND (character_id = ? OR character_id IS NULL)
-          AND predicate IN (${placeholders})
-        ORDER BY confidence DESC, updated_at DESC
+        SELECT f.id, f.subject, f.predicate, f.object, f.confidence,
+               COALESCE(f.updated_at, f.created_at) AS updated_at
+        FROM facts f
+        LEFT JOIN memory source_memory ON source_memory.id = f.source_memory_id
+        WHERE f.is_active = 1
+          AND f.valid_to IS NULL
+          AND (f.superseded_by IS NULL OR f.superseded_by = '')
+          AND f.project = ?
+          AND f.character_id = ?
+          AND f.predicate IN (${placeholders})
+          AND COALESCE(f.source_memory_source, source_memory.source, '') NOT IN ('agent_diary', 'agent_state')
+        ORDER BY f.confidence DESC, updated_at DESC
         LIMIT ?
       `).all(proj, cid, ...families, limit * 3);
             for (const row of rows) {

@@ -27,7 +27,7 @@ import crypto from 'node:crypto';
 import { serializeTags } from './tags.js';
 export function reflectRecordKey(r) {
     const h = crypto.createHash('sha1').update(String(r.text || '')).digest('hex').slice(0, 12);
-    return `${r.instance}|${r.project}|${r.id}|${h}`;
+    return `${r.instance}|${r.project}|${CHAR_ID}|${r.id}|${h}`;
 }
 /** 账本路径:REFLECT_LEDGER_FILE > <REFLECT_DIR|MEMORY_DB_DIR>/reflect-ledger.json */
 export function reflectLedgerPath() {
@@ -94,9 +94,12 @@ function scanLibrary(lib, limit) {
       SELECT id, text, mem_type, importance, created_at
       FROM memory
       WHERE is_active = 1
+        AND project = ?
+        AND character_id = ?
+        AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
       ORDER BY created_at DESC
       LIMIT ?
-    `).all(limit);
+    `).all(lib.project, CHAR_ID, limit);
         return { rows };
     }
     catch (e) {
@@ -379,7 +382,7 @@ export async function runReflectAll(opts) {
                 if (!existingByType.has(mt)) {
                     let rows = [];
                     try {
-                        rows = db.prepare('SELECT id, text FROM memory WHERE is_active = 1 AND character_id = ? LIMIT 5000').all(CHAR_ID);
+                        rows = db.prepare("SELECT id, text FROM memory WHERE is_active = 1 AND project = 'reflect' AND character_id = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state') LIMIT 5000").all(CHAR_ID);
                     }
                     catch { }
                     existingByType.set(mt, rows);
@@ -414,12 +417,12 @@ export async function runReflectAll(opts) {
                 if (verdict.duplicateOf) {
                     quality.nearDuplicate++;
                     try {
-                        db.prepare('UPDATE memory SET reference_count = COALESCE(reference_count, 0) + 1, updated_at = ? WHERE id = ?').run(now, verdict.duplicateOf);
+                        db.prepare("UPDATE memory SET reference_count = COALESCE(reference_count, 0) + 1, updated_at = ? WHERE id = ? AND project = 'reflect' AND character_id = ? AND is_active = 1 AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").run(now, verdict.duplicateOf, CHAR_ID);
                     }
                     catch { }
                     continue;
                 }
-                const exists = db.prepare('SELECT 1 FROM memory WHERE is_active = 1 AND text = ? AND character_id = ?').get(ins.text, CHAR_ID);
+                const exists = db.prepare("SELECT 1 FROM memory WHERE is_active = 1 AND project = 'reflect' AND text = ? AND character_id = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").get(ins.text, CHAR_ID);
                 if (exists) {
                     skipped++;
                     continue;

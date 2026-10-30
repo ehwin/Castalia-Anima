@@ -20,6 +20,10 @@ import { computeDecay, computeBaseIntensity, computeRecency, isNightTime } from 
 import { parseTagsSafe } from './tags.js';
 import { chunkKnnSearch } from './chunkIndex.js';
 import { rankBySalience, moodFromScalar } from './emotionalRanking.js';
+import { memorySourceWithoutStateSql, publicMemorySourceSql } from './memoryProvenance.js';
+function visibleMemorySourceSql(alias, includeDiary) {
+    return includeDiary === true ? memorySourceWithoutStateSql(alias) : publicMemorySourceSql(alias);
+}
 // v1.28: tags 解码收敛到纯模块 src/tags.ts（零副作用、可被验收脚本单独加载）。
 // 这里保留 re-export，历史 import { parseTagsSafe } from './search.js' 不会断。
 export { parseTagsSafe };
@@ -236,6 +240,7 @@ export function pinnedAnchors(options = {}) {
             const db = DatabaseManager.getInstance(project, mt);
             const conds = ['m.is_active = 1', 'm.project = ?', 'm.pinned = 1', "COALESCE(m.status, '') <> 'superseded'"];
             const params = [project];
+            conds.push(visibleMemorySourceSql('m', options.includeDiary));
             if (options.characterId) {
                 conds.push(options.includeGeneral
                     ? "(m.character_id = ? OR m.character_id IS NULL OR m.character_id = '')"
@@ -294,47 +299,98 @@ export function pinnedAnchors(options = {}) {
  * 这样 recallForInjection 的 gateOf() 会按词法门槛(0.2)判它 —— 结构命中天然比余弦弱,
  * 不该用 0.45 的余弦门槛去卡它,也不该独自构成"强证据"。
  */
-function entityExpandedSearch(db, options, seedIds, excludeIds, limit) {
+function entityExpandedSearch(db, options, seedIds, excludeIds, limit, memoryDbs = [db]) {
     if (seedIds.length === 0 || limit <= 0)
         return [];
     const project = options.project;
     const cid = options.characterId;
     try {
         const ph = seedIds.map(() => '?').join(',');
-        const seedEnts = db.prepare(`SELECT DISTINCT entity_id FROM memory_entities WHERE memory_id IN (${ph})`)
-            .all(...seedIds);
+        // Relations are normally stored in general, while the source memory may
+        // live in another memType partition. Read relations from every partition
+        // and resolve the actual memory rows separately below.
+        const seedEnts = [];
+        const relationDbs = [...new Set([db, ...memoryDbs])];
+        for (const relationDb of relationDbs) {
+            try {
+                seedEnts.push(...relationDb.prepare(`SELECT DISTINCT entity_id FROM memory_entities WHERE memory_id IN (${ph})`)
+                    .all(...seedIds));
+            }
+            catch { /* legacy partition without entity tables */ }
+        }
         const entIds = seedEnts.map(r => String(r.entity_id)).slice(0, 32);
         if (entIds.length < 2)
             return [];
         const ph2 = entIds.map(() => '?').join(',');
-        const notIn = [...excludeIds];
-        const notPh = notIn.length ? `AND m.id NOT IN (${notIn.map(() => '?').join(',')})` : '';
-        const charCond = cid && cid !== 'any' ? 'AND m.character_id = ?' : '';
-        const params = [...entIds];
-        if (project)
-            params.push(project);
-        params.push(...notIn);
-        if (charCond)
-            params.push(cid);
-        params.push(limit);
-        const rows = db.prepare(`
-      SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
-        m.emotional_impact, m.importance, m.character_id, m.source,
-        m.subject, m.agent_mood, m.agent_desire, m.tier,
-        m.created_at, m.last_accessed_at, m.accessed_count, m.parent_id,
-        m.vad_valence, m.vad_arousal, m.vad_dominance, m.tsundere_level,
-        COUNT(DISTINCT me.entity_id) AS shared
-      FROM memory_entities me
-      JOIN memory m ON m.id = me.memory_id
-      WHERE me.entity_id IN (${ph2}) AND m.is_active = 1
-        ${project ? 'AND m.project = ?' : ''}
-        ${notPh} ${charCond}
-      GROUP BY m.id
-      HAVING shared >= 2
-      ORDER BY shared DESC, m.importance DESC
-      LIMIT ?
-    `).all(...params);
-        return rows.map(row => {
+        // Count shared entities across all relation partitions before loading
+        // memory rows. This preserves entity expansion for cross-memType sources.
+        const sharedByMemory = new Map();
+        for (const relationDb of relationDbs) {
+            try {
+                const rows = relationDb.prepare(`SELECT memory_id, entity_id FROM memory_entities WHERE entity_id IN (${ph2})`)
+                    .all(...entIds);
+                for (const row of rows) {
+                    const id = String(row.memory_id || '');
+                    const entityId = String(row.entity_id || '');
+                    if (!id || !entityId)
+                        continue;
+                    const set = sharedByMemory.get(id) || new Set();
+                    set.add(entityId);
+                    sharedByMemory.set(id, set);
+                }
+            }
+            catch { /* legacy partition without entity tables */ }
+        }
+        const candidateIds = [...sharedByMemory.entries()]
+            .filter(([id, entities]) => entities.size >= 2 && !excludeIds.has(id))
+            .map(([id]) => id);
+        if (candidateIds.length === 0)
+            return [];
+        const rows = [];
+        const idPh = candidateIds.map(() => '?').join(',');
+        for (const memoryDb of memoryDbs) {
+            const params = [...candidateIds];
+            const conditions = [`m.id IN (${idPh})`, 'm.is_active = 1'];
+            if (project) {
+                conditions.push('m.project = ?');
+                params.push(project);
+            }
+            conditions.push(visibleMemorySourceSql('m', options.includeDiary));
+            if (options.memType) {
+                conditions.push('m.mem_type = ?');
+                params.push(options.memType);
+            }
+            const charCond = cid && cid !== 'any'
+                ? (options.includeGeneral
+                    ? "(m.character_id = ? OR m.character_id IS NULL OR m.character_id = '')"
+                    : 'm.character_id = ?')
+                : '';
+            if (charCond) {
+                conditions.push(charCond);
+                params.push(cid);
+            }
+            try {
+                rows.push(...memoryDb.prepare(`
+          SELECT m.id, m.text, m.project, m.type, m.mem_type, m.category, m.subcategory, m.tags,
+            m.emotional_impact, m.importance, m.character_id, m.source,
+            m.subject, m.agent_mood, m.agent_desire, m.tier,
+            m.created_at, m.last_accessed_at, m.accessed_count, m.parent_id,
+            m.vad_valence, m.vad_arousal, m.vad_dominance, m.tsundere_level
+          FROM memory m WHERE ${conditions.join(' AND ')}
+        `).all(...params));
+            }
+            catch { /* legacy partition without newer memory columns */ }
+        }
+        const dedup = new Map();
+        for (const row of rows) {
+            const id = String(row.id);
+            if (!dedup.has(id))
+                dedup.set(id, { ...row, shared: sharedByMemory.get(id)?.size || 0 });
+        }
+        return [...dedup.values()]
+            .sort((a, b) => Number(b.shared) - Number(a.shared) || Number(b.importance || 0) - Number(a.importance || 0))
+            .slice(0, limit)
+            .map(row => {
             const shared = Number(row.shared) || 0;
             const structural = Math.min(0.7, 0.3 + 0.1 * (shared - 1));
             const { score, biasBoost } = computeScore(row, structural, project);
@@ -355,7 +411,7 @@ function entityExpandedSearch(db, options, seedIds, excludeIds, limit) {
         return []; // 没有 memory_entities 表(旧库)/查询失败:扩散是增益,不是前置条件
     }
 }
-async function searchInDb(db, options) {
+async function searchInDb(db, options, memoryDbs = [db]) {
     const profile = options.profile ? SEARCH_PROFILES[options.profile] : null;
     const topK = options.topK ?? profile?.topK ?? 10;
     const minScore = options.minScore ?? profile?.minScore ?? 0;
@@ -423,7 +479,7 @@ async function searchInDb(db, options) {
     // 放在排序前,让它们与其它来源同场竞争(它们分数天然偏低,不会挤掉强命中)。
     if (!options.noEntityExpand && merged.length > 0) {
         const seedIds = merged.slice(0, 5).map(r => r.id);
-        merged.push(...entityExpandedSearch(db, scoped, seedIds, new Set(merged.map(r => r.id)), Math.min(3, topK)));
+        merged.push(...entityExpandedSearch(db, scoped, seedIds, new Set(merged.map(r => r.id)), Math.min(3, topK), memoryDbs));
     }
     merged.sort((a, b) => b.score - a.score);
     // 2026-10-28:接管关系要有硬保证。降权系数是乘法(0.6),而相关性权重提到 1.0 之后,被接管的旧记忆
@@ -457,14 +513,17 @@ async function searchInDb(db, options) {
     // 三条设计决定见 applySalienceRerank;老库缺列时它自己退化为不重排。
     applySalienceRerank(db, unique, scoped.mood);
     const top = unique.slice(0, topK);
-    updateAccessedGuard(db, top, scoped.countAccess, scoped.accessChannel);
+    updateAccessedGuard(db, top, scoped.countAccess, scoped.accessChannel, memoryDbs);
     return top;
 }
 /** countAccess=false 时不记访问（注入路径），见 SearchOptions.countAccess */
-function updateAccessedGuard(db, results, countAccess, channel) {
+function updateAccessedGuard(db, results, countAccess, channel, memoryDbs = [db]) {
     if (countAccess === false)
         return;
-    updateAccessed(db, results, channel);
+    // Entity expansion can return rows owned by another memType database.
+    // Update each partition so access accounting never targets the wrong DB.
+    for (const ownerDb of [...new Set([db, ...memoryDbs])])
+        updateAccessed(ownerDb, results, channel);
 }
 export async function searchMemory(options) {
     const proj = normalizeProject(options.project);
@@ -472,11 +531,18 @@ export async function searchMemory(options) {
     // memdir:memType 指定 → 单分类库;未指定 → 聚合项目全部分类库
     const mtFilter = options.memType ? normalizeMemType(options.memType) : null;
     const dirs = mtFilter ? [mtFilter] : listMemTypeDirs(proj);
+    const memoryDbs = [];
+    for (const mt of listMemTypeDirs(proj)) {
+        try {
+            memoryDbs.push(DatabaseManager.getInstance(proj, mt));
+        }
+        catch { /* partition unavailable */ }
+    }
     const all = [];
     for (const mt of dirs) {
         try {
             const db = DatabaseManager.getInstance(proj, mt);
-            const r = await searchInDb(db, { ...options, project: proj });
+            const r = await searchInDb(db, { ...options, project: proj }, memoryDbs.length ? memoryDbs : [db]);
             all.push(...r);
         }
         catch { /* 单分类库失败不影响其他 */ }
@@ -571,6 +637,7 @@ function tagSearch(db, options) {
     // v1.23-fix: superseded 在三条检索路径上一致排除（被接管的旧记忆不该再被检索命中）
     const conditions = ['m.is_active = 1', 'm.project = ?', "COALESCE(m.status, '') <> 'superseded'"];
     const params = [project];
+    conditions.push(visibleMemorySourceSql('m', options.includeDiary));
     conditions.push(`((${tagCond}) OR (${looseCond}))`);
     params.push(...tagParams, ...looseParams);
     if (options.type) {
@@ -681,6 +748,7 @@ chunkSims) {
     const rowidParams = candidateRowids;
     const conditions = [`m.rowid IN (${rowidPlaceholders})`, 'm.is_active = 1', 'm.project = ?', "COALESCE(m.status, '') <> 'superseded'"];
     const params = [...rowidParams, project];
+    conditions.push(visibleMemorySourceSql('m', options.includeDiary));
     if (options.type) {
         conditions.push('m.type = ?');
         params.push(options.type);
@@ -761,9 +829,16 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
     // 权重取 log(1 + N/(1+df)):df 小(罕见)权重高,df 大(高频)权重接近 0。
     const dfSql = `SELECT COUNT(*) c FROM memory m WHERE m.is_active = 1 AND m.project = ?`
         + ` AND COALESCE(m.status, '') <> 'superseded'`
+        + ` AND ${visibleMemorySourceSql('m', options.includeDiary)}`
         + (options.memType ? ' AND m.mem_type = ?' : '')
-        + (options.characterId ? ' AND m.character_id = ?' : '');
-    const dfBase = [project, ...(options.memType ? [String(options.memType)] : []), ...(options.characterId ? [options.characterId] : [])];
+        + (options.characterId
+            ? (options.includeGeneral
+                ? " AND (m.character_id = ? OR m.character_id IS NULL OR m.character_id = '')"
+                : ' AND m.character_id = ?')
+            : '');
+    const dfBase = [project, ...(options.memType ? [String(options.memType)] : [])];
+    if (options.characterId)
+        dfBase.push(options.characterId);
     let corpusN = 1;
     try {
         corpusN = Number(db.prepare(dfSql).get(...dfBase)?.c) || 1;
@@ -783,6 +858,7 @@ function textFallbackSearch(db, options, excludeIds, topK, minScore) {
     });
     const conds = [`m.is_active = 1`, `m.project = ?`, "COALESCE(m.status, '') <> 'superseded'", `${matchExpr} >= 1`];
     const params = [project, ...likeParams];
+    conds.push(visibleMemorySourceSql('m', options.includeDiary));
     if (options.memType) {
         conds.push('m.mem_type = ?');
         params.push(options.memType);
@@ -882,6 +958,7 @@ function supersededRecall(db, options, excludeIds, limit) {
     const likeCond = terms.map(() => 'm.text LIKE ?').join(' OR ');
     const conds = ['m.is_active = 1', 'm.project = ?', "COALESCE(m.status, '') = 'superseded'", `(${likeCond})`];
     const params = [project, ...terms.map(t => `%${t}%`)];
+    conds.push(visibleMemorySourceSql('m', options.includeDiary));
     if (options.characterId) {
         conds.push(options.includeGeneral
             ? "(m.character_id = ? OR m.character_id IS NULL OR m.character_id = '')"
@@ -999,12 +1076,14 @@ export function hydrateParentExcerpts(project, related, opts = {}) {
         for (const [pid, hit] of [...hitsByParent.entries()].slice(0, maxParents)) {
             if (budget <= 0)
                 break;
-            const row = DatabaseManager.queryAll(proj, 'SELECT id, text FROM memory WHERE id = ? AND project = ? AND character_id = ?', [pid, proj, cid])[0];
+            // Parent hydration is still a memory read. Keep derived self-cycle
+            // entries out even when a caller supplies a diary leaf/parent id.
+            const row = DatabaseManager.queryAll(proj, `SELECT id, text FROM memory WHERE id = ? AND project = ? AND character_id = ? AND is_active = 1 AND ${publicMemorySourceSql()}`, [pid, proj, cid])[0];
             if (!row || !row.text)
                 continue;
             const parentText = String(row.text);
             // 分母只算活跃 leaf：已停用/被接管的 leaf 不该把"同父命中比"拉低
-            const totalLeaves = DatabaseManager.queryAll(proj, 'SELECT COUNT(*) AS c FROM memory WHERE parent_id = ? AND project = ? AND is_active = 1 AND character_id = ?', [pid, proj, cid])
+            const totalLeaves = DatabaseManager.queryAll(proj, `SELECT COUNT(*) AS c FROM memory WHERE parent_id = ? AND project = ? AND is_active = 1 AND character_id = ? AND ${publicMemorySourceSql()}`, [pid, proj, cid])
                 .reduce((n, r) => n + (Number(r.c) || 0), 0) || 1;
             const ratio = hit.hits / totalLeaves;
             const full = ratio > 0.5 || parentText.length <= 1800;
@@ -1058,6 +1137,7 @@ export function getRecentMemories(characterId, limit = 5, hoursBack = 24, projec
             // v1.24: 角色隔离 — characterId='any' 才关闭过滤(默认由调用方传 CHAR_ID)
             const conds = ['is_active = 1', 'project = ?', 'created_at > ?', "COALESCE(status, '') <> 'superseded'"];
             const params = [proj, since];
+            conds.push(publicMemorySourceSql());
             if (characterId && characterId !== 'any') {
                 conds.push('character_id = ?');
                 params.push(characterId);
@@ -1144,7 +1224,9 @@ export async function searchFacts(query, options = {}) {
     SELECT f.rowid, f.id, f.subject, f.predicate, f.object, f.confidence,
            f.source_memory_id, f.created_at, f.updated_at
     FROM facts f
+    LEFT JOIN memory source_memory ON source_memory.id = f.source_memory_id
     WHERE ${conditions.join(' AND ')}
+      AND COALESCE(f.source_memory_source, source_memory.source, '') NOT IN ('agent_diary', 'agent_state')
     ORDER BY f.confidence DESC
   `).all(...params);
     const results = [];

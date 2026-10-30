@@ -35,7 +35,14 @@ function openWindows(project, characterId) {
     const rows = db.prepare(`
     SELECT id, subject, predicate, object, confidence, valid_from, valid_to,
            created_at, expired_at, superseded_by
-    FROM facts WHERE ${conditions.join(' AND ')}
+    FROM facts
+    WHERE ${conditions.join(' AND ')}
+      AND NOT EXISTS (
+        SELECT 1 FROM memory source_memory
+        WHERE source_memory.id = facts.source_memory_id
+          AND source_memory.source IN ('agent_diary', 'agent_state')
+      )
+      AND COALESCE(facts.source_memory_source, '') NOT IN ('agent_diary', 'agent_state')
     ORDER BY julianday(COALESCE(valid_from, created_at)) DESC
   `).all(...params);
     return rows.map(row => ({

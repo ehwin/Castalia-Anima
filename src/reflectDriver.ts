@@ -149,7 +149,7 @@ export function shouldAutoReflect(charId: string = CHAR_ID, project?: string): R
 export function shouldAutoConsolidate(project?: string, characterId: string = CHAR_ID): { should: boolean; count: number; min: number; reason: string } {
   const db = DatabaseManager.getInstance(project);
   const proj = normalizeProject(project);
-  const count = (db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active = 1 AND project = ? AND character_id = ?').get(proj, characterId || CHAR_ID) as any)?.c ?? 0;
+  const count = (db.prepare("SELECT COUNT(*) as c FROM memory WHERE is_active = 1 AND project = ? AND character_id = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").get(proj, characterId || CHAR_ID) as any)?.c ?? 0;
   const min = CONSOLIDATE_MIN_MEMORIES;
   if (count > min) return { should: true, count, min, reason: `${count} > ${min}` };
   return { should: false, count, min, reason: `${count} 未超 ${min}` };
@@ -273,7 +273,7 @@ export async function runAutoReflect(charId: string, limit = 30, project?: strin
       }
       out.errors.push(...r.errors); out.receipts!.push(...r.receipts);
       if (r.errors.length) break;
-      markConversationsReflected(ids, project);
+      markConversationsReflected(ids, project, charId);
       out.processedCount! += ids.length; out.deferredCount! -= ids.length;
       if (ids.length < batch.length) { out.errors.push('本批部分来源尚未完成，保留待重试'); break; }
     }
@@ -480,6 +480,7 @@ export async function runConsolidate(
   // v1.24: 角色隔离 — 整合窗口只含本实例角色(charId='any' 关闭过滤)。
   const cid = charId || CHAR_ID;
   const windowWhere = `is_active = 1 AND project = ? AND (? = 'any' OR character_id = ?) AND (locked IS NULL OR locked = 0)
+        AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
         AND COALESCE(tier, 'standard') <> 'critical'
         AND COALESCE(status, '') <> 'cold'`;
   const headRows: any[] = [];
@@ -573,9 +574,11 @@ export async function runConsolidate(
   try {
     factRows = DatabaseManager.getInstance(proj).prepare(`
       SELECT id, subject, predicate, object, confidence FROM facts
-      WHERE is_active = 1 AND project = ? AND (? = 'any' OR character_id = ?) AND confidence >= 0.6
-        AND (valid_to IS NULL OR valid_to = '')
-      ORDER BY updated_at DESC LIMIT 80
+      LEFT JOIN memory source_memory ON source_memory.id = facts.source_memory_id
+      WHERE facts.is_active = 1 AND facts.project = ? AND (? = 'any' OR facts.character_id = ?) AND facts.confidence >= 0.6
+        AND (facts.valid_to IS NULL OR facts.valid_to = '')
+        AND COALESCE(facts.source_memory_source, source_memory.source, '') NOT IN ('agent_diary', 'agent_state')
+      ORDER BY facts.updated_at DESC LIMIT 80
     `).all(proj, cid, cid) as any[];
   } catch { /* facts 表不存在时忽略 */ }
   const factsJson = JSON.stringify(factRows.map(f => ({ id: f.id, s: f.subject, p: f.predicate, o: f.object })), null, 1);

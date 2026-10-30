@@ -147,7 +147,7 @@ export function chunkKnnSearch(
   } catch (_e) { return out; }
   if (knnRows.length === 0) return out;
   const meta = db.prepare('SELECT text_hash FROM chunk_meta WHERE mem_rowid = ? AND chunk_idx = ?');
-  const cur = db.prepare('SELECT text FROM memory WHERE rowid = ? AND is_active = 1');
+  const cur = db.prepare("SELECT text FROM memory WHERE rowid = ? AND is_active = 1 AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')");
   const freshCache = new Map<number, string[] | null>();
   for (const r of knnRows) {
     const key = Number(r.rowid);

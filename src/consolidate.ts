@@ -60,6 +60,7 @@ function scanVectorPairs(db: any, proj: string, threshold: number, limit: number
   const mems = db.prepare(`
     SELECT m.rowid, m.id FROM memory m
     WHERE m.is_active = 1 AND m.project = ? AND (? = 'any' OR m.character_id = ?) AND (m.locked IS NULL OR m.locked = 0)
+      AND COALESCE(m.source, '') NOT IN ('agent_diary', 'agent_state')
       AND COALESCE(m.tier, 'standard') <> 'critical'
       AND COALESCE(m.status, '') NOT IN ('cold', 'superseded')
     ORDER BY m.created_at DESC
@@ -130,6 +131,7 @@ function scanStructPairs(db: any, proj: string, limit: number, seen: Set<string>
       rows2 = db.prepare(`
         SELECT id, text, mem_type FROM memory
         WHERE is_active = 1 AND project = ? AND (? = 'any' OR character_id = ?) AND (locked IS NULL OR locked = 0)
+          AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
           AND COALESCE(tier, 'standard') <> 'critical'
           AND COALESCE(status, '') NOT IN ('cold', 'superseded')
         ORDER BY created_at DESC LIMIT 500
@@ -229,7 +231,7 @@ export async function consolidate(): Promise<ConsolidateResult> {
     const activeRecords = db.prepare(`
       SELECT id, importance, COALESCE(base_importance, importance) AS base_importance, last_accessed_at
       FROM memory WHERE is_active = 1 AND character_id = ?
-        AND COALESCE(source, '') NOT IN ('manual_lore', 'conversation_log', 'agent_state', 'daily_event')
+        AND COALESCE(source, '') NOT IN ('manual_lore', 'conversation_log', 'agent_state', 'daily_event', 'agent_diary')
         AND COALESCE(tier, 'standard') != 'critical' AND (locked IS NULL OR locked = 0)
         AND COALESCE(identity_locked, 0) = 0
     `).all(cid) as any[];
@@ -259,7 +261,7 @@ export async function consolidate(): Promise<ConsolidateResult> {
 
     // ═══ Phase 2: reference_count 升华 ═══
     const dupes = db.prepare(
-      'SELECT id FROM memory WHERE is_active = 1 AND character_id = ? AND reference_count > 2 LIMIT 20'
+      "SELECT id FROM memory WHERE is_active = 1 AND character_id = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state') AND reference_count > 2 LIMIT 20"
     ).all(cid) as any[];
 
     for (const dup of dupes) {

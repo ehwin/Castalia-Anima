@@ -12,6 +12,7 @@
 import { DatabaseManager } from './db.js';
 import { normalizeProject } from './env.js';
 import { parseTagsSafe } from './tags.js';
+import { publicMemorySourceSql } from './memoryProvenance.js';
 // In-memory topic weights per (project, character) — v1.23.2 审计第 3 组：
 // 只按 characterId 做键会让不同项目的兴趣权重互相污染。
 const biasMaps = new Map();
@@ -130,6 +131,7 @@ export function loadBiasesFromDb(characterId, project) {
                 const db = DatabaseManager.getInstance(proj, mt);
                 const rows = db.prepare(`
           SELECT tags FROM memory WHERE project = ? AND character_id = ? AND is_active = 1
+            AND ${publicMemorySourceSql()}
         `).all(proj, characterId);
                 for (const row of rows) {
                     try {

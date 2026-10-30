@@ -12,9 +12,9 @@ import { saveConversationTurn } from './store.js';
 import { DatabaseManager } from './db.js';
 import { getAgentState } from './agentState.js';
 import { observeUserMessage } from './userLearning.js';
-import { queueForVad, ollamaClassify, fallbackClassify, formatVADForPrompt, VADVector } from './emotion.js';
+import { queueForVad, ollamaClassify, fallbackClassify, formatVADForPrompt, formatInteractionForVad, VADVector } from './emotion.js';
 import { getBuffer } from './buffer.js';
-import { PROJECT_ID, CHAR_ID, normalizeProject } from './env.js';
+import { PROJECT_ID, CHAR_ID, normalizeCharacterId, normalizeProject } from './env.js';
 
 /** 兜底：saveConversationTurn 没返回 id 时，按 (project, 角色, 用户原文) 回查最近一条 conversation_log。 */
 function findConversationTurnId(project: string, userMessage: string, characterId: string = CHAR_ID): string | undefined {
@@ -22,7 +22,8 @@ function findConversationTurnId(project: string, userMessage: string, characterI
     const db = DatabaseManager.getInstance(project);
     const row = db.prepare(`
       SELECT id FROM memory
-      WHERE source = 'conversation_log' AND project = ? AND is_active = 1 AND character_id = ?
+      WHERE source = 'conversation_log' AND project = ? AND is_active = 1
+        AND character_id = ?
         AND instr(text, ?) > 0
       ORDER BY rowid DESC LIMIT 1
     `).get(project, characterId, '用户: ' + userMessage) as any;
@@ -42,7 +43,7 @@ export async function autoProcess(args: {
   sessionId?: string;  // v1.11 Part2: 会话 ID — 传了才启用会话记忆缓冲(渐进式临时反思),不传保持旧行为
 }): Promise<any> {
   // v1.24: 角色由进程级 CHAR_ID 决定(与 Castalia 普通版一致);args.characterId 仅作内部显式覆盖
-  const cid = args.characterId || CHAR_ID;
+  const cid = normalizeCharacterId(args.characterId);
   const proj = normalizeProject(args.project || PROJECT_ID);
   const results: any = {
     success: true,
@@ -79,13 +80,15 @@ export async function autoProcess(args: {
 
   // VAD 异步队列 — 不阻塞消息管道；条目带上 project + memoryId，flush 时精确回写。
   // 落库失败时不入队：没有本轮记录可回写，位置兜底可能误伤上一轮同文本的行。
-  if (results.conversationSaved) {
+  if (results.conversationSaved && memoryId) {
     try {
-      queueForVad(args.userMessage, proj, memoryId);
-      results.details.push('VAD queued (async batch)' + (memoryId ? '' : ' [no memory id]'));
+      queueForVad(formatInteractionForVad(args.userMessage, args.assistantMessage), proj, memoryId, cid);
+      results.details.push('VAD queued (async batch)');
     } catch (e: any) {
       results.details.push('VAD queue error: ' + e.message);
     }
+  } else if (results.conversationSaved) {
+    results.details.push('VAD queue skipped (conversation has no memory id)');
   } else {
     results.details.push('VAD queue skipped (conversation not saved)');
   }
@@ -131,9 +134,14 @@ export async function classifyMessage(
   text: string,
   context?: string,
   project?: string,
+  memoryId?: string,
+  characterId?: string,
 ): Promise<StructClassification & { vad: VADVector | null; tsundereLevel: number; confidence: number; vadTags: string[] }> {
-  // 异步队列 — 不阻塞；project 进了队列，flush 时不会串到默认库
-  queueForVad(text, project);
+  // A queue item without its durable memory id can only be matched by position,
+  // which is unsafe under concurrent projects. Legacy callers may still pass
+  // no id and receive the cheap fallback classification, but they do not enter
+  // the VAD write-back queue.
+  if (memoryId) queueForVad(text, project, memoryId, characterId);
 
   // 启发式默认值 — 最多 <1ms
   const cls = fallbackClassify(text);

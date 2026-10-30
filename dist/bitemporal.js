@@ -101,6 +101,12 @@ export function factsAsOf(options) {
            created_at, expired_at, superseded_by
     FROM facts
     WHERE ${conditions.join(' AND ')}
+      AND NOT EXISTS (
+        SELECT 1 FROM memory source_memory
+        WHERE source_memory.id = facts.source_memory_id
+          AND source_memory.source IN ('agent_diary', 'agent_state')
+      )
+      AND COALESCE(facts.source_memory_source, '') NOT IN ('agent_diary', 'agent_state')
     ORDER BY subject, predicate, julianday(COALESCE(valid_from, created_at)) DESC
   `).all(...params);
     return rows.map(toWindow);
@@ -128,6 +134,12 @@ export function findOpenWindowConflicts(options = {}) {
            created_at, expired_at, superseded_by
     FROM facts
     WHERE ${conditions.join(' AND ')}
+      AND NOT EXISTS (
+        SELECT 1 FROM memory source_memory
+        WHERE source_memory.id = facts.source_memory_id
+          AND source_memory.source IN ('agent_diary', 'agent_state')
+      )
+      AND COALESCE(facts.source_memory_source, '') NOT IN ('agent_diary', 'agent_state')
     ORDER BY subject, predicate, julianday(COALESCE(valid_from, created_at)) DESC
   `).all(...params);
     const groups = new Map();

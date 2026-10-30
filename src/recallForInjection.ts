@@ -24,6 +24,8 @@ import { injectionPolicy, moodFromScalar } from './emotionalRanking.js';
 export interface InjectionOptions {
   project?: string;
   characterId?: string;
+  /** 是否把自循环 agent_diary 作为检索来源；默认关闭，避免派生文本回流成证据。 */
+  includeDiary?: boolean;
   /** 取几条上限，默认 5 */
   topK?: number;
   /** 相似度门槛，默认 0.5（可用 env MEMORY_INJECT_MIN_SIM 覆盖）。判在 similarity 上 */
@@ -419,6 +421,7 @@ export async function recallForInjection(query: string, options: InjectionOption
       profile: 'deep',
       // 跟读取路径一致：本角色的 + owner 共享的都能被回忆起（否则一般记忆永远进不了注入）
       includeGeneral: true,
+      includeDiary: options.includeDiary === true,
       // 注入不算回忆（2026-10-30）：不刷新 accessed_count/last_accessed_at，
       // 否则"被注入 → 排名更高 → 更常被注入"会自己滚雪球（实测 lore 行 200~306 次）。
       countAccess: false,
@@ -442,6 +445,7 @@ export async function recallForInjection(query: string, options: InjectionOption
         project: options.project,
         characterId: options.characterId,
         includeGeneral: true,
+        includeDiary: options.includeDiary === true,
         limit: options.maxAnchors ?? 2,
       });
     } catch { /* 锚点取不到不影响正常注入 */ }

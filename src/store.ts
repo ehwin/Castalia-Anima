@@ -10,11 +10,12 @@ import type Database from 'better-sqlite3';
 import { embed, getEmbeddingCached } from './ollama.js';
 import { ensureChunksForRow } from './chunkIndex.js';
 import { recordTopics } from './bias.js';
-import { PROJECT_ID, CHAR_ID, normalizeProject, isEmbedEnabled } from './env.js';
+import { PROJECT_ID, CHAR_ID, normalizeCharacterId, normalizeProject, isEmbedEnabled } from './env.js';
 import { scoreAffect, affectImpact } from './affectLexicon.js';
 import { MemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
 import { parseTagsSafe, normalizeTagsForWrite, serializeTags } from './tags.js';
 import { estimatePredicateVolatility, needsEvidence, shouldSupersede } from './volatility.js';
+import { isDerivedMemorySource } from './memoryProvenance.js';
 
 let saveCount = 0;
 const CONSOLIDATE_INTERVAL = 50;
@@ -37,6 +38,10 @@ export interface StoreParams {
   expiresAt?: string;
   /** v1.29 情感锚点:钉住的那条注入时无条件在场(Character.AI Story Memory) */
   pinned?: boolean;
+  /** Structured provenance for generated/self-authored memories. */
+  metadata?: Record<string, unknown> | string;
+  /** Parent/source memory that this record was derived from. */
+  parentId?: string;
   skipEmbed?: boolean;  // v5.0: digest 暂不向量化
 }
 
@@ -62,33 +67,162 @@ export interface MemoryRecord {
   updatedAt: string;
   lastAccessedAt: string;
   accessedCount: number;
+  metadata: Record<string, unknown> | string | null;
+  parentId: string | null;
+}
+
+function serializeMetadata(value: StoreParams['metadata']): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') return value;
+  try { return JSON.stringify(value); }
+  catch { throw new Error('memory metadata must be JSON serializable'); }
+}
+
+function parseMetadata(value: unknown): Record<string, unknown> | string | null {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value !== 'string') return value as Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' ? parsed : value;
+  } catch { return value; }
+}
+
+function isDiaryEvidenceConflict(error: any): boolean {
+  const code = String(error?.code || '');
+  const message = String(error?.message || '');
+  return code === 'SQLITE_CONSTRAINT_UNIQUE'
+    || code === 'SQLITE_CONSTRAINT_TRIGGER'
+    || message.includes('idx_agent_diary_evidence_unique')
+    || message.includes('agent diary evidence already exists');
+}
+
+function memoryRecordFromRow(row: any, fallback: MemoryRecord): MemoryRecord {
+  return {
+    ...fallback,
+    id: String(row.id || fallback.id),
+    text: String(row.text ?? fallback.text),
+    project: String(row.project ?? fallback.project),
+    sessionId: row.session_id ?? fallback.sessionId,
+    type: String(row.type ?? fallback.type),
+    memType: normalizeMemType(row.mem_type ?? fallback.memType),
+    category: String(row.category ?? fallback.category),
+    subcategory: row.subcategory ?? fallback.subcategory,
+    tags: parseTagsSafe(row.tags),
+    emotionalImpact: Number(row.emotional_impact ?? fallback.emotionalImpact),
+    importance: Number(row.importance ?? fallback.importance),
+    characterId: row.character_id ?? fallback.characterId,
+    source: row.source ?? fallback.source,
+    subject: String(row.subject ?? fallback.subject),
+    tier: String(row.tier ?? fallback.tier),
+    expiresAt: row.expires_at ?? fallback.expiresAt,
+    isActive: Number(row.is_active ?? 1) === 1,
+    createdAt: String(row.created_at ?? fallback.createdAt),
+    updatedAt: String(row.updated_at ?? fallback.updatedAt),
+    lastAccessedAt: String(row.last_accessed_at ?? fallback.lastAccessedAt),
+    accessedCount: Number(row.accessed_count ?? fallback.accessedCount),
+    metadata: parseMetadata(row.metadata),
+    parentId: row.parent_id ?? fallback.parentId,
+  };
+}
+
+/** Queue durable conversation evidence without making the store depend on the
+ * emotion module during module initialization. A failed enqueue is recoverable
+ * from the durable pending marker during digest/restart recovery. */
+async function enqueueConversationEvidence(
+  text: string,
+  project: string,
+  memoryId: string,
+  characterId: string,
+  userMessage?: string,
+  assistantMessage?: string,
+): Promise<void> {
+  try {
+    const { queueForVad, formatInteractionForVad, formatStoredConversationForVad } = await import('./emotion.js');
+    // Keep every conversation entry on the same role-labelled contract used
+    // by autoProcess. The low-level writer can be called directly, before the
+    // higher-level adapter has a chance to enqueue its formatted copy; queue
+    // de-duplication by memoryId means the first payload is authoritative.
+    const vadText = userMessage !== undefined || assistantMessage !== undefined
+      ? formatInteractionForVad(userMessage || '', assistantMessage || '')
+      : formatStoredConversationForVad(text);
+    queueForVad(vadText, project, memoryId, characterId);
+  } catch (e: any) {
+    console.warn('[store] conversation VAD enqueue deferred:', e?.message || e);
+  }
 }
 
 export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
   if (!params.text || !params.text.trim()) throw new Error('memory text must not be empty');
-  // memdir 路由:按 memType 落对应分类库(memory/<project>/<memType>/memory.sqlite)
-  const db = DatabaseManager.getInstance(params.project, params.memType);
+  // Self-cycle output has a dedicated writer so provenance cannot be lost by
+  // a generic memory tool. Existing diary rows remain readable, but new ones
+  // must carry the marker written by saveSelfDiary().
+  if (params.source === 'agent_diary') {
+    const supplied = serializeMetadata(params.metadata);
+    let generatedBy = '';
+    try {
+      const parsed = supplied ? JSON.parse(supplied) : null;
+      generatedBy = parsed && typeof parsed === 'object' ? String(parsed.generated_by || '') : '';
+    } catch { /* malformed metadata is rejected below */ }
+    if (generatedBy !== 'self_cycle') {
+      throw new Error('agent_diary memories must be written through saveSelfDiary()');
+    }
+  }
+  if (params.source === 'agent_state') {
+    throw new Error('agent_state memories are runtime snapshots and must use the AgentState writer');
+  }
   const now = new Date().toISOString();
   const skipEmbed = params.skipEmbed === true;
   const project = normalizeProject(params.project);
-  const memType = normalizeMemType(params.memType);
+  // Raw conversation evidence has one canonical home. The VAD queue and its
+  // durable recovery path address the general conversation log, so a caller
+  // cannot accidentally place a pending row in another memType database.
+  const memType = params.source === 'conversation_log' ? 'general' : normalizeMemType(params.memType);
+  // memdir 路由:按 memType 落对应分类库(memory/<project>/<memType>/memory.sqlite)
+  const db = DatabaseManager.getInstance(params.project, memType);
   // v1.8: 4 种封闭类型(memType≠general)且 text 非 Markdown 时,自动规范化包装(加标题行+转列表)
   const text = normalizeMarkdown(params.text, memType);
-  // v1.24: 角色 = 调用方显式指定,否则进程级 CHAR_ID —— 写入永不落 NULL(否则新行对所有角色都不可见)。
-  const charId = params.characterId ?? CHAR_ID;
+  // v1.24: 角色 = 调用方显式指定,否则进程级 CHAR_ID。
+  // 显式传入空字符串是“共享/general”记忆的写入契约，必须保留为空，
+  // 否则后续严格角色检索会把共享行误当成当前角色私有证据。
+  const charId = params.characterId !== undefined && String(params.characterId).trim() === ''
+    ? ''
+    : normalizeCharacterId(params.characterId);
 
   // ═══ 精确去重：完全相同的文本不重复存(仅限同项目 + 同角色) ═══
   // v1.24: 角色隔离 — 去重也必须限定 character_id,否则会把别的角色的同文本记忆
   // 当成本次命中(reference_count 记到别人头上),返回的 id 对当前角色还不可见。
-  const exactDup = db.prepare(`
-    SELECT * FROM memory
-    WHERE is_active = 1 AND project = ? AND TRIM(text) = TRIM(?)
-      AND session_id IS ? AND subject = ? AND character_id IS ?
-    LIMIT 1
-  `).get(project, text?.trim() || '', params.sessionId ?? null, params.subject ?? 'user', charId) as any;
+  const exactDupSourceFilter = params.source === 'conversation_log' ? ' AND source = ?' : '';
+  const exactDup = params.source === 'agent_diary' ? null : db.prepare(`
+      SELECT * FROM memory
+      WHERE is_active = 1 AND project = ? AND TRIM(text) = TRIM(?)
+        AND session_id IS ? AND subject = ? AND character_id IS ?
+        ${exactDupSourceFilter}
+      LIMIT 1
+    `).get(
+      project, text?.trim() || '', params.sessionId ?? null, params.subject ?? 'user', charId,
+      ...(params.source === 'conversation_log' ? [params.source] : []),
+    ) as any;
 
   if (exactDup) {
     db.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(exactDup.id);
+    // Re-enqueue only rows that are still waiting for affect analysis. Once a
+    // row is analyzed or explicitly abstained, saving the same text again
+    // must not make the local fallback overwrite the durable result.
+    const affectStatus = String(exactDup.affect_status ?? '').trim();
+    const needsVad = params.source === 'conversation_log'
+      && (['pending', 'pending_psyche'].includes(affectStatus)
+        || (!affectStatus
+          && exactDup.vad_valence == null
+          && exactDup.vad_arousal == null
+          && exactDup.vad_dominance == null));
+    if (needsVad) {
+      await enqueueConversationEvidence(
+        String(exactDup.text || text),
+        project,
+        String(exactDup.id),
+        String(exactDup.character_id || charId || CHAR_ID),
+      );
+    }
     const storedTags = parseTagsSafe(exactDup.tags);
     return {
       id: exactDup.id, text: exactDup.text, project: exactDup.project,
@@ -102,6 +236,7 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
       isActive: true,
       createdAt: exactDup.created_at, updatedAt: exactDup.updated_at, lastAccessedAt: exactDup.last_accessed_at,
       accessedCount: exactDup.accessed_count ?? 0,
+      metadata: parseMetadata(exactDup.metadata), parentId: exactDup.parent_id ?? null,
     } as MemoryRecord;
     }
 
@@ -164,25 +299,41 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
     expiresAt,
     isActive: true,
     createdAt: now, updatedAt: now, lastAccessedAt: now, accessedCount: 0,
+    metadata: parseMetadata(serializeMetadata(params.metadata)),
+    parentId: params.parentId ?? null,
   };
+  const metadata = serializeMetadata(params.metadata);
 
   // 写路径补情感(2026-10-29):嵌入形态下没有 autoProcess/digest 周期,VAD 的唯一来源
   // Ollama 通常不在跑(实测 airi bank 262 条 0 条 VAD)。所以落库时用词表补一次:
   // 只补空缺(调用方给了 emotionalImpact 就尊重),只影响 vad_*/emotional_impact。
   // 放在 store 层而不是宿主层:bank.save、store-tools、MCP、直连引擎都走这里,只写一处。
   let writeVad: { valence: number; arousal: number; dominance: number } | null = null;
-  if (process.env.SKIP_WRITE_AFFECT !== '1') {
+  const isConversationEvidence = record.source === 'conversation_log';
+  if (process.env.SKIP_WRITE_AFFECT !== '1' && !isConversationEvidence) {
     const aff = scoreAffect(text);
-    if (aff.confidence > 0) {
+    // Self-cycle prose is a derived observation. It must never acquire a VAD
+    // marker that makes it look like fresh conversation evidence.
+    if (aff.confidence > 0 && record.source !== 'agent_diary') {
       writeVad = { valence: aff.valence, arousal: aff.arousal, dominance: aff.dominance };
       if (!(record.emotionalImpact > 0)) record.emotionalImpact = affectImpact(aff);
     }
   }
+  const affectStatus = record.source === 'agent_diary'
+    ? null
+    : isConversationEvidence
+      ? 'pending'
+      : (writeVad ? 'analyzed' : null);
+  const affectSource = record.source === 'agent_diary'
+    ? null
+    : isConversationEvidence
+      ? 'vad_queue'
+      : (writeVad ? 'lexicon_write' : null);
 
   const storeTx = db.transaction(() => {
     db.prepare(`
-      INSERT INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, emotional_impact, importance, base_importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, vad_valence, vad_arousal, vad_dominance)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, emotional_impact, importance, base_importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, vad_valence, vad_arousal, vad_dominance, metadata, parent_id, affect_status, affect_analyzed_at, affect_source)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       record.id, record.text, record.project, record.sessionId, record.type, record.memType, record.category, record.subcategory,
       serializeTags(record.tags), record.emotionalImpact,
@@ -190,7 +341,8 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
       record.characterId, record.source, record.subject,
       record.tier, record.expiresAt, 1,
       record.createdAt, record.updatedAt, record.lastAccessedAt, 0, 0,
-      writeVad ? writeVad.valence : null, writeVad ? writeVad.arousal : null, writeVad ? writeVad.dominance : null
+      writeVad ? writeVad.valence : null, writeVad ? writeVad.arousal : null, writeVad ? writeVad.dominance : null,
+      metadata, record.parentId, affectStatus, writeVad ? record.updatedAt : null, affectSource
     );
 
     // v5.0: 仅在非 skipEmbed 时写入向量
@@ -203,10 +355,43 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
       db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?, ?)').run(rowid, new Float32Array(vector));
     }
   });
-  storeTx();
+  try {
+    storeTx();
+  } catch (error: any) {
+    // Two processes can pass the in-memory self-cycle check at the same time.
+    // The database index/trigger is the final claim boundary; return the
+    // committed winner so both callers converge on one diary id.
+    if (record.source === 'agent_diary' && isDiaryEvidenceConflict(error)) {
+      let evidenceKey = '';
+      try {
+        const parsed = metadata ? JSON.parse(metadata) : null;
+        evidenceKey = parsed && typeof parsed.evidence_key === 'string'
+          ? parsed.evidence_key : '';
+      } catch { /* malformed metadata cannot identify a winner */ }
+      if (evidenceKey) {
+        const winner = db.prepare(`
+          SELECT * FROM memory
+          WHERE source = 'agent_diary' AND is_active = 1 AND project = ?
+            AND COALESCE(character_id, '') = COALESCE(?, '')
+            AND json_valid(metadata)
+            AND json_extract(metadata, '$.evidence_key') = ?
+          ORDER BY rowid ASC LIMIT 1
+        `).get(project, record.characterId, evidenceKey) as any;
+        if (winner) return memoryRecordFromRow(winner, record);
+      }
+    }
+    throw error;
+  }
+
+  // Every generic conversation write must enter the same durable VAD path as
+  // the dedicated conversation_save adapter. The queue is deduplicated by
+  // project/memory/character, so legacy callers may still enqueue explicitly.
+  if (isConversationEvidence) {
+    await enqueueConversationEvidence(record.text, project, record.id, record.characterId || CHAR_ID);
+  }
 
   // 记录 tags 到 bias(bias 学习:兴趣权重积累,随记忆沉淀人格)
-  if (record.tags.length > 0 && record.characterId) {
+  if (record.tags.length > 0 && record.characterId && !isDerivedMemorySource(record.source)) {
     recordTopics(record.characterId, record.tags, record.project);
   }
 
@@ -221,6 +406,44 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
   }
 
   return record;
+}
+
+/**
+ * Write a self-cycle diary entry with explicit provenance.
+ *
+ * This deliberately goes through the memory store (so project/character
+ * isolation and deduplication still apply), but it never queues VAD or calls
+ * the conversation/reflection loop. Consumers can identify it by source and
+ * metadata instead of treating self-authored text as user evidence.
+ */
+export async function saveSelfDiary(params: {
+  text: string;
+  project?: string;
+  characterId?: string;
+  evidenceIds?: string[];
+  stateVersion?: number;
+  metadata?: Record<string, unknown>;
+}): Promise<MemoryRecord> {
+  const metadata: Record<string, unknown> = {
+    ...(params.metadata || {}),
+    generated_by: 'self_cycle',
+    evidence_ids: Array.from(new Set((params.evidenceIds || []).filter(Boolean))).slice(0, 20),
+    state_version: params.stateVersion ?? 1,
+  };
+  return saveMemory({
+    text: params.text,
+    project: params.project,
+    characterId: params.characterId,
+    memType: 'project',
+    type: 'semantic',
+    category: 'emotional',
+    importance: 0.45,
+    tier: 'standard',
+    source: 'agent_diary',
+    subject: 'self',
+    metadata,
+    skipEmbed: true,
+  });
 }
 
 /** 按 id 定位记忆所在分类库(memdir 遍历),返回库连接+分类;找不到返回 null。
@@ -243,11 +466,20 @@ export function findDbByMemoryId(id: string, project?: string, characterId?: str
 export function forgetMemory(id: string, project?: string, characterId?: string): boolean {
   const found = findDbByMemoryId(id, project, characterId);
   if (!found) return false;
+  // Derived runtime output is append-only.  Generic memory deletion would
+  // make a self-cycle diary disappear (or remove a state snapshot) without
+  // updating the writer's cursor/state, so only the owning writer may retire it.
+  const existing = found.db.prepare('SELECT source FROM memory WHERE id = ?').get(id) as any;
+  if (isDerivedMemorySource(existing?.source)) return false;
   return found.db.prepare('UPDATE memory SET is_active = 0 WHERE id = ?').run(id).changes > 0;
 }
 export function restoreMemory(id: string, project?: string, characterId?: string): boolean {
   const found = findDbByMemoryId(id, project, characterId);
   if (!found) return false;
+  // Keep derived records immutable through the generic API.  A restored diary
+  // could re-enter a path that intentionally excludes only active rows.
+  const existing = found.db.prepare('SELECT source FROM memory WHERE id = ?').get(id) as any;
+  if (isDerivedMemorySource(existing?.source)) return false;
   return found.db.prepare('UPDATE memory SET is_active = 1 WHERE id = ?').run(id).changes > 0;
 }
 export async function updateMemory(id: string, updates: Partial<StoreParams>, characterId?: string): Promise<MemoryRecord | null> {
@@ -257,8 +489,34 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>, ch
   const existing = db.prepare('SELECT * FROM memory WHERE id = ?').get(id) as any;
   if (!existing) return null;
 
+  // Provenance is a write-once boundary. Generic memory updates cannot turn
+  // ordinary evidence into self-cycle output, nor strip the marker from a
+  // diary. Diary metadata is immutable here so evidence_ids/state_version
+  // cannot be rewritten through an ordinary MCP update.
+  if (updates.source === 'agent_diary' && existing.source !== 'agent_diary') {
+    throw new Error('agent_diary memories must be written through saveSelfDiary()');
+  }
+  if (existing.source === 'agent_diary') {
+    // Diary rows are append-only outputs of self-cycle. Generic memory
+    // mutation would let ordinary tools alter the prose or provenance after
+    // the evidence claim has been completed, so require the dedicated writer
+    // for every semantic update.
+    const mutationKeys = Object.entries(updates)
+      .filter(([key, value]) => value !== undefined && !['project', 'characterId', 'skipEmbed'].includes(key))
+      .map(([key]) => key);
+    if (mutationKeys.length > 0) {
+      throw new Error('agent_diary memories are immutable; use the self-cycle writer');
+    }
+  }
+  if (existing.source === 'agent_state') {
+    throw new Error('agent_state memories are runtime snapshots; use the AgentState writer');
+  }
+
   // memdir 跨分类移动:memType 变更 → 复制到新分类库 + 软删原库
   const newMt = updates.memType !== undefined ? normalizeMemType(updates.memType) : found.memType;
+  if (existing.source === 'conversation_log' && newMt !== 'general') {
+    throw new Error('conversation_log memories must remain in the general log');
+  }
   if (newMt !== found.memType) {
     const proj = normalizeProject(updates.project);
     const newDb = DatabaseManager.getInstance(proj, newMt);
@@ -268,8 +526,8 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>, ch
       : JSON.stringify(parseTagsSafe(existing.tags));  // v1.28-fix: 搬移时不把历史脏值原样抄到新库
     const now = new Date().toISOString();
     newDb.prepare(`
-      INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, base_importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, emotional_impact)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO memory (id, text, project, session_id, type, mem_type, category, subcategory, tags, importance, base_importance, character_id, source, subject, tier, expires_at, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, locked, emotional_impact, metadata, parent_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id,
       text,
@@ -291,8 +549,17 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>, ch
       existing.accessed_count, existing.reference_count ?? 0,
       existing.locked ?? 0,
       updates.emotionalImpact ?? existing.emotional_impact ?? 0,
+      existing.metadata ?? null,
+      existing.parent_id ?? null,
     );
-    const emotionFields = ['metadata', 'agent_mood', 'agent_desire', 'vad_valence', 'vad_arousal', 'vad_dominance', 'tsundere_level'];
+    // Copy affect lifecycle fields as well as VAD. Without this, moving a
+    // pending conversation between memType databases loses its restartable
+    // VAD queue marker and the row can remain permanently unanalyzed.
+    const emotionFields = [
+      'metadata', 'parent_id', 'agent_mood', 'agent_desire',
+      'vad_valence', 'vad_arousal', 'vad_dominance', 'tsundere_level',
+      'affect_status', 'affect_analyzed_at', 'affect_source',
+    ];
     newDb.prepare(`UPDATE memory SET ${emotionFields.map(name => `${name} = ?`).join(', ')} WHERE id = ?`)
       .run(...emotionFields.map(name => existing[name] ?? null), id);
     // 向量一并搬移(若有)
@@ -330,6 +597,8 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>, ch
   }
   // v1.29 情感锚点:钉住 / 取消钉住(pinned=1 的行注入时无条件在场)
   if (updates.pinned !== undefined) { fields.push('pinned = ?'); values.push(updates.pinned ? 1 : 0); }
+  if (updates.metadata !== undefined) { fields.push('metadata = ?'); values.push(serializeMetadata(updates.metadata)); }
+  if (updates.parentId !== undefined) { fields.push('parent_id = ?'); values.push(updates.parentId || null); }
 
   if (fields.length === 0) return existing;
 
@@ -363,6 +632,7 @@ export async function saveConversationTurn(
   moodReason?: string,
   project?: string,  // v1.5: 项目隔离
 ): Promise<any> {
+  characterId = normalizeCharacterId(characterId);
   const db = DatabaseManager.getInstance(project);
   const now = new Date().toISOString();
   const id = generateId();
@@ -379,9 +649,14 @@ export async function saveConversationTurn(
   const text = `${moodPrefix}用户: ${userMsg}\n${assistantName}: ${assistantMsg}`;
 
   db.prepare(`
-    INSERT INTO memory (id, text, project, type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
-    VALUES (?, ?, ?, 'episodic', 'conversation', '[]', 0.5, ?, 'conversation_log', 'user', 'standard', 1, ?, ?, ?, 0, 0)
+    INSERT INTO memory (id, text, project, type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, affect_status, affect_source)
+    VALUES (?, ?, ?, 'episodic', 'conversation', '[]', 0.5, ?, 'conversation_log', 'user', 'standard', 1, ?, ?, ?, 0, 0, 'pending', 'vad_queue')
   `).run(id, text, proj, characterId, now, now, now);
+
+  // Keep the low-level conversation writer safe for direct callers too. The
+  // higher-level auto_process/conversation_save adapters may enqueue the same
+  // id again; queueForVad deduplicates by durable id.
+  await enqueueConversationEvidence(text, proj, id, characterId, userMsg, assistantMsg);
 
   return { id, ok: true };
 }
@@ -417,6 +692,7 @@ export function markColdMemories(project?: string, characterId: string = CHAR_ID
         WHERE project = ? AND character_id = ? AND is_active = 1
           AND COALESCE(status, '') NOT IN ('cold', 'superseded')
           AND COALESCE(tier, 'standard') = 'standard'
+          AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
           AND (locked IS NULL OR locked = 0)
           AND importance < ?
           AND COALESCE(reference_count, 0) = 0
@@ -440,6 +716,7 @@ export function promoteByAccess(project?: string, characterId: string = CHAR_ID)
     const r = db.prepare(`
       UPDATE memory SET tier = 'standard', updated_at = ?
       WHERE tier = 'temporary' AND accessed_count >= ? AND is_active = 1 AND character_id = ?
+        AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
     `).run(now, HEAT_PROMOTE_THRESHOLD, cid);
     total += r.changes;
   }
@@ -460,6 +737,7 @@ export function cleanupExpiredMemories(project?: string, characterId: string = C
     const result = db.prepare(`
       UPDATE memory SET is_active = 0, updated_at = ?
       WHERE tier = 'temporary' AND expires_at IS NOT NULL AND expires_at < ? AND is_active = 1 AND character_id = ?
+        AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
     `).run(now, now, cid);
     total += result.changes;
   }
@@ -475,7 +753,7 @@ export async function reEmbedMemory(id: string, project?: string): Promise<boole
   const found = findDbByMemoryId(id, project);
   if (!found) return false;
   const db = found.db;
-  const mem = db.prepare('SELECT rowid, text FROM memory WHERE id = ? AND is_active = 1').get(id) as any;
+  const mem = db.prepare("SELECT rowid, text, source FROM memory WHERE id = ? AND is_active = 1 AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").get(id) as any;
   if (!mem) return false;
 
   try {
@@ -515,7 +793,7 @@ export async function batchEmbedPending(characterId: string = CHAR_ID, project?:
     conditions.push('m.character_id = ?');
     params.push(characterId);
   }
-  conditions.push("COALESCE(m.source, '') != 'conversation_log'");
+  conditions.push("COALESCE(m.source, '') NOT IN ('conversation_log', 'agent_diary', 'agent_state')");
   if (project) {
     conditions.push('m.project = ?');
     params.push(proj);
@@ -577,9 +855,51 @@ export async function saveFacts(
 ): Promise<{ inserted: number; updated: number }> {
   if (!facts || facts.length === 0) return { inserted: 0, updated: 0 };
 
+  const proj = normalizeProject(project);
+  const cid = normalizeCharacterId(characterId);
+
+  // A self-cycle diary is a derived observation, never evidence for a stable
+  // user/agent fact. Enforce that at the write boundary so reflection/tools
+  // cannot reintroduce diary text into the facts graph by passing its id.
+  if (sourceMemoryId !== null) {
+    const sourceId = String(sourceMemoryId).trim();
+    if (!sourceId) throw new Error('sourceMemoryId must be null or a non-empty memory id');
+    // Facts are durable claims. An explicit source must resolve to one active
+    // memory owned by the same project and character; otherwise the claim
+    // would be an untraceable orphan or could cross character boundaries.
+    const sourceDb = findDbByMemoryId(sourceId, proj, cid);
+    if (!sourceDb) {
+      throw new Error(`source memory not found for project=${proj}, character=${cid}: ${sourceId}`);
+    }
+    const source = sourceDb.db.prepare(`
+      SELECT source, project, character_id, is_active, mem_type
+      FROM memory WHERE id = ?
+    `).get(sourceId) as any;
+    if (!source || Number(source.is_active) !== 1
+      || String(source.project || '') !== proj
+      || String(source.character_id || '') !== cid) {
+      throw new Error(`source memory does not belong to project=${proj}, character=${cid}: ${sourceId}`);
+    }
+    if (isDerivedMemorySource(source.source)) {
+      throw new Error(`${String(source.source)} cannot be used as a fact source`);
+    }
+    sourceMemoryId = sourceId;
+  }
+
+  // Keep the source provenance on the fact itself. Facts are stored in the
+  // general database, while the source memory can be in another memType DB;
+  // later queries cannot depend on a cross-database JOIN to filter diaries.
+  let sourceMemorySource: string | null = null;
+  let sourceMemoryMemType: string | null = null;
+  if (sourceMemoryId !== null) {
+    const sourceDb = findDbByMemoryId(sourceMemoryId, proj, cid);
+    const source = sourceDb?.db.prepare('SELECT source FROM memory WHERE id = ?').get(sourceMemoryId) as any;
+    sourceMemorySource = source?.source ? String(source.source) : null;
+    sourceMemoryMemType = sourceDb?.memType || null;
+  }
+
   const db = DatabaseManager.getInstance(project);
   const now = new Date().toISOString();
-  const proj = normalizeProject(project);
   let inserted = 0;
   let updated = 0;
 
@@ -592,23 +912,30 @@ export async function saveFacts(
   const updateFact = db.prepare(`
     UPDATE facts SET confidence = MAX(confidence, ?), updated_at = ?, is_active = 1,
       evidence = COALESCE(NULLIF(?, ''), evidence),
-      valid_from = COALESCE(?, valid_from), valid_to = ?
+      valid_from = COALESCE(?, valid_from), valid_to = ?,
+      source_memory_source = COALESCE(source_memory_source, ?),
+      source_memory_mem_type = COALESCE(source_memory_mem_type, ?)
     WHERE id = ?
   `);
   const insertFact = db.prepare(`
-    INSERT INTO facts (id, subject, predicate, object, project, confidence, source_memory_id, character_id, is_active, created_at, updated_at, evidence, valid_from, valid_to)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+    INSERT INTO facts (id, subject, predicate, object, project, confidence, source_memory_id,
+      source_memory_source, source_memory_mem_type, character_id, is_active, created_at,
+      updated_at, evidence, valid_from, valid_to)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
   `);
 
   for (const f of facts) {
-    const existing = selectFact.get(f.subject, f.predicate, f.object, proj, characterId ?? '') as any;
+    const existing = selectFact.get(f.subject, f.predicate, f.object, proj, cid) as any;
     const factId = existing ? existing.id : generateId();
     if (existing) {
       // v1.28: 复写一条"已被失效"的事实 = 重新断言它。它的有效起点要回到现在，否则按
       // valid_from 排序的时间线上它仍排在接管它的那个值之前，会被立刻重新闭合 —— v1.23 的
       // "复写清空 valid_to" 就失效了（regression_v123_anima 7b）。显式给了 validFrom 时以调用方为准。
       const wasInvalidated = !!(existing.valid_to && String(existing.valid_to).length > 0) && !f.validFrom;
-      updateFact.run(f.confidence, now, f.evidence ?? '', f.validFrom ?? null, f.validTo ?? null, factId);
+      updateFact.run(
+        f.confidence, now, f.evidence ?? '', f.validFrom ?? null, f.validTo ?? null,
+        sourceMemorySource, sourceMemoryMemType, factId,
+      );
       updated++;
       if (wasInvalidated) {
         try { db.prepare('UPDATE facts SET valid_from = ? WHERE id = ?').run(now, factId); } catch { /* 列未迁移 */ }
@@ -618,7 +945,8 @@ export async function saveFacts(
       try { db.prepare('UPDATE facts SET valid_from = ? WHERE id = ? AND (valid_from IS NULL OR valid_from = \'\')').run(now, factId); } catch { /* 列未迁移 */ }
     } else {
       insertFact.run(
-        factId, f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId, characterId, now, now,
+        factId, f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId,
+        sourceMemorySource, sourceMemoryMemType, cid, now, now,
         f.evidence ?? null, f.validFrom ?? now, f.validTo ?? null,
       );
       inserted++;
@@ -664,11 +992,11 @@ export async function saveFacts(
       const inThisBatch = batchObjects.get(key) || new Set<string>();
       // 表外谓词才查历史证据（表内谓词由语义先验直接决定，省一次查询）。
       const evidence = needsEvidence(predicate)
-        ? estimatePredicateVolatility(db, proj, f.subject, predicate, characterId)
+        ? estimatePredicateVolatility(db, proj, f.subject, predicate, cid)
         : undefined;
       if (!shouldSupersede({ predicate, evidence }).supersede) continue;
 
-      const chain = loadChain.all(proj, characterId ?? '', f.subject, predicate) as any[];
+      const chain = loadChain.all(proj, cid, f.subject, predicate) as any[];
       for (let i = 0; i < chain.length - 1; i++) {
         const next = chain[i + 1];
         // 同批 + 同时间戳 = 无法排序的两个值 → 并存（v1.23-fix 的语义）
@@ -692,7 +1020,7 @@ export async function saveFacts(
       WHERE project = ? AND COALESCE(character_id, '') = ? AND subject || ' ' || predicate || ' ' || object IN (
         ${facts.map(() => '?').join(',')}
       )
-    `).all(proj, characterId ?? '', ...facts.map(f => `${f.subject} ${f.predicate} ${f.object}`)) as any[];
+    `).all(proj, cid, ...facts.map(f => `${f.subject} ${f.predicate} ${f.object}`)) as any[];
 
     for (const row of allFacts) {
       const factText = `${row.subject} ${row.predicate} ${row.object}`;
@@ -717,7 +1045,7 @@ export function getFactsBySubject(subject: string, characterId?: string, project
   // v1.23.1: 默认只返回当前有效事实；历史版本留在表里（valid_to 有值）供按需追溯
   // v1.24: 角色隔离 — 未指定 characterId 时按当前实例角色过滤(不再跨角色泄露)
   const cid = characterId ?? CHAR_ID;
-  let query = "SELECT * FROM facts WHERE subject = ? AND is_active = 1 AND project = ? AND (valid_to IS NULL OR valid_to = '')";
+  let query = "SELECT facts.* FROM facts WHERE facts.subject = ? AND facts.is_active = 1 AND facts.project = ? AND (facts.valid_to IS NULL OR facts.valid_to = '') AND COALESCE(facts.source_memory_source, '') NOT IN ('agent_diary', 'agent_state') AND NOT EXISTS (SELECT 1 FROM memory source_memory WHERE source_memory.id = facts.source_memory_id AND source_memory.source IN ('agent_diary', 'agent_state'))";
   const params: any[] = [subject, proj];
   if (cid !== 'any') {
     query += ' AND character_id = ?';
@@ -808,6 +1136,7 @@ export function promoteToProject(
     const dup = db.prepare(`
       SELECT id FROM memory
       WHERE is_active = 1 AND project = ? AND session_id IS NULL AND TRIM(text) = TRIM(?) AND subject = ? AND character_id IS ?
+        AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
       LIMIT 1
     `).get(proj, md, item.subject || 'user', cid) as any;
     if (dup) { ids.push(dup.id); continue; }

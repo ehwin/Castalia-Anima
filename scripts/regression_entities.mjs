@@ -49,6 +49,7 @@ const distUrl = name => pathToFileURL(path.join(ROOT, 'dist', name)).href;
 const dbMod = await import(distUrl('db.js'));
 const storeMod = await import(distUrl('store.js'));
 const entMod = await import(distUrl('entities.js'));
+const searchMod = await import(distUrl('search.js'));
 
 async function connect() {
   const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
@@ -115,6 +116,83 @@ async function main() {
   check('entityFacts 返回 user 的 2 条当前事实', factsOfUser.length === 2, `got=${factsOfUser.length}`);
   const memsOfUser = entMod.entityMemories(db, db.prepare("SELECT id FROM entities WHERE key='user'").get().id, 20);
   check('entityMemories 回到源记忆', memsOfUser.some(m => m.id === mem.id), JSON.stringify(memsOfUser).slice(0, 160));
+
+  // ── 2.5 跨 memType: facts/entities 在 general,源记忆在 project ───────
+  const crossMem = await storeMod.saveMemory({
+    text: '跨分类源记忆:用户偏好嵌入式图引擎。',
+    memType: 'project',
+    importance: 0.7,
+    characterId: CHAR,
+    project: PROJECT,
+  });
+  await storeMod.saveFacts([
+    { subject: 'user', predicate: '偏好', object: '嵌入式图引擎', confidence: 0.88 },
+  ], crossMem.id, CHAR, PROJECT);
+  const memoryDbs = ['general', 'user', 'feedback', 'project', 'reference']
+    .map(mt => ({ db: dbMod.DatabaseManager.getInstance(PROJECT, mt), memType: mt }));
+  const crossEntity = db.prepare("SELECT id FROM entities WHERE key='嵌入式图引擎'").get();
+  const crossMems = entMod.entityMemories(db, crossEntity.id, 20, CHAR, PROJECT, memoryDbs);
+  check('跨 memType entityMemories 找回 project 源记忆', crossMems.some(m => m.id === crossMem.id), JSON.stringify(crossMems).slice(0, 240));
+
+  // 2.5b entity-expanded search must also cross the physical partition
+  // boundary. The project memory deliberately does not contain the query
+  // words; it is reachable only through the two shared fact entities.
+  const seedMem = await storeMod.saveMemory({
+    text: '用户最近讨论了嵌入式图引擎的取舍。',
+    memType: 'general',
+    importance: 0.8,
+    characterId: CHAR,
+    project: PROJECT,
+  });
+  await storeMod.saveFacts([
+    { subject: 'user', predicate: '讨论主题', object: '嵌入式图引擎', confidence: 0.86 },
+  ], seedMem.id, CHAR, PROJECT);
+  const expandedMem = await storeMod.saveMemory({
+    text: '用户在项目库里记录了一次架构方案取舍。',
+    memType: 'project',
+    importance: 0.8,
+    characterId: CHAR,
+    project: PROJECT,
+  });
+  await storeMod.saveFacts([
+    { subject: 'user', predicate: '架构选择', object: '嵌入式图引擎', confidence: 0.84 },
+  ], expandedMem.id, CHAR, PROJECT);
+  const expanded = await searchMod.searchMemory({
+    query: '嵌入式图引擎', project: PROJECT, characterId: CHAR,
+    topK: 10, countAccess: false,
+  });
+  check('实体扩散跨 memType 找回 project 记忆', expanded.some(r => r.id === expandedMem.id && r.basis === 'entity'),
+    JSON.stringify(expanded.map(r => ({ id: r.id, basis: r.basis, memType: r.memType }))));
+
+  // ── 2.6 provenance 边界:显式来源必须存在且属于目标角色 ────────
+  let rejectedUnknownSource = false;
+  try {
+    await storeMod.saveFacts([
+      { subject: 'user', predicate: '未知来源测试', object: '不应落库', confidence: 0.5 },
+    ], 'memory-does-not-exist', CHAR, PROJECT);
+  } catch (error) {
+    rejectedUnknownSource = /source memory not found/i.test(String(error?.message || error));
+  }
+  check('saveFacts 拒绝未知 sourceMemoryId', rejectedUnknownSource);
+  check('未知来源事实没有写入', db.prepare("SELECT COUNT(*) c FROM facts WHERE predicate='未知来源测试'").get().c === 0);
+
+  const otherCharMem = await storeMod.saveMemory({
+    text: '另一角色的来源记忆,不能给当前角色背书。',
+    memType: 'general',
+    importance: 0.7,
+    characterId: 'other-character',
+    project: PROJECT,
+  });
+  let rejectedCrossCharacterSource = false;
+  try {
+    await storeMod.saveFacts([
+      { subject: 'user', predicate: '跨角色来源测试', object: '不应落库', confidence: 0.5 },
+    ], otherCharMem.id, CHAR, PROJECT);
+  } catch (error) {
+    rejectedCrossCharacterSource = /source memory not found|does not belong/i.test(String(error?.message || error));
+  }
+  check('saveFacts 拒绝跨角色 sourceMemoryId', rejectedCrossCharacterSource);
+  check('跨角色来源事实没有写入', db.prepare("SELECT COUNT(*) c FROM facts WHERE predicate='跨角色来源测试'").get().c === 0);
 
   // ── 3. 冲突失效:姓名 张三 → 李四 ───────────────────────────
   await storeMod.saveFacts([{ subject: 'user', predicate: '姓名', object: '李四', confidence: 0.99 }], mem.id, CHAR, PROJECT);
@@ -188,6 +266,7 @@ async function main() {
 
   const lookup = await call('entity_lookup', { name: 'user' });
   check('entity_lookup(user) 命中并给事实', lookup.found === true && lookup.counts?.facts >= 2, JSON.stringify(lookup).slice(0, 240));
+  check('entity_lookup(user) 包含跨 memType 源记忆', lookup.memories?.some(m => m.id === crossMem.id), JSON.stringify(lookup.memories).slice(0, 240));
   check('entity_lookup 带上其他候选', Array.isArray(lookup.otherCandidates));
 
   const lookup2 = await call('entity_lookup', { name: '张三', includeGraph: true });

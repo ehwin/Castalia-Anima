@@ -192,7 +192,7 @@ export async function isDuplicate(proj: string, text: string, memType: string, s
     const rows = DatabaseManager.getInstance(proj, mt).prepare(`
       SELECT text FROM memory WHERE is_active = 1 AND project = ? AND mem_type = ? AND character_id = ?
         AND (? IS NULL OR subject = ?)
-        AND session_id IS NULL AND COALESCE(source, '') NOT IN ('conversation_log', 'auto_process', 'session_memory')
+        AND session_id IS NULL AND COALESCE(source, '') NOT IN ('conversation_log', 'auto_process', 'session_memory', 'agent_diary', 'agent_state')
     `).all(proj, memType, characterId, subject ?? null, subject ?? null) as { text: string }[];
     if (rows.some(row => row.text.trim() === normalized)) return true;
   }

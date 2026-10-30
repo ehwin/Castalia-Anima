@@ -473,12 +473,46 @@ export function initProjectSchema(db: Database.Database) {
       project TEXT DEFAULT 'default',
       confidence REAL DEFAULT 0.5,
       source_memory_id TEXT,
+      source_memory_source TEXT,
+      source_memory_mem_type TEXT,
       character_id TEXT,
       is_active INTEGER DEFAULT 1,
       accessed_count INTEGER DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(source_memory_id) REFERENCES memory(id)
+    );
+
+    -- Short-term affect is a state snapshot, not a memory record. Keeping it
+    -- in its own table prevents psyche state from entering memory search/VAD.
+    CREATE TABLE IF NOT EXISTS psyche_state (
+      project TEXT NOT NULL,
+      character_id TEXT NOT NULL,
+      version INTEGER NOT NULL DEFAULT 1,
+      has_evidence INTEGER NOT NULL DEFAULT 0,
+      baseline_valence REAL NOT NULL,
+      baseline_arousal REAL NOT NULL,
+      baseline_dominance REAL NOT NULL,
+      vad_valence REAL NOT NULL,
+      vad_arousal REAL NOT NULL,
+      vad_dominance REAL NOT NULL,
+      band TEXT NOT NULL DEFAULT 'neutral',
+      updated_at INTEGER NOT NULL,
+      processed_event_ids TEXT NOT NULL DEFAULT '[]',
+      PRIMARY KEY (project, character_id)
+    );
+
+    -- One claim per self-cycle evidence set. This is separate from memory so
+    -- derived diary writes can be retried without becoming new evidence.
+    CREATE TABLE IF NOT EXISTS self_cycle_runs (
+      project TEXT NOT NULL,
+      character_id TEXT NOT NULL,
+      evidence_key TEXT NOT NULL,
+      evidence_watermark_created_at TEXT,
+      evidence_watermark_rowid INTEGER,
+      diary_id TEXT,
+      claimed_at TEXT NOT NULL,
+      PRIMARY KEY (project, character_id, evidence_key)
     );
   `);
 
@@ -508,12 +542,63 @@ export function initProjectSchema(db: Database.Database) {
   try { db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_project ON memory(project, is_active)`); } catch (_e) {}
   try { db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_project ON facts(project, is_active)`); } catch (_e) {}
 
+  // Self-cycle diary claim: one active diary per project/person/evidence set,
+  // including callers running in separate Node processes. Legacy duplicate
+  // rows are retained; the trigger remains installable even when the unique
+  // index cannot be created because old rows already collide.
+  try {
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_diary_evidence_unique
+      ON memory(
+        project,
+        COALESCE(character_id, ''),
+        CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.evidence_key') END
+      )
+      WHERE source = 'agent_diary'
+        AND is_active = 1
+        AND json_valid(metadata)
+        AND json_extract(metadata, '$.evidence_key') IS NOT NULL
+    `);
+  } catch (e: any) {
+    console.error(`[db] agent diary evidence index unavailable: ${e.message}`);
+  }
+  try {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_agent_diary_evidence_unique
+      BEFORE INSERT ON memory
+      WHEN NEW.source = 'agent_diary'
+        AND NEW.is_active = 1
+        AND json_valid(NEW.metadata)
+        AND json_extract(NEW.metadata, '$.evidence_key') IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM memory AS prior
+          WHERE prior.project = NEW.project
+            AND COALESCE(prior.character_id, '') = COALESCE(NEW.character_id, '')
+            AND prior.source = 'agent_diary'
+            AND prior.is_active = 1
+            AND json_valid(prior.metadata)
+            AND json_extract(prior.metadata, '$.evidence_key') = json_extract(NEW.metadata, '$.evidence_key')
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'agent diary evidence already exists');
+      END
+    `);
+  } catch (e: any) {
+    console.error(`[db] agent diary evidence trigger unavailable: ${e.message}`);
+  }
+
   // v6.0: session_id column for session-level memory (reserved, no logic added yet)
   try { db.exec(`ALTER TABLE memory ADD COLUMN session_id TEXT`); } catch (_e) { /* already exists */ }
 
   // v1.8: mem_type column — 用途维度(Claude Code 4 种封闭类型),默认 general
   try { db.exec(`ALTER TABLE memory ADD COLUMN mem_type TEXT DEFAULT 'general'`); } catch (_e) { /* already exists */ }
   try { db.exec(`ALTER TABLE memory ADD COLUMN emotional_impact REAL DEFAULT 0`); } catch (_e) { /* already exists */ }
+  // Affect analysis is a durable workflow state. NULL VAD alone cannot tell
+  // "not processed" from "processed but no affect was detected".
+  try { db.exec(`ALTER TABLE memory ADD COLUMN affect_status TEXT`); } catch (_e) { /* already exists */ }
+  try { db.exec(`ALTER TABLE memory ADD COLUMN affect_analyzed_at DATETIME`); } catch (_e) { /* already exists */ }
+  try { db.exec(`ALTER TABLE memory ADD COLUMN affect_source TEXT`); } catch (_e) { /* already exists */ }
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_affect_pending ON memory(project, character_id, is_active, affect_status)`); } catch (_e) {}
   try { db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_mem_type ON memory(mem_type, is_active)`); } catch (_e) {}
 
   // v1.15(Anima 补):status / identity_locked —— 老库由 Full 血统建表时已有,新建库必须补,
@@ -540,6 +625,65 @@ export function initProjectSchema(db: Database.Database) {
   try { db.exec(`ALTER TABLE facts ADD COLUMN superseded_by TEXT`); } catch (_e) { /* already exists */ }
   try { db.exec(`ALTER TABLE facts ADD COLUMN expired_at DATETIME`); } catch (_e) { /* already exists */ }
   try { db.exec(`ALTER TABLE facts ADD COLUMN evidence TEXT`); } catch (_e) { /* already exists */ }
+  // Provenance must survive the physical memType split. A facts row normally
+  // lives in general while its source memory may live in project/reference;
+  // a local JOIN on memory therefore cannot reliably identify derived diary
+  // evidence after the split.
+  try { db.exec(`ALTER TABLE facts ADD COLUMN source_memory_source TEXT`); } catch (_e) { /* already exists */ }
+  try { db.exec(`ALTER TABLE facts ADD COLUMN source_memory_mem_type TEXT`); } catch (_e) { /* already exists */ }
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_source_memory_source ON facts(source_memory_source, is_active)`); } catch (_e) {}
+
+  // v1.30: facts may live in the general partition while their source memory
+  // lives in another physical memType database.  A local SQLite FK on
+  // source_memory_id therefore rejects valid cross-partition provenance.  The
+  // source id remains useful metadata, while source_memory_source and
+  // source_memory_mem_type provide the durable cross-database provenance.
+  // Rebuild only legacy tables that still carry the local-memory FK.  This is
+  // idempotent and preserves all columns/data added by the migrations above.
+  try {
+    const foreignKeys = db.prepare("PRAGMA foreign_key_list('facts')").all() as any[];
+    if (foreignKeys.some(row => String(row?.from || '') === 'source_memory_id'
+      && String(row?.table || '') === 'memory')) {
+      db.exec('DROP VIEW IF EXISTS facts_current');
+      db.exec(`CREATE TABLE facts_without_memory_fk (
+        id TEXT PRIMARY KEY,
+        subject TEXT NOT NULL,
+        predicate TEXT NOT NULL,
+        object TEXT NOT NULL,
+        project TEXT DEFAULT 'default',
+        confidence REAL DEFAULT 0.5,
+        source_memory_id TEXT,
+        source_memory_source TEXT,
+        source_memory_mem_type TEXT,
+        character_id TEXT,
+        is_active INTEGER DEFAULT 1,
+        accessed_count INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        valid_from DATETIME,
+        valid_to DATETIME,
+        superseded_by TEXT,
+        expired_at DATETIME,
+        evidence TEXT
+      )`);
+      db.exec(`INSERT INTO facts_without_memory_fk (
+        id, subject, predicate, object, project, confidence, source_memory_id,
+        source_memory_source, source_memory_mem_type, character_id, is_active,
+        accessed_count, created_at, updated_at, valid_from, valid_to,
+        superseded_by, expired_at, evidence
+      ) SELECT
+        id, subject, predicate, object, project, confidence, source_memory_id,
+        source_memory_source, source_memory_mem_type, character_id, is_active,
+        accessed_count, created_at, updated_at, valid_from, valid_to,
+        superseded_by, expired_at, evidence
+      FROM facts`);
+      db.exec('DROP TABLE facts');
+      db.exec('ALTER TABLE facts_without_memory_fk RENAME TO facts');
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_source_memory_source ON facts(source_memory_source, is_active)`);
+  } catch (e: any) {
+    console.error(`[db] facts 跨 memType 外键迁移失败: ${e.message}`);
+  }
 
   // v1.29 情感锚点 + 访问日志(2026-10-30)
   //
@@ -623,9 +767,18 @@ export function initProjectSchema(db: Database.Database) {
       PRIMARY KEY (memory_id, entity_id, role)
     )`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_entities_entity ON memory_entities(entity_id)`);
-    // 当前有效事实视图:把散落在各处的 (valid_to IS NULL OR valid_to='') 口径收敛到一处
-    db.exec(`CREATE VIEW IF NOT EXISTS facts_current AS
-      SELECT * FROM facts WHERE is_active = 1 AND (valid_to IS NULL OR valid_to = '')`);
+    // 当前有效事实视图:派生日记不是事实证据，不能通过这个公共视图回流。
+    // 每次打开重建一次，确保已存在的旧视图也获得新的 provenance 过滤。
+    db.exec(`DROP VIEW IF EXISTS facts_current`);
+    db.exec(`CREATE VIEW facts_current AS
+      SELECT * FROM facts
+      WHERE is_active = 1 AND (valid_to IS NULL OR valid_to = '')
+        AND NOT EXISTS (
+          SELECT 1 FROM memory source_memory
+          WHERE source_memory.id = facts.source_memory_id
+            AND source_memory.source IN ('agent_diary', 'agent_state')
+        )
+        AND COALESCE(facts.source_memory_source, '') NOT IN ('agent_diary', 'agent_state')`);
     // v1.27: valid_from 为空的老行补成 created_at。
     // 否则"按时刻 T 查有效事实"会把所有未知起点的事实都算成 T 时刻为真 —— 时间层就是假的。
     // 先探一行再更新:没有空值时这条 UPDATE 不必每次打开都全表扫一遍。

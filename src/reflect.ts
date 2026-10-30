@@ -112,6 +112,8 @@ export function listAllMemories(characterId: string = CHAR_ID, limit: number = 2
           AND (? = 'any' OR character_id = ?)
           -- v1.23: 冷存与被接管的旧记忆不参加新一轮沉淀（否则深反思会反复处理同一批死记忆）
           AND COALESCE(status, '') NOT IN ('cold', 'superseded')
+          -- 自循环日记是派生观察，不得进入普通反思/事实提取
+          AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
         ORDER BY importance DESC, created_at DESC
         LIMIT ?
       `).all(proj, cid, cid, limit) as any[];
@@ -181,7 +183,7 @@ function resolveReflectTarget(idPrefix: string, project?: string, allowInactiveC
   const matches: { db: any; id: string }[] = [];
   for (const mt of listMemTypeDirs(normalizeProject(project))) {
     const db = DatabaseManager.getInstance(project, mt);
-    const rows = db.prepare(`SELECT id FROM memory WHERE project = ? AND (is_active = 1${allowInactiveConversation ? " OR source = 'conversation_log'" : ''})${own} AND substr(id, 1, length(?)) = ?`)
+    const rows = db.prepare(`SELECT id FROM memory WHERE project = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state') AND (is_active = 1${allowInactiveConversation ? " OR source = 'conversation_log'" : ''})${own} AND substr(id, 1, length(?)) = ?`)
       .all(normalizeProject(project), ...ownArgs, idPrefix, idPrefix) as { id: string }[];
     for (const row of rows) matches.push({ db, id: row.id });
   }
@@ -335,7 +337,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             const sdb = memDbFor(id, project, db, characterId);
             // 原料行（对话流水 / 事件层 / 状态快照）不接受整合合并：它们是"原文与导航层"，
             // 不是可再生的摘要 —— 合并只留一份改写稿，原文就再也回不来了（2026-10-30）。
-            const src = sdb.prepare("SELECT id FROM memory WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical' AND COALESCE(source, '') NOT IN ('conversation_log', 'daily_event', 'agent_state')").get(id) as any;
+            const src = sdb.prepare("SELECT id FROM memory WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical' AND COALESCE(source, '') NOT IN ('conversation_log', 'daily_event', 'agent_state', 'agent_diary')").get(id) as any;
             if (!src) { mergeInvalid = `source not found, locked, critical, or raw-material: ${id}`; break; }
             mergeSources.push({ db: sdb, id: src.id });
           }
@@ -364,7 +366,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           // 所有源均已确认 active 且合并结果已落库后，才软删除并清理向量。
           for (const src of mergeSources) {
             if (src.id === merged.id) continue;
-            src.db.prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical'").run(src.id);
+            src.db.prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical' AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").run(src.id);
             try {
               const row = src.db.prepare('SELECT rowid FROM memory WHERE id = ?').get(src.id) as any;
               if (row) src.db.prepare('DELETE FROM vec_memory WHERE rowid = ?').run(row.rowid);
@@ -381,10 +383,10 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             throw new Error('split: need targetId and non-empty fragments');
           }
           const source = resolveReflectTarget(action.targetId, project, false, characterId)!;
-          const row = source.db.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(source.id) as any;
+          const row = source.db.prepare("SELECT * FROM memory WHERE id = ? AND is_active = 1 AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").get(source.id) as any;
           if (!row || row.locked || row.identity_locked) throw new Error('split: target locked or inactive');
           // 2026-10-30: 原料行不可拆分/替换 —— 拆分会把源软删，原文与事件引文就没了。
-          if (['conversation_log', 'daily_event', 'agent_state'].includes(String(row.source || ''))) {
+          if (['conversation_log', 'daily_event', 'agent_state', 'agent_diary'].includes(String(row.source || ''))) {
             throw new Error('split: raw-material row is immutable');
           }
           const children = [];
@@ -397,7 +399,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             }));
           }
           if (!children.some(child => child.id === source.id)) {
-            source.db.prepare('UPDATE memory SET is_active = 0 WHERE id = ?').run(source.id);
+            source.db.prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").run(source.id);
             try { source.db.prepare('DELETE FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id = ?)').run(source.id); } catch { /* optional vectors */ }
           }
           receipt.rowsAffected = children.length;
@@ -486,7 +488,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           }
           if (updates.length > 0) {
             const _tdb = memDbFor(tid, project, db, characterId);
-            const existing = _tdb.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1').get(tid) as any;
+            const existing = _tdb.prepare("SELECT * FROM memory WHERE id = ? AND is_active = 1 AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").get(tid) as any;
             if (!existing || existing.locked || existing.identity_locked) throw new Error('target locked or inactive');
             const patch: any = { project };
             const names: Record<string, string> = { type: 'type', category: 'category', tags: 'tags', mem_type: 'memType', text: 'text' };
@@ -529,7 +531,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
 
           const { saveMemory } = await import('./store.js');
           const sourceTarget = resolveReflectTarget(action.sourceId, project, true, characterId)!;
-          const sourceRow = sourceTarget.db.prepare('SELECT * FROM memory WHERE id = ?').get(action.sourceId) as any;
+          const sourceRow = sourceTarget.db.prepare("SELECT * FROM memory WHERE id = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").get(sourceTarget.id) as any;
           // v1.23: 引用校验 —— 只有能在原文子串命中的引用才保留（防编造原话）
           const sourceText = String(sourceRow?.text || '');
           const quoteClean = (q: string) => String(q).replace(/^[「『"']+|[」』"']+$/g, '').trim();
@@ -628,7 +630,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
           // v1.23: critical 核心记忆不得被自动反思删除
           // 2026-10-30: 原料行（对话流水/事件层/状态快照）同样不得被删除 —— 原文永不删除是这套记忆的地基，
           //   事件层则带着逐字引文与来源 rowid，重建需要重跑且 progress 表已经挡掉重跑。
-          const _delR = memDbFor(action.targetId, project, db, characterId).prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical' AND COALESCE(source, '') NOT IN ('conversation_log', 'daily_event', 'agent_state')").run(action.targetId);
+          const _delR = memDbFor(action.targetId, project, db, characterId).prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical' AND COALESCE(source, '') NOT IN ('conversation_log', 'daily_event', 'agent_state', 'agent_diary')").run(action.targetId);
           receipt.rowsAffected = _delR.changes;
           if (_delR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found, locked, or raw-material: ${action.targetId}`; }
           if (receipt.status === 'applied') result.applied++;
@@ -643,7 +645,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             result.receipts.push(receipt);
             continue;
           }
-          const _boR = memDbFor(action.targetId, project, db, characterId).prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance + ?)) WHERE id = ? AND (locked IS NULL OR locked = 0)')
+          const _boR = memDbFor(action.targetId, project, db, characterId).prepare("UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance + ?)) WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')")
             .run(action.delta, action.targetId);
           receipt.rowsAffected = _boR.changes;
           if (_boR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found or locked: ${action.targetId}`; }
@@ -659,7 +661,7 @@ export async function applyReflectActions(actions: ReflectAction[], characterId:
             result.receipts.push(receipt);
             continue;
           }
-          const _deR = memDbFor(action.targetId, project, db, characterId).prepare('UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance - ?)) WHERE id = ? AND (locked IS NULL OR locked = 0)')
+          const _deR = memDbFor(action.targetId, project, db, characterId).prepare("UPDATE memory SET importance = MIN(0.95, MAX(0.1, importance - ?)) WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')")
             .run(action.delta, action.targetId);
           receipt.rowsAffected = _deR.changes;
           if (_deR.changes === 0) { receipt.status = 'failed'; receipt.reason = `target not found or locked: ${action.targetId}`; }
@@ -712,7 +714,6 @@ export function getAllMemories(characterId: string = CHAR_ID, limit: number = 20
 
 /** 获取记忆关联图 */
 export function getMemoryGraph(characterId: string = CHAR_ID, project?: string): { nodes: any[]; edges: any[] } {
-  const db = DatabaseManager.getInstance(project);
   const proj = normalizeProject(project);
   const nodes = listAllMemories(characterId, 500, proj);
   const nodeIds = new Set(nodes.map((n: any) => n.id));
@@ -720,14 +721,37 @@ export function getMemoryGraph(characterId: string = CHAR_ID, project?: string):
   if (nodeIds.size > 0) {
     // v1.27-fix: 原来只过滤 source_id IN (...),目标节点在集合里的边会被漏掉(图看着比实际稀疏)。
     const ph = [...nodeIds].map(() => '?').join(',');
-    edgeRows = db.prepare(`
-      SELECT e.id, e.source_id, e.target_id, e.relation_type,
-             m1.text as source_text, m2.text as target_text
-      FROM edges e
-      LEFT JOIN memory m1 ON e.source_id = m1.id
-      LEFT JOIN memory m2 ON e.target_id = m2.id
-      WHERE e.source_id IN (${ph}) OR e.target_id IN (${ph})
-    `).all(...nodeIds, ...nodeIds) as any[];
+    // Edges are stored in the source memory's memType database. Query every
+    // project partition, and bind the role/project on both endpoints; the
+    // old general-only query could return a foreign-role endpoint or a stale
+    // diary edge when an edge row was present in another partition.
+    const cid = characterId || CHAR_ID;
+    const diaryIds = new Set<string>();
+    for (const mt of listMemTypeDirs(proj)) {
+      const db = DatabaseManager.getInstance(proj, mt);
+      try {
+        for (const row of db.prepare("SELECT id FROM memory WHERE project = ? AND source = 'agent_diary'").all(proj) as any[]) {
+          diaryIds.add(String(row.id));
+        }
+      } catch { /* legacy schema */ }
+      try {
+        edgeRows.push(...db.prepare(`
+          SELECT e.id, e.source_id, e.target_id, e.relation_type,
+                 m1.text as source_text, m2.text as target_text
+          FROM edges e
+          JOIN memory m1 ON e.source_id = m1.id
+          JOIN memory m2 ON e.target_id = m2.id
+          WHERE (e.source_id IN (${ph}) OR e.target_id IN (${ph}))
+            AND m1.project = ? AND m1.is_active = 1
+            AND COALESCE(m1.source, '') NOT IN ('agent_diary', 'agent_state')
+            AND (? = 'any' OR m1.character_id = ?)
+            AND m2.project = ? AND m2.is_active = 1
+            AND COALESCE(m2.source, '') NOT IN ('agent_diary', 'agent_state')
+            AND (? = 'any' OR m2.character_id = ?)
+        `).all(...nodeIds, ...nodeIds, proj, cid, cid, proj, cid, cid) as any[]);
+      } catch { /* one damaged partition must not hide the remaining graph */ }
+    }
+    edgeRows = edgeRows.filter((row) => !diaryIds.has(String(row.source_id)) && !diaryIds.has(String(row.target_id)));
   }
 
   const edges = edgeRows.map(r => ({

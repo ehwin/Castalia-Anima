@@ -27,8 +27,8 @@ export function orphanMemories(db, opts) {
             return null;
         }
     };
-    const total = Number(rowOf('SELECT COUNT(*) n FROM memory WHERE is_active = 1')?.n ?? 0);
-    const anchored = Number(rowOf("SELECT COUNT(*) n FROM memory WHERE is_active = 1 AND session_id IS NOT NULL AND session_id <> ''")?.n ?? 0);
+    const total = Number(rowOf("SELECT COUNT(*) n FROM memory WHERE is_active = 1 AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')")?.n ?? 0);
+    const anchored = Number(rowOf("SELECT COUNT(*) n FROM memory WHERE is_active = 1 AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state') AND session_id IS NOT NULL AND session_id <> ''")?.n ?? 0);
     base.anchored = anchored;
     base.skippedNoAnchor = Math.max(0, total - anchored);
     if (anchored === 0)
@@ -42,7 +42,7 @@ export function orphanMemories(db, opts) {
         rows = db.prepare(`
       SELECT m.id, m.session_id, m.text, m.created_at, m.source, m.metadata
       FROM memory m
-      WHERE ${where}
+      WHERE COALESCE(m.source, '') NOT IN ('agent_diary', 'agent_state') AND ${where}
       ORDER BY m.created_at DESC
       LIMIT ?
     `).all(...alive, limit);
@@ -92,7 +92,7 @@ export function sessionInventory(db, limit = 200) {
     try {
         return db.prepare(`
       SELECT session_id AS sessionId, COUNT(*) AS memories, MAX(created_at) AS latest
-      FROM memory WHERE is_active = 1 AND session_id IS NOT NULL AND session_id <> ''
+      FROM memory WHERE is_active = 1 AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state') AND session_id IS NOT NULL AND session_id <> ''
       GROUP BY session_id ORDER BY memories DESC LIMIT ?
     `).all(limit).map(r => ({
             sessionId: String(r.sessionId), memories: Number(r.memories) || 0, latest: String(r.latest || ''),

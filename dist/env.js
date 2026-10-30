@@ -12,7 +12,7 @@ import { VERSION } from './version.js';
  * 不再按 project 推导角色。project 只做记忆库维度(库/项目分区)。
  * 多角色 = 多实例(各自 CHAR_ID + 各自库目录),同一库里不同角色靠 character_id 列隔离。
  */
-export const CHAR_ID = process.env.CHAR_ID || 'airi';
+export const CHAR_ID = String(process.env.CHAR_ID || 'airi').trim() || 'airi';
 /** 当前项目 ID(对齐 Hermes Project 概念):记忆按项目隔离。默认 'default' 保持向后兼容 */
 export const PROJECT_ID = process.env.CASTALIA_PROJECT || 'default';
 /**
@@ -27,6 +27,11 @@ export const SHARED_PROJECT = process.env.SHARED_PROJECT || 'shared';
 export function normalizeProject(p) {
     const t = (p ?? '').trim();
     return t.length > 0 ? t : PROJECT_ID;
+}
+/** Canonical character partition key used by memory, state and queues. */
+export function normalizeCharacterId(id) {
+    const value = String(id ?? '').trim();
+    return value || CHAR_ID;
 }
 /**
  * 角色身份解析 — 与 Castalia 普通版对齐:角色只由进程级 CHAR_ID 决定。

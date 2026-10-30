@@ -300,6 +300,7 @@ export async function recallForInjection(query, options = {}) {
             profile: 'deep',
             // 跟读取路径一致：本角色的 + owner 共享的都能被回忆起（否则一般记忆永远进不了注入）
             includeGeneral: true,
+            includeDiary: options.includeDiary === true,
             // 注入不算回忆（2026-10-30）：不刷新 accessed_count/last_accessed_at，
             // 否则"被注入 → 排名更高 → 更常被注入"会自己滚雪球（实测 lore 行 200~306 次）。
             countAccess: false,
@@ -325,6 +326,7 @@ export async function recallForInjection(query, options = {}) {
                 project: options.project,
                 characterId: options.characterId,
                 includeGeneral: true,
+                includeDiary: options.includeDiary === true,
                 limit: options.maxAnchors ?? 2,
             });
         }

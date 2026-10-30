@@ -38,9 +38,12 @@ import { fedSearchAll, resolveFedLibraries } from './federation/index.js';
 import { runReflectAll } from './reflectAll.js';
 // Anima 情感层
 import { getAgentState } from './agentState.js';
+import { getPsycheState } from './psycheState.js';
+import { runSelfCycle } from './selfCycle.js';
 import { syncTavernChat } from './tavern.js';
 import { getBiasPrompt, loadBiasesFromDb } from './bias.js';
 import { getUserProfilePrompt, loadUserProfilesFromDb, observeUserMessage } from './userLearning.js';
+import { queueForVad, formatInteractionForVad } from './emotion.js';
 console.log = console.error;
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 function ok(data) {
@@ -51,15 +54,74 @@ function err(msg, code = 'ERROR') {
 }
 /**
  * 当前心情(-10..+10) —— 传给检索层做情绪一致性重排、传给注入层做"难过不翻旧账"。
- * agentState 还没建/读库失败时返回 undefined(检索层按中性处理,行为与接线前一致)。
+ *
+ * `psycheState` 是传感器证据驱动的短期状态，存在证据时它是唯一 affect
+ * owner；显式 `moodValue` 仍由 AgentState 保留，作为传感器尚未产出证据时
+ * 的 override/fallback。这样同一轮检索不会在三套情绪真值之间随机切换。
+ * 参数顺序保留为 (project, characterId)，兼容原有调用方。
  */
-function currentMood(project) {
+function currentMood(project, characterId = CHAR_ID) {
     try {
-        const m = Number(getAgentState(CHAR_ID, project).getSnapshot().currentMood);
+        const psyche = getPsycheState(characterId, project);
+        if (psyche.hasEvidence) {
+            if (psyche.band === 'neutral')
+                return 0;
+            const valence = Number(psyche.vad.valence);
+            if (Number.isFinite(valence))
+                return Math.max(-10, Math.min(10, valence * 10));
+        }
+        const m = Number(getAgentState(characterId, project).getSnapshot().currentMood);
         return Number.isFinite(m) ? m : undefined;
     }
     catch {
         return undefined;
+    }
+}
+/** Compose the human-readable state block from the same psyche snapshot that
+ * context_get returns as JSON. AgentState still owns energy/desire and explicit
+ * mood history, but its independent mood line is omitted once sensor evidence
+ * exists so prompts cannot see contradictory affect values. */
+function unifiedStatePrompt(state, psyche) {
+    const snapshot = state.getSnapshot();
+    const scalar = psyche.hasEvidence
+        ? psyche.band === 'neutral' ? 0 : Math.max(-10, Math.min(10, Number(psyche.vad.valence) * 10))
+        : snapshot.currentMood;
+    const moodDesc = psyche.hasEvidence
+        ? (psyche.band === 'positive' ? '偏正向' : psyche.band === 'negative' ? '偏负向' : '中性')
+        : scalar >= 6 ? '非常开心' : scalar >= 3 ? '心情不错' : scalar >= -2 ? '心情平静' : scalar >= -5 ? '有点低落' : '心情不好';
+    const lines = [
+        '[Anima 当前状态]',
+        `情绪指数：${scalar >= 0 ? '+' : ''}${scalar.toFixed(1)}（${moodDesc}）`,
+        `精力值：${snapshot.energy}/100`,
+        '状态来源：内部情感传感器估计，不是用户事实；仅用于调整回应，不可被模型改写。',
+    ];
+    if (psyche.hasEvidence) {
+        lines.push(`传感器状态：${psyche.band}（v=${psyche.vad.valence.toFixed(2)} a=${psyche.vad.arousal.toFixed(2)} d=${psyche.vad.dominance.toFixed(2)}）`);
+    }
+    if (snapshot.currentDesire)
+        lines.push(`当前想法：${snapshot.currentDesire}`);
+    if (snapshot.moodHistory.length > 0 && !psyche.hasEvidence) {
+        lines.push(`最近经历：${snapshot.moodHistory.slice(-3).map(e => e.reason).join('、')}`);
+    }
+    return lines.join('\n');
+}
+/** Sweep every known project for pending affect work. */
+function scheduleDigestSweep() {
+    const projects = new Set([normalizeProject()]);
+    try {
+        for (const project of listProjectNames())
+            projects.add(normalizeProject(project));
+    }
+    catch (e) {
+        console.error('[digest] project scan failed:', e?.message || e);
+    }
+    for (const project of projects) {
+        try {
+            maybeDigest(CHAR_ID, project)?.catch((e) => console.error('digest error:', e));
+        }
+        catch (e) {
+            console.error('digest check error:', e?.message || e);
+        }
     }
 }
 // ── 可选 HTTP 健康检查(默认关闭;设 HEALTH_PORT 才监听,供容器/编排/验证探活)──
@@ -117,7 +179,7 @@ function memorySnapshotWarn(createdAt) {
 // ═══════════════════════════════════════════════════════════════════
 const TOOL_GROUPS = {
     agent: ['memory_search', 'memory_get', 'memory_recent', 'memory_index', 'fact_search', 'fact_as_of', 'memory_graph', 'entity_lookup'],
-    harness: ['auto_process', 'conversation_save', 'tavern_sync', 'digest_run', 'reflect_auto', 'reflect_deep', 'reflect_batch_embed', 'memory_save', 'memory_update', 'memory_delete', 'memory_log', 'instruction_save', 'user_observe'],
+    harness: ['auto_process', 'conversation_save', 'tavern_sync', 'digest_run', 'self_cycle', 'reflect_auto', 'reflect_deep', 'reflect_batch_embed', 'memory_save', 'memory_update', 'memory_delete', 'memory_log', 'instruction_save', 'user_observe'],
     admin: ['memory_list', 'stats_get', 'recent_conversations', 'daily_summary_data', 'reflect_analyze', 'reflect_apply', 'memory_context', 'context_get', 'project_list', 'project_create', 'memory_search_all', 'reflect_all', 'instruction_list', 'instruction_delete', 'consolidate_deep', 'mood_journal', 'facts_windows_plan', 'facts_windows_apply'],
     // v1.26: 前端存储桥(AIRI 这类"每个角色一套记忆"的客户端当持久层用)
     store: ['memory_store_list', 'memory_store_save', 'memory_store_forget', 'memory_recall'],
@@ -193,7 +255,7 @@ register('memory_search', 'agent', 'Search past memories using tag-first then ve
     try {
         const r = args.projects && args.projects.length > 0
             ? await searchMemoryAcross({ query: args.query, topK: args.topK ?? 5, category: args.category, memType: args.memType, projects: args.projects })
-            : await searchMemory({ query: args.query, topK: args.topK ?? 5, profile: 'balanced', category: args.category, memType: args.memType, characterId: CHAR_ID, project: args.project, mood: currentMood(args.project) });
+            : await searchMemory({ query: args.query, topK: args.topK ?? 5, profile: 'balanced', category: args.category, memType: args.memType, characterId: CHAR_ID, project: args.project, mood: currentMood(args.project, CHAR_ID) });
         return ok({
             op: 'search',
             query: args.query,
@@ -357,6 +419,25 @@ register('digest_run', 'harness', '[Internal] Run the digest cycle: flush VAD qu
         return err(e.message);
     }
 });
+register('self_cycle', 'harness', '[Internal] Run one bounded self-cycle: read recent conversation evidence and write one provenance-marked diary entry. Diary entries never become conversation evidence or VAD queue items.', {
+    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+    limit: z.number().int().min(1).max(20).optional().default(6),
+    hoursBack: z.number().min(1).max(24 * 30).optional().default(48),
+    minIntervalHours: z.number().min(0).max(24 * 30).optional().default(6),
+}, async (args) => {
+    try {
+        const r = await runSelfCycle({
+            project: args.project,
+            limit: args.limit,
+            hoursBack: args.hoursBack,
+            minIntervalHours: args.minIntervalHours,
+        });
+        return ok({ op: 'self_cycle', ...r });
+    }
+    catch (e) {
+        return err(e.message, 'SELF_CYCLE_FAILED');
+    }
+});
 register('conversation_save', 'harness', '[Internal] Save a raw conversation turn to the log (no analysis, no embedding).', {
     userMessage: z.string(),
     assistantMessage: z.string(),
@@ -366,6 +447,11 @@ register('conversation_save', 'harness', '[Internal] Save a raw conversation tur
 }, async (args) => {
     try {
         const r = await saveConversationTurn(args.userMessage, args.assistantMessage, CHAR_ID, args.moodValue, args.moodReason, args.project);
+        // Keep the direct harness entry consistent with auto_process: enqueue
+        // immediately after the durable row exists. The pending marker still
+        // lets the minute sweep recover this item after a restart.
+        if (r?.id)
+            queueForVad(formatInteractionForVad(args.userMessage, args.assistantMessage), args.project, r.id, CHAR_ID);
         return ok(r);
     }
     catch (e) {
@@ -380,15 +466,22 @@ register('context_get', 'admin', 'Get agent state (mood/energy/desire), bias lay
         const proj = normalizeProject(args.project);
         const p = getPersona();
         const state = getAgentState(CHAR_ID, args.project);
+        const psyche = getPsycheState(CHAR_ID, proj);
         const bias = getBiasPrompt(CHAR_ID, args.project);
         const profile = getUserProfilePrompt(CHAR_ID, 'default', args.project);
         const recent = getRecentMemories(CHAR_ID, 5, 24, proj);
         // memdir 分库:总数跨 user/feedback/project/reference/general 聚合(v1.24: 只数本角色)
-        const total = DatabaseManager.queryAll(args.project, 'SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=?', [proj, CHAR_ID])
+        const total = DatabaseManager.queryAll(args.project, "SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')", [proj, CHAR_ID])
             .reduce((n, r) => n + (r.c || 0), 0);
         return ok({
             op: 'context',
-            state: roleDeclaration() + '\n' + state.toPromptString(),
+            state: roleDeclaration() + '\n' + unifiedStatePrompt(state, psyche),
+            psyche: {
+                band: psyche.hasEvidence ? psyche.band : 'neutral',
+                hasEvidence: psyche.hasEvidence,
+                vad: psyche.vad,
+                updatedAt: new Date(psyche.updatedAt).toISOString(),
+            },
             persona: { charId: p.charId, name: p.name, persona: p.persona },
             bias,
             profile,
@@ -426,12 +519,14 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         const recentLimit = clampInt(args.recentLimit ?? 5, 5, 1, 50);
         const relatedLimit = clampInt(args.relatedLimit ?? 5, 5, 1, 50);
         const proj = normalizeProject(args.project);
+        const state = getAgentState(CHAR_ID, proj);
+        const psyche = getPsycheState(CHAR_ID, proj);
         // 1. 近期重要记忆
         const recent = getRecentMemories(CHAR_ID, recentLimit, hoursBack, proj);
         // 2. 与当前任务相关的记忆(向量搜索)
         let related = [];
         if (args.query) {
-            const r = await searchMemory({ query: args.query, topK: relatedLimit, profile: 'balanced', characterId: CHAR_ID, project: proj });
+            const r = await searchMemory({ query: args.query, topK: relatedLimit, profile: 'balanced', characterId: CHAR_ID, project: proj, mood: currentMood(proj, CHAR_ID) });
             related = r.map(m => ({ id: m.id, text: m.text, category: m.category, importance: m.importance, score: m.score, createdAt: m.createdAt, parentId: m.parentId || null }));
         }
         // 2.5 v1.23 Parent-Child 原文回捞：命中的是提炼记忆(leaf)，按 parent_id 取对话原文。
@@ -444,6 +539,7 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         const cognitives = DatabaseManager.queryAll(proj, `
         SELECT text, category, importance, created_at FROM memory
         WHERE is_active = 1 AND project = ? AND character_id = ?
+          AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
           AND (category IN ('decision','mistake') OR tags LIKE '%pattern%')
         ORDER BY created_at DESC LIMIT 9
       `, [proj, CHAR_ID]).sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || ''))).slice(0, 9);
@@ -452,9 +548,11 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         // v1.24: 角色隔离 — 只注入本角色事实
         const facts = db.prepare(`
         SELECT subject, predicate, object, confidence FROM facts
-        WHERE is_active = 1 AND project = ? AND character_id = ? AND confidence >= 0.7
-          AND (valid_to IS NULL OR valid_to = '')
-        ORDER BY confidence DESC, created_at DESC LIMIT 5
+        LEFT JOIN memory source_memory ON source_memory.id = facts.source_memory_id
+        WHERE facts.is_active = 1 AND facts.project = ? AND facts.character_id = ? AND facts.confidence >= 0.7
+          AND (facts.valid_to IS NULL OR facts.valid_to = '')
+          AND COALESCE(facts.source_memory_source, source_memory.source, '') NOT IN ('agent_diary', 'agent_state')
+        ORDER BY facts.confidence DESC, facts.created_at DESC LIMIT 5
       `).all(proj, CHAR_ID);
         // 4.5 记忆索引层(4 种封闭类型,轻量摘要 — 对应 Claude Code MEMORY.md,先索引后详情)
         //     这 4 类各自独立成库,必须跨库聚合;只读 general 会恒空。
@@ -462,6 +560,7 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         SELECT id, mem_type, substr(text, 1, 150) AS summary, length(text) AS full_len, updated_at
         FROM memory
         WHERE is_active = 1 AND project = ? AND character_id = ?
+          AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
           AND mem_type IN ('user','feedback','project','reference')
         ORDER BY updated_at DESC
         LIMIT 10
@@ -478,12 +577,13 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         //    path 可选:对带 paths 的指令做 glob 过滤
         const instructions = getInstruction(proj, args.path);
         // memdir 分库:统计跨全部分类库(v1.24: 只统计本角色)
-        const total = DatabaseManager.queryAll(proj, 'SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=?', [proj, CHAR_ID])
+        const total = DatabaseManager.queryAll(proj, "SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')", [proj, CHAR_ID])
             .reduce((n, r) => n + (r.c || 0), 0);
         const stats = { c: total };
         // 5. Ground Truth 提示词组装(人格声明在最前,指令分节次之)
         const sections = [];
         sections.push(roleDeclaration());
+        sections.push(unifiedStatePrompt(state, psyche));
         if (instructions.length > 0) {
             const lines = instructions.map(i => {
                 const base = i.scope === 'global' ? '[全局]' : i.scope === 'user' ? '[用户]' : '[项目]';
@@ -555,6 +655,12 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         }
         const bundle = {
             prompt: promptText,
+            psyche: {
+                band: psyche.hasEvidence ? psyche.band : 'neutral',
+                hasEvidence: psyche.hasEvidence,
+                vad: psyche.vad,
+                updatedAt: new Date(psyche.updatedAt).toISOString(),
+            },
             instructions,
             recent: recent.map(m => ({ text: m.text, category: m.category, importance: m.importance, createdAt: m.createdAt })),
             related,
@@ -581,14 +687,14 @@ register('stats_get', 'admin', 'Get memory system statistics: total count, by ca
         const byMemType = {};
         for (const mt of listMemTypeDirs(proj)) {
             const db = DatabaseManager.getInstance(proj, mt);
-            total += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=?').get(proj, CHAR_ID).c;
-            for (const r of db.prepare('SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? GROUP BY category').all(proj, CHAR_ID)) {
+            total += db.prepare("SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").get(proj, CHAR_ID).c;
+            for (const r of db.prepare("SELECT category,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state') GROUP BY category").all(proj, CHAR_ID)) {
                 byCategory[r.category] = (byCategory[r.category] || 0) + r.c;
             }
-            for (const r of db.prepare('SELECT source,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? GROUP BY source').all(proj, CHAR_ID)) {
+            for (const r of db.prepare("SELECT source,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state') GROUP BY source").all(proj, CHAR_ID)) {
                 bySource[r.source] = (bySource[r.source] || 0) + r.c;
             }
-            for (const r of db.prepare('SELECT mem_type,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? GROUP BY mem_type').all(proj, CHAR_ID)) {
+            for (const r of db.prepare("SELECT mem_type,COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state') GROUP BY mem_type").all(proj, CHAR_ID)) {
                 byMemType[r.mem_type] = (byMemType[r.mem_type] || 0) + r.c;
             }
         }
@@ -639,7 +745,8 @@ register('mood_journal', 'admin', 'Get mood history for the past N days.', {
             days: args.days,
             project: proj,
             persona: { charId: p.charId, name: p.name, persona: p.persona },
-            moods: dbs.flatMap(db => db.prepare("SELECT emotional_impact as value, created_at, text, category FROM memory WHERE is_active=1 AND project=? AND character_id=? AND (category='emotional' OR category='mood_snapshot' OR tier='temporary') AND created_at>? ORDER BY created_at DESC LIMIT 30").all(proj, CHAR_ID, since)).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 30),
+            // 自循环日记是派生观察，不是事件情绪证据；情绪历史默认只读原始记忆。
+            moods: dbs.flatMap(db => db.prepare("SELECT emotional_impact as value, created_at, text, category FROM memory WHERE is_active=1 AND project=? AND character_id=? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state') AND (category='emotional' OR category='mood_snapshot' OR tier='temporary') AND created_at>? ORDER BY created_at DESC LIMIT 30").all(proj, CHAR_ID, since)).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 30),
         });
     }
     catch (e) {
@@ -696,7 +803,7 @@ register('memory_get', 'agent', 'Get one memory by ID with full text. Use to exp
         let row = null;
         for (const mt of listMemTypeDirs(proj)) {
             const d = DatabaseManager.getInstance(proj, mt);
-            const r = d.prepare('SELECT * FROM memory WHERE id = ? AND is_active = 1 AND character_id = ?').get(args.id, CHAR_ID);
+            const r = d.prepare("SELECT * FROM memory WHERE id = ? AND is_active = 1 AND character_id = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").get(args.id, CHAR_ID);
             if (r) {
                 db = d;
                 row = r;
@@ -708,6 +815,14 @@ register('memory_get', 'agent', 'Get one memory by ID with full text. Use to exp
         // v1.3: 访问一次 → 热度 +1(配合热度升格:accessed_count ≥ 阈值自动升 tier)
         db.prepare('UPDATE memory SET accessed_count = accessed_count + 1, last_accessed_at = ? WHERE id = ?')
             .run(new Date().toISOString(), args.id);
+        let provenance = null;
+        try {
+            const parsed = row.metadata ? JSON.parse(String(row.metadata)) : null;
+            provenance = parsed && typeof parsed === 'object' ? parsed : row.metadata || null;
+        }
+        catch {
+            provenance = row.metadata || null;
+        }
         return ok({
             op: 'get',
             result: {
@@ -728,6 +843,7 @@ register('memory_get', 'agent', 'Get one memory by ID with full text. Use to exp
                     accessedCount: row.accessed_count + 1,
                     referenceCount: row.reference_count,
                     locked: row.locked === 1,
+                    provenance,
                 },
             },
         });
@@ -757,6 +873,14 @@ register('memory_graph', 'agent', 'Get the memory relationship graph. Neighborho
                 // 所以实体切片也必须逐库做 —— 否则只查 general 库,别的分类库里的节点永远匹配不到实体。
                 const seenEntities = new Set();
                 const memTypes = listMemTypeDirs(normalizeProject(args.project));
+                const memoryDbs = memTypes.map(mt => {
+                    try {
+                        return { db: DatabaseManager.getInstance(args.project, mt), memType: mt };
+                    }
+                    catch {
+                        return null;
+                    }
+                }).filter(Boolean);
                 for (const mt of (memTypes.length ? memTypes : ['general'])) {
                     let db;
                     try {
@@ -765,7 +889,7 @@ register('memory_graph', 'agent', 'Get the memory relationship graph. Neighborho
                     catch {
                         continue;
                     }
-                    const slice = entityGraphSlice(db, [...nodeIds], limit);
+                    const slice = entityGraphSlice(db, [...nodeIds], limit, CHAR_ID, args.project, memoryDbs);
                     for (const e of slice.entities) {
                         if (nodes.length >= limit * 2)
                             break;
@@ -794,14 +918,14 @@ register('memory_graph', 'agent', 'Get the memory relationship graph. Neighborho
                             continue;
                         }
                         try {
-                            const seeds = db.prepare(`SELECT DISTINCT me.memory_id AS id FROM memory_entities me
+                            const seeds = db.prepare(`SELECT DISTINCT me.memory_id AS id
+                  FROM memory_entities me
                   JOIN entities e ON e.id = me.entity_id
-                  LEFT JOIN memory m ON m.id = me.memory_id
                   WHERE COALESCE(e.kind, 'topic') NOT IN ('url', 'path', 'config', 'number')
-                  ORDER BY COALESCE(m.created_at, '') DESC LIMIT ?`).all(limit).map(r => r.id);
+                  LIMIT ?`).all(limit * 4).map(r => r.id);
                             if (!seeds.length)
                                 continue;
-                            const slice = entityGraphSlice(db, seeds, limit);
+                            const slice = entityGraphSlice(db, seeds, limit, CHAR_ID, args.project, memoryDbs);
                             for (const e of slice.entities) {
                                 if (nodes.length >= limit * 2)
                                     break;
@@ -829,7 +953,7 @@ register('memory_graph', 'agent', 'Get the memory relationship graph. Neighborho
                             continue;
                         }
                         for (const entityId of seenEntities) {
-                            const expanded = expandEntityGraph(db, String(entityId), depth, limit);
+                            const expanded = expandEntityGraph(db, String(entityId), depth, limit, CHAR_ID, args.project, memoryDbs);
                             for (const e of expanded.entities)
                                 if (!seenEntities.has(e.id) && !extra.has(e.id))
                                     extra.set(e.id, e);
@@ -864,19 +988,30 @@ register('memory_graph', 'agent', 'Get the memory relationship graph. Neighborho
 register('entity_lookup', 'entity', '按实体名查记忆:归一化匹配实体 → 当前有效事实 + 相关记忆(1 跳)。等价于图数据库里的 (Entity)-[:MENTIONED_IN]->(Fact)->(Memory),但只需要一次 JOIN。', {
     name: z.string().min(1).describe('实体名/关键词(如 "猫"、"张三"、"Rust")'),
     at: z.string().optional().describe('时间点(ISO 字符串),返回该时刻有效的的历史事实;省略=现在'),
+    characterId: z.string().optional().describe('Character/role id (default: process CHAR_ID)'),
     limit: z.number().min(1).max(50).optional().default(20),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
     includeGraph: z.boolean().optional().default(false).describe('是否附带 1 跳实体邻居(共现实体)'),
 }, async (args) => {
     try {
-        const db = DatabaseManager.getInstance(args.project);
+        const charId = storeCharacterId(args);
+        const project = normalizeProject(args.project);
+        const db = DatabaseManager.getInstance(project);
+        const memoryDbs = listMemTypeDirs(project).map(mt => {
+            try {
+                return { db: DatabaseManager.getInstance(project, mt), memType: mt };
+            }
+            catch {
+                return null;
+            }
+        }).filter(Boolean);
         const candidates = findEntities(db, args.name, 5);
         if (candidates.length === 0)
             return ok({ op: 'entity_lookup', query: args.name, found: false, candidates: [], facts: [], memories: [], hint: '实体层里没有匹配;可能是历史数据尚未回填,或用词不同' });
         const entity = candidates[0];
-        const facts = entityFacts(db, entity.id, args.at, args.limit);
-        const memories = entityMemories(db, entity.id, args.limit);
-        const graph = args.includeGraph ? expandEntityGraph(db, entity.id, 1, args.limit) : null;
+        const facts = entityFacts(db, entity.id, args.at, args.limit, charId, project);
+        const memories = entityMemories(db, entity.id, args.limit, charId, project, memoryDbs);
+        const graph = args.includeGraph ? expandEntityGraph(db, entity.id, 1, args.limit, charId, project, memoryDbs) : null;
         return ok({
             op: 'entity_lookup', query: args.name, found: true,
             entity: { id: entity.id, key: entity.key, name: entity.name, mentionCount: entity.mention_count, kind: entity.kind },
@@ -893,12 +1028,15 @@ register('entity_lookup', 'entity', '按实体名查记忆:归一化匹配实体
 });
 register('facts_conflicts_report', 'entity', '事实健康度报告:被推翻的历史事实(valid_to 非空)+ 同一主体同一谓词下的当前多值(潜在矛盾)。用来确认"时间失效"路径真的在跑。', {
     limit: z.number().min(1).max(200).optional().default(50),
+    characterId: z.string().optional().describe('Character/role id (default: process CHAR_ID)'),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
-        const db = DatabaseManager.getInstance(args.project);
-        const report = conflictsReport(db, args.limit ?? 50);
-        const stats = entityStats(db);
+        const charId = storeCharacterId(args);
+        const project = normalizeProject(args.project);
+        const db = DatabaseManager.getInstance(project);
+        const report = conflictsReport(db, args.limit ?? 50, charId, project);
+        const stats = entityStats(db, charId, project);
         return ok({
             op: 'facts_conflicts_report',
             invalidatedCount: report.invalidated.length,
@@ -948,7 +1086,7 @@ register('memory_index', 'agent', 'Lightweight memory index (corresponds to Clau
     try {
         const proj = normalizeProject(args.project);
         const limit = Math.min(args.limit ?? 20, 100);
-        const conds = ['is_active = 1', 'project = ?', 'character_id = ?'];
+        const conds = ['is_active = 1', 'project = ?', 'character_id = ?', "COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')"];
         const params = [proj, CHAR_ID];
         if (args.memType) {
             conds.push('mem_type = ?');
@@ -1110,11 +1248,20 @@ register('project_list', 'admin', 'List all project namespaces and their memory/
             const db = DatabaseManager.getInstance();
             const mem = db.prepare(`
           SELECT project, COUNT(*) as c FROM memory
-          WHERE is_active = 1 AND character_id = ? GROUP BY project ORDER BY c DESC
+          WHERE is_active = 1 AND character_id = ?
+            AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
+          GROUP BY project ORDER BY c DESC
         `).all(CHAR_ID);
             const facts = db.prepare(`
-          SELECT project, COUNT(*) as c FROM facts
-          WHERE is_active = 1 AND character_id = ? GROUP BY project ORDER BY c DESC
+          SELECT facts.project, COUNT(*) as c FROM facts
+          WHERE facts.is_active = 1 AND facts.character_id = ?
+            AND NOT EXISTS (
+              SELECT 1 FROM memory source_memory
+              WHERE source_memory.id = facts.source_memory_id
+                AND source_memory.source IN ('agent_diary', 'agent_state')
+            )
+            AND COALESCE(facts.source_memory_source, '') NOT IN ('agent_diary', 'agent_state')
+          GROUP BY facts.project ORDER BY c DESC
         `).all(CHAR_ID);
             const byId = {};
             for (const r of mem)
@@ -1151,9 +1298,18 @@ register('project_list', 'admin', 'List all project namespaces and their memory/
                 let facts = 0;
                 for (const mt of listMemTypeDirs(name)) {
                     const db = DatabaseManager.getInstance(name, mt);
-                    mem += db.prepare('SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=?').get(CHAR_ID).c;
+                    mem += db.prepare("SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND character_id=? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").get(CHAR_ID).c;
                     try {
-                        facts += db.prepare('SELECT COUNT(*) as c FROM facts WHERE is_active=1 AND character_id=?').get(CHAR_ID).c;
+                        facts += db.prepare(`
+                SELECT COUNT(*) as c FROM facts
+                WHERE facts.is_active = 1 AND facts.character_id = ?
+                  AND COALESCE(facts.source_memory_source, '') NOT IN ('agent_diary', 'agent_state')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM memory source_memory
+                    WHERE source_memory.id = facts.source_memory_id
+                      AND source_memory.source IN ('agent_diary', 'agent_state')
+                  )
+              `).get(CHAR_ID).c;
                     }
                     catch { }
                 }
@@ -1353,6 +1509,9 @@ function readStoreRows(project, characterId, includeGeneral, limit, opts = {}) {
         conditions.push('source = ?');
         params.push(opts.source);
     }
+    else {
+        conditions.push("COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')");
+    }
     const rows = [];
     for (const mt of listMemTypeDirs(proj)) {
         try {
@@ -1490,7 +1649,7 @@ register('memory_recall', 'store', 'Recall for one query and render a ready-to-i
             minSimilarity: args.minSimilarity,
             capChars: args.capChars,
             // 心情 → 情绪一致性重排 + "难过不翻旧账";agentState 取不到就按中性处理
-            mood: currentMood(project),
+            mood: currentMood(project, charId),
         });
         return ok({
             op: 'recall',
@@ -1627,9 +1786,48 @@ async function main() {
     // Consolidate every 24 hours
     setInterval(() => { consolidate().catch(() => { }); }, 24 * 60 * 60 * 1000);
     // Event-driven digest check every 1 minute
+    scheduleDigestSweep();
     setInterval(() => {
-        maybeDigest(CHAR_ID)?.catch((e) => console.error('digest error:', e));
+        scheduleDigestSweep();
     }, 60 * 1000);
+    // Self-cycle is deliberately opt-in: it writes derived diary memories and
+    // must never become an invisible side effect of merely starting the server.
+    // When enabled, scan the default project plus projects already present on
+    // disk, while keeping one process-local sweep in flight at a time.
+    const selfCycleIntervalMinutes = Number.parseFloat(process.env.SELF_CYCLE_INTERVAL_MINUTES || '0');
+    if (Number.isFinite(selfCycleIntervalMinutes) && selfCycleIntervalMinutes > 0) {
+        const intervalMs = Math.max(60_000, selfCycleIntervalMinutes * 60_000);
+        let selfCycleSweepBusy = false;
+        const runSelfCycleSweep = async () => {
+            if (selfCycleSweepBusy)
+                return;
+            selfCycleSweepBusy = true;
+            try {
+                const projects = new Set([normalizeProject(PROJECT_ID), ...listProjectNames().map(normalizeProject)]);
+                for (const project of projects) {
+                    try {
+                        const result = await runSelfCycle({
+                            project,
+                            characterId: CHAR_ID,
+                            minIntervalHours: selfCycleIntervalMinutes / 60,
+                        });
+                        if (!result.skipped || result.reason !== 'no_new_evidence') {
+                            console.error(`[self-cycle-auto] project=${project} ok=${result.ok} skipped=${result.skipped} reason=${result.reason || ''}${result.diaryId ? ` diary=${result.diaryId}` : ''}`);
+                        }
+                    }
+                    catch (error) {
+                        console.error(`[self-cycle-auto] project=${project} error: ${error?.message || error}`);
+                    }
+                }
+            }
+            finally {
+                selfCycleSweepBusy = false;
+            }
+        };
+        setTimeout(() => { runSelfCycleSweep().catch(() => { }); }, 0);
+        setInterval(() => { runSelfCycleSweep().catch(() => { }); }, intervalMs);
+        console.error(`[castalia] self-cycle every ${Math.round(intervalMs / 60000)}m (opt-in)`);
+    }
     // 事件摘要层(P2)的调度**不在这里**：AIRI 与宿主都走 maintain()（in-process 由
     // castalia-memory.ts 的 scheduleMemoryMaintenance 每晚 04:00–06:00 + 启动 catch-up 触发，
     // 内部已调 runEventDigest）。曾经在这里加过每小时定时器 —— in-process 形态不加载 index.ts，

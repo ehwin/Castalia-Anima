@@ -141,7 +141,8 @@ export async function runEventDigest(options: EventDigestOptions = {}): Promise<
         FROM memory m
         LEFT JOIN event_digest_progress p ON p.conversation_id = m.id
         WHERE m.source = 'conversation_log' AND m.is_active = 1 AND m.project = ?
-          AND m.character_id = ? AND m.created_at >= ? AND p.conversation_id IS NULL
+          AND m.character_id = ?
+          AND m.created_at >= ? AND p.conversation_id IS NULL
         ORDER BY m.created_at ASC
         LIMIT ?
       `).all(proj, cid, cutoff, limit) as any[];

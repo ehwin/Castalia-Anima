@@ -100,14 +100,14 @@ export interface ReflectAllResult {
  * 增量反思账本(v1.29,移植自 Lite 的同款设计,但落在**进程内文件**上:
  * Anima 没有 web 任务表,也不需要 —— 账本就住在 bank 根,谁跑谁读)。
  *
- * 键 = instance|project|id|sha1(text)[:12]:带内容哈希,所以记忆被 update 后会重新入列,
- * 只按 id 记会永久漏掉改动后的内容。
+ * 键 = instance|project|character|id|sha1(text)[:12]:角色也纳入作用域，避免同一账本文件
+ * 被不同角色进程共享时互相跳过；带内容哈希所以记忆被 update 后会重新入列。
  */
 export interface ReflectLedger { version: 1; seen: Record<string, string>; updatedAt?: string }
 
 export function reflectRecordKey(r: { instance: string; project: string; id: string; text: string }): string {
   const h = crypto.createHash('sha1').update(String(r.text || '')).digest('hex').slice(0, 12);
-  return `${r.instance}|${r.project}|${r.id}|${h}`;
+  return `${r.instance}|${r.project}|${CHAR_ID}|${r.id}|${h}`;
 }
 
 /** 账本路径:REFLECT_LEDGER_FILE > <REFLECT_DIR|MEMORY_DB_DIR>/reflect-ledger.json */
@@ -178,9 +178,12 @@ function scanLibrary(lib: FedLibrary, limit: number): { rows: any[]; error?: str
       SELECT id, text, mem_type, importance, created_at
       FROM memory
       WHERE is_active = 1
+        AND project = ?
+        AND character_id = ?
+        AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
       ORDER BY created_at DESC
       LIMIT ?
-    `).all(limit) as any[];
+    `).all(lib.project, CHAR_ID, limit) as any[];
     return { rows };
   } catch (e: any) {
     return { rows: [], error: `[${lib.instance}/${lib.project}] 读取失败: ${e.message}` };
@@ -450,7 +453,9 @@ export async function runReflectAll(opts?: ReflectAllOptions): Promise<ReflectAl
         const db = openReflect(mt);
         if (!existingByType.has(mt)) {
           let rows: Array<{ id: string; text: string }> = [];
-          try { rows = db.prepare('SELECT id, text FROM memory WHERE is_active = 1 AND character_id = ? LIMIT 5000').all(CHAR_ID) as any[]; } catch {}
+          try {
+            rows = db.prepare("SELECT id, text FROM memory WHERE is_active = 1 AND project = 'reflect' AND character_id = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state') LIMIT 5000").all(CHAR_ID) as any[];
+          } catch {}
           existingByType.set(mt, rows);
         }
         // —— 质量闸(确定性,零 LLM):证据 / 复述 / 近重复 / 验证器重要度 ——
@@ -476,10 +481,12 @@ export async function runReflectAll(opts?: ReflectAllOptions): Promise<ReflectAl
         if (verdict.reasons.includes('summary-only')) { quality.summaryOnly++; continue; }
         if (verdict.duplicateOf) {
           quality.nearDuplicate++;
-          try { db.prepare('UPDATE memory SET reference_count = COALESCE(reference_count, 0) + 1, updated_at = ? WHERE id = ?').run(now, verdict.duplicateOf); } catch {}
+          try {
+            db.prepare("UPDATE memory SET reference_count = COALESCE(reference_count, 0) + 1, updated_at = ? WHERE id = ? AND project = 'reflect' AND character_id = ? AND is_active = 1 AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").run(now, verdict.duplicateOf, CHAR_ID);
+          } catch {}
           continue;
         }
-        const exists = db.prepare('SELECT 1 FROM memory WHERE is_active = 1 AND text = ? AND character_id = ?').get(ins.text, CHAR_ID);
+        const exists = db.prepare("SELECT 1 FROM memory WHERE is_active = 1 AND project = 'reflect' AND text = ? AND character_id = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").get(ins.text, CHAR_ID);
         if (exists) { skipped++; continue; }
         const markers = ins.sources.map(s => `${s.instance}:${s.project}`);
         const tags = [...new Set([...ins.tags, ...markers])];
