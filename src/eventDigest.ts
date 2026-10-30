@@ -22,6 +22,7 @@ import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { saveMemory } from './store.js';
 import { CHAR_ID, normalizeProject } from './env.js';
 import { callLlm, makeLlmChannel, parseJsonRobust } from './reflectionLlm.js';
+import { localDayOf } from './dayKey.js';
 
 export interface EventDigestOptions {
   project?: string;
@@ -81,8 +82,10 @@ function ensure(db: any): void {
 }
 
 function dayOf(iso: string): string {
-  // 兼容 "2026-10-30T..." 与 "2026-10-30 12:00:00"
-  return String(iso).slice(0, 10);
+  // 必须按本地日历日分桶：created_at 是 UTC ISO，切前 10 位在 UTC+8 会把本地
+  // 00:00–08:00 的对话算进前一天（2026-10-29T17:03Z = 本地 10-30 01:03），
+  // 而「今天/昨天」问句走的是本地日 —— 两套口径错开就查不到（见 dayKey.ts）。
+  return localDayOf(iso);
 }
 
 /** 摘录必须真的出现在原文里（子串校验，去掉「」与空白后比对） */
@@ -114,6 +117,9 @@ export async function runEventDigest(options: EventDigestOptions = {}): Promise<
   for (const mt of listMemTypeDirs(proj)) {
     let dbi: any;
     try { dbi = DatabaseManager.getInstance(proj, mt) } catch { continue }
+    // 进度表要建在**每个**分类库里：JOIN 一张不存在的表会抛 no such table，
+    // 而下面的 catch 为"该库没有这些表"准备 —— 结果是那个库里的对话被静默跳过、永远不整理。
+    ensure(dbi);
     try {
       const found = dbi.prepare(`
         SELECT m.id, m.text, m.created_at

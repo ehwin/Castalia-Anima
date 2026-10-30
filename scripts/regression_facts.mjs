@@ -40,7 +40,9 @@ globalThis.fetch = async url => {
 const project = 'anima-facts';
 const sourceId = 'anima-source-1';
 const m = await saveMemory({ project, text: '用户说：今天想休息一下。', memType: 'general', source: 'conversation_log' });
-findDbByMemoryId(m.id, project).db.prepare("UPDATE memory SET id=?, is_active=0, created_at='2026-01-01T00:00:00.000Z' WHERE id=?").run(sourceId, m.id);
+// is_active 必须留 1：2026-10-29 起软删的对话不再作为抽取来源（reflectionSources 加 AND is_active=1），
+// 这里要造的是"还没被分析的一轮对话"，软删它等于没有来源 —— 实测会得到「无未分析对话」。
+findDbByMemoryId(m.id, project).db.prepare("UPDATE memory SET id=?, is_active=1, created_at='2026-01-01T00:00:00.000Z' WHERE id=?").run(sourceId, m.id);
 
 const batch = [{ id: sourceId, text: '用户说：今天想休息一下。' }];
 const extraction = facts => JSON.stringify({

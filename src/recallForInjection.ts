@@ -17,6 +17,7 @@
 import type { SearchResult } from './search.js';
 import { recallFactsForQuery } from './factRecall.js';
 import { recallTemporalForQuery } from './temporalRecall.js';
+import { localDayOffset } from './dayKey.js';
 import { searchMemory } from './search.js';
 
 export interface InjectionOptions {
@@ -129,10 +130,8 @@ export const INJECTION_DEFAULTS = {
  */
 export function temporalDaysOf(query: string): Set<string> {
   const out = new Set<string>();
-  const day = (offset: number) => {
-    const d = new Date(Date.now() - offset * 86400000);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-  };
+  // 与事件层分桶同一个口径（dayKey.ts）：本地日历日，跨零点而不是跨 24 小时。
+  const day = (offset: number) => localDayOffset(offset);
   if (/前天/.test(query)) out.add(day(2));
   if (/昨天|昨晚|昨日/.test(query)) out.add(day(1));
   if (/今天|今晚|刚才|刚刚/.test(query)) out.add(day(0));

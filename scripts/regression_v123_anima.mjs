@@ -344,8 +344,10 @@ check(!listed.includes(sup.id), 'listAllMemories skips superseded memories');
   const BP = 'anima-backoff';
   const src = await saveMemory({ project: BP, text: '退避验证用来源：端口 3318。', memType: 'general', source: 'conversation_log' });
   const srcId = 'backoff-src';
+  // is_active=1：2026-10-29 起软删的对话不再作为抽取来源，软删这里会得到「无未分析对话」(ok:true/skipped)，
+  // 于是一个**该失败**的反思被当成成功，退避也就测不到。
   findDbByMemoryId(src.id, BP).db
-    .prepare("UPDATE memory SET id=?, is_active=0, created_at='2026-01-01T00:00:00.000Z' WHERE id=?")
+    .prepare("UPDATE memory SET id=?, is_active=1, created_at='2026-01-01T00:00:00.000Z' WHERE id=?")
     .run(srcId, src.id);
   reply = '{"summary":"partial","actions":[';
   const failed = await runAutoReflect('airi', 10, BP);
