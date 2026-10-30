@@ -62,6 +62,17 @@ function quoteIsReal(quote, haystack) {
         return false;
     return haystack.replace(/\s/g, '').includes(q);
 }
+/**
+ * progress 该记哪些对话（纯函数，便于钉死）。
+ * - 这一天没出错：整天都算整理过（模型说"没什么可记"也是有效结论）。
+ * - 出了错且有对话被覆盖：只记被覆盖的，其余留待下一轮重试。
+ * - 出了错但一条都没覆盖：仍记整天 —— 空集会让同一批原料每轮重烧 token，而错误已在日志里。
+ */
+export function progressIdsToMark(dayRows, dayFailed, covered) {
+    if (!dayFailed || covered.size === 0)
+        return dayRows;
+    return dayRows.filter(r => covered.has(r.id));
+}
 export async function runEventDigest(options = {}) {
     const proj = normalizeProject(options.project);
     const cid = options.characterId || CHAR_ID;
@@ -226,7 +237,7 @@ export async function runEventDigest(options = {}) {
             // 其余留到下一轮重试 —— 否则一次模型打偏就把那批原料永久标成"已整理"、再也回不来。
             // 全天一条都没保住（covered 为空）时不收缩：空集标记等于每轮重烧同一批 token，而日志已记下错误。
             const dayFailed = result.errors.some(e => e.startsWith(`${day}:`));
-            const toMark = dayFailed && consumedIds.size > 0 ? dayRows.filter(r => consumedIds.has(r.id)) : dayRows;
+            const toMark = progressIdsToMark(dayRows, dayFailed, consumedIds);
             if (dayFailed && toMark.length < dayRows.length) {
                 result.errors.push(`${day}: 仅 ${toMark.length}/${dayRows.length} 条对话被事件覆盖，其余留待重试`);
             }
