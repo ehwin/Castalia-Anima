@@ -1,14 +1,89 @@
 {
   "spec_version": 1,
   "engine": "castalia-anima",
-  "variant": "memory-only",
+  "variant": "memory-panel",
   "engine_version": "2.0.0",
-  "generated_by": "Castalia Anima 单记忆版",
+  "generated_by": "Castalia Anima 记忆+面板版",
   "notes": [
-    "单记忆版不带面板：引擎不声明任何可调项，宿主读到空 groups 应把「心智参数」整块隐藏。",
-    "空清单 ≠ 没有清单：没有清单（心智版）表示「按完整清单画」，空 groups 表示「一个都别画」。",
-    "要调检索权重/注入门槛，用 memory-panel 分支。"
+    "宿主（如 AIRI 的「心智参数」面板）按本文件生成表单：只画这里列出的键，默认值取这里的 default。",
+    "本变体没有情感状态机，所以不含 band / halfLife / mood / gain / trait / evidence 六组；面板应隐藏这些组。",
+    "restart=true 的键是模块级常量，改完必须重启后端进程才生效。"
   ],
-  "groups": {},
+  "groups": {
+    "search": [
+      {
+        "key": "WEIGHT_CONSISTENCY",
+        "kind": "number",
+        "default": 1.0,
+        "min": 0,
+        "max": 3,
+        "step": 0.01,
+        "restart": true,
+        "label": { "zh": "权重 · 相关性", "en": "Weight · relevance" }
+      },
+      {
+        "key": "WEIGHT_EMOTION",
+        "kind": "number",
+        "default": 0.12,
+        "min": 0,
+        "max": 2,
+        "step": 0.01,
+        "restart": true,
+        "label": { "zh": "权重 · 情感强度", "en": "Weight · emotion" },
+        "hint": { "zh": "记忆自身 VAD/emotional_impact 的强度；同等相关时的偏好项", "en": "Strength of the memory's own VAD/impact; a preference term among equally relevant rows" }
+      },
+      {
+        "key": "WEIGHT_TIME",
+        "kind": "number",
+        "default": 0.03,
+        "min": 0,
+        "max": 1,
+        "step": 0.01,
+        "restart": true,
+        "label": { "zh": "权重 · 时间衰减", "en": "Weight · recency" }
+      },
+      {
+        "key": "WEIGHT_DEVIATION",
+        "kind": "number",
+        "default": 0.1,
+        "min": 0,
+        "max": 1,
+        "step": 0.01,
+        "restart": true,
+        "label": { "zh": "权重 · 偏离加成", "en": "Weight · deviation" },
+        "hint": { "zh": "低相似 + 高情绪 = 珍贵瞬间的额外加成", "en": "Low similarity + high emotion = bonus for the unforgettable bits" }
+      }
+    ],
+    "inject": [
+      {
+        "key": "MEMORY_INJECT_MIN_SIM_LEXICAL",
+        "kind": "number",
+        "default": 0.2,
+        "min": 0,
+        "max": 1,
+        "step": 0.01,
+        "label": { "zh": "注入门槛 · 词法", "en": "Inject threshold · lexical" },
+        "hint": { "zh": "抬到 0.35 会让纯词法部署召回掉到 0", "en": "Raising to 0.35 zeroes recall on lexical-only deployments" }
+      },
+      {
+        "key": "MEMORY_INJECT_MIN_SIM",
+        "kind": "number",
+        "default": 0.5,
+        "min": 0,
+        "max": 1,
+        "step": 0.01,
+        "label": { "zh": "注入门槛 · 相似度", "en": "Inject threshold · similarity" }
+      },
+      {
+        "key": "MEMORY_INJECT_STRONG",
+        "kind": "number",
+        "default": 0.5,
+        "min": 0,
+        "max": 1,
+        "step": 0.01,
+        "label": { "zh": "证据门 · 至少一条强命中", "en": "Evidence gate · one strong hit" }
+      }
+    ]
+  },
   "presets": {}
 }

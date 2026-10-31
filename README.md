@@ -124,7 +124,39 @@ node dist/plugins/fullPipeline/cli.js --all
 `--dry-run`、`--all`、`--json`。需要 `config.json` 的 `reflect` 通道可用。
 每个独立记忆体想要「总反思」，就把这个 CLI 挂到它自己的调度器上 —— 一库一套，不设中心越权。
 
-## 7. 测试
+## 7. 面板对接（`tuning-support.json`）
+
+这个变体保留「记忆 + 面板」：宿主（如 AIRI 的「心智参数」面板）不需要认识引擎内部，只要读
+`tuning-support.json` 就能生成**真实生效**的表单：
+
+```json
+{
+  "spec_version": 1,
+  "engine": "castalia-anima",
+  "variant": "memory-panel",
+  "groups": {
+    "search": [ { "key": "WEIGHT_CONSISTENCY", "kind": "number", "default": 1.0, "min": 0, "max": 3, "step": 0.01, "restart": true, "label": {…} }, … ],
+    "inject": [ { "key": "MEMORY_INJECT_MIN_SIM", "default": 0.5, … }, … ]
+  },
+  "presets": {}
+}
+```
+
+三条约定：
+
+1. **只画清单里的键**。本变体没有情感状态机，所以清单里没有 `PSYCHE_*` / `ANIMA_*`——
+   面板应把 band / halfLife / mood / gain / trait / evidence 六组整组隐藏，而不是给一排死开关。
+2. **默认值取清单里的 `default`**，不要用宿主自己那份（不同变体的权重默认值不同：
+   本变体是 1.00 / 0.12 / 0.03 / 0.10）。
+3. `restart: true` 的键是模块级常量，改完必须重启后端进程。
+
+契约测试（断言每个键真的被引擎读、默认值与代码一致、清单里没有 psyche 键）：
+
+```bash
+node scripts/test_tuning_surface.mjs   # 19 断言
+```
+
+## 8. 测试
 
 ```bash
 npm run build
@@ -140,7 +172,7 @@ for f in scripts/regression_*.mjs scripts/test_*.mjs; do echo "== $f"; node "$f"
 测试全部用临时库（`mkdtemp`），不读写 `MEMORY_DB_DIR` 之外的东西；不需要真实 LLM
 （自带 mock 通道）也不需要网络。
 
-## 8. 与「完整 Anima」的差异（本包是子集）
+## 9. 与「完整 Anima」的差异（本包是子集）
 
 | 模块 | 状态 |
 |---|---|
@@ -152,7 +184,7 @@ for f in scripts/regression_*.mjs scripts/test_*.mjs; do echo "== $f"; node "$f"
 | `psyche_state` / `psyche_events` 表、`psyche_*` 迁移 | 已移除（旧库若带这些表，引擎不会读也不会写，可手工 DROP） |
 | VAD 分析、情感列、情感加权检索、衰减与显著性 | **保留**（这是"情感记忆体"的本体） |
 
-## 9. 目录
+## 10. 目录
 
 ```
 dist/            编译产物（含 dist/plugins/fullPipeline/cli.js）
@@ -163,6 +195,6 @@ integrations/    SillyTavern 桥（可选）
 memory/          运行时库目录（默认空 + config.example.json）
 ```
 
-## 10. 许可证
+## 11. 许可证
 
 MIT，见 `LICENSE`。
