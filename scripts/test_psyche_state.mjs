@@ -152,16 +152,50 @@ check('late event cannot move updatedAt backwards', () => {
 const held = psyche.transitionPsycheState(event, {
   kind: 'event',
   eventId: 'e2',
-  delta: { valence: -0.6 },
+  delta: { valence: -0.19 },
 }, 3600000, { eventGain: 1 });
-check('band hysteresis holds a positive label near the boundary', () => {
-  assert.ok(held.vad.valence > 0.1 && held.vad.valence < 0.25);
+check('band hysteresis holds a positive label just below the entry threshold', () => {
+  // Bands are measured against the personality baseline now, so the hold zone is
+  // baseline +0.10 .. +0.25 rather than an absolute 0.10 .. 0.25.
+  const rel = held.vad.valence - held.baseline.valence;
+  assert.ok(rel > 0.1 && rel < 0.25);
   assert.equal(held.band, 'positive');
 });
 
 const recovered = psyche.transitionPsycheState(event, { kind: 'no_event' }, 3600000 * 240);
 check('long elapsed time returns toward personality baseline', () => {
   assert.ok(Math.abs(recovered.vad.valence - baseline.baseline.valence) < 0.001);
+});
+
+// Regression: bands used to be absolute, so a baseline of +0.40 sat above the
+// +0.25 entry threshold and every decay converged on "positive" — a negative
+// event turned into "偏正向" after ~10 days of silence.
+check('decayed baseline is neutral, not positive', () => {
+  assert.equal(recovered.band, 'neutral');
+  assert.equal(recovered.hasEvidence, false);
+});
+
+check('a negative event cannot decay into a positive label', () => {
+  const neg = psyche.transitionPsycheState(baseline, {
+    kind: 'target', eventId: 'neg-target', target: { valence: -0.9 },
+  }, 1000);
+  assert.equal(neg.band, 'negative');
+  const later = psyche.transitionPsycheState(neg, { kind: 'no_event' }, 1000 + 3600000 * 240);
+  assert.equal(later.band, 'neutral');
+  assert.equal(later.hasEvidence, false);
+});
+
+check('evidence expiry is configurable and hands the band back to neutral', () => {
+  const fresh = psyche.transitionPsycheState(baseline, {
+    kind: 'event', eventId: 'ttl-event', delta: { valence: 1 },
+  }, 0, { eventGain: 1, evidenceTtlHours: 6 });
+  assert.equal(fresh.hasEvidence, true);
+  assert.equal(fresh.band, 'positive');
+  const within = psyche.transitionPsycheState(fresh, { kind: 'no_event' }, 3600000 * 3, { evidenceTtlHours: 6 });
+  assert.equal(within.hasEvidence, true);
+  const expired = psyche.transitionPsycheState(within, { kind: 'no_event' }, 3600000 * 9, { evidenceTtlHours: 6 });
+  assert.equal(expired.hasEvidence, false);
+  assert.equal(expired.band, 'neutral');
 });
 
 const readKey = 'test-read-decay';

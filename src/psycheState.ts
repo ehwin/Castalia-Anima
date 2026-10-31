@@ -34,6 +34,8 @@ export interface PsycheAppraisal {
 export interface PsycheState {
   version: number;
   hasEvidence: boolean;
+  /** Last time an appraisal was actually applied (not the last read). Drives evidence expiry. */
+  lastEvidenceAt: number;
   baseline: PsycheVAD;
   vad: PsycheVAD;
   band: AffectBand;
@@ -45,6 +47,8 @@ export interface PsycheTransitionOptions {
   eventGain?: number;
   halfLifeHours?: Partial<PsycheVAD>;
   maxProcessedEvents?: number;
+  /** Evidence older than this stops owning the visible band, so AgentState mood can take over again. */
+  evidenceTtlHours?: number;
   /** Require the state write to reach SQLite before the caller commits its evidence row. */
   requirePersistence?: boolean;
 }
@@ -54,6 +58,9 @@ export const DEFAULT_PSYCHE_BASELINE: PsycheVAD = {
   arousal: 0.3,
   dominance: 0.6,
 };
+
+/** 3× the valence half-life: leftover deviation is ~12%, i.e. no longer an observation. */
+export const DEFAULT_EVIDENCE_TTL_HOURS = 72;
 
 const psycheStates = new Map<string, PsycheState>();
 const loadedKeys = new Set<string>();
@@ -75,13 +82,19 @@ function finite(value: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-function bandFor(valence: number, previous?: AffectBand): AffectBand {
+function bandFor(valence: number, baselineValence: number, previous?: AffectBand): AffectBand {
   // Hysteresis prevents a model hovering around a boundary from changing the
   // externally visible label on every turn.
-  if (previous === 'positive' && valence > 0.1) return 'positive';
-  if (previous === 'negative' && valence < -0.1) return 'negative';
-  if (valence >= 0.25) return 'positive';
-  if (valence <= -0.25) return 'negative';
+  //
+  // The label is measured against the personality baseline, not against zero:
+  // the default baseline is +0.40, so an absolute ±0.25 threshold could never
+  // be re-crossed by decay (it converges on 0.40 → permanently "positive",
+  // and a negative event used to flip to "positive" after ~10 days of silence).
+  const rel = valence - baselineValence;
+  if (previous === 'positive' && rel > 0.1) return 'positive';
+  if (previous === 'negative' && rel < -0.1) return 'negative';
+  if (rel >= 0.25) return 'positive';
+  if (rel <= -0.25) return 'negative';
   return 'neutral';
 }
 
@@ -103,6 +116,7 @@ export function createPsycheState(
   return {
     version: 1,
     hasEvidence: false,
+    lastEvidenceAt: -1,
     baseline: b,
     vad: { ...b },
     // Personality baseline is not an observed affect event. Keep the visible
@@ -194,8 +208,23 @@ export function transitionPsycheState(
   // An absolute target is still observed evidence. Without this branch the
   // Ollama path could move `vad` while callers kept treating the state as
   // sensor-empty and fell back to the unrelated AgentState mood scalar.
-  const hasEvidence = previous.hasEvidence
-    || (statusAccepted && (effectiveKind === 'event' || effectiveKind === 'target' || effectiveKind === 'neutral'));
+  //
+  // Evidence also has a shelf life: `updatedAt` follows reads (decay), so it
+  // cannot answer "when was the last real observation". Without an expiry the
+  // first appraisal owns the visible band forever and AgentState mood never
+  // gets the state back, even after days of pure `abstain`.
+  const evidenceTtlHours = finite(options.evidenceTtlHours) !== undefined
+    ? Math.max(1, Number(options.evidenceTtlHours))
+    : DEFAULT_EVIDENCE_TTL_HOURS;
+  // -1 means "never observed"; 0 is a legitimate timestamp in tests and replays.
+  const evidenceAgeHours = previous.lastEvidenceAt >= 0
+    ? (effectiveNow - previous.lastEvidenceAt) / 3600000
+    : Number.POSITIVE_INFINITY;
+  const evidenceFresh = previous.hasEvidence && evidenceAgeHours <= evidenceTtlHours;
+  const observedNow = statusAccepted
+    && (effectiveKind === 'event' || effectiveKind === 'target' || effectiveKind === 'neutral');
+  const hasEvidence = observedNow || evidenceFresh;
+  const lastEvidenceAt = shouldApply ? effectiveNow : previous.lastEvidenceAt;
   const holdNeutralBand = previous.hasEvidence
     && previous.band === 'neutral'
     && effectiveKind === 'no_event';
@@ -204,6 +233,7 @@ export function transitionPsycheState(
   return {
     version: previous.version + (shouldApply ? 1 : 0),
     hasEvidence,
+    lastEvidenceAt,
     baseline: { ...previous.baseline },
     vad: next,
     band: hasEvidence
@@ -213,7 +243,7 @@ export function transitionPsycheState(
           ? previous.band
           : holdNeutralBand
             ? 'neutral'
-            : bandFor(next.valence, previous.band))
+            : bandFor(next.valence, previous.baseline.valence, previous.band))
       : 'neutral',
     updatedAt: effectiveNow,
     processedEventIds,
@@ -253,9 +283,17 @@ function parsePersistedStateRow(row: any): PsycheState | null {
     if (Array.isArray(parsed)) processed = parsed.map(String).filter(Boolean).slice(-128);
   } catch { /* recover from malformed event history */ }
   const updatedAt = Number(row.updated_at);
+  const hasEvidence = Number(row.has_evidence) === 1;
+  const storedEvidenceAt = Number(row.last_evidence_at);
   return {
     version: Math.max(1, Number(row.version) || 1),
-    hasEvidence: Number(row.has_evidence) === 1,
+    hasEvidence,
+    // Rows written before the column existed still need a usable clock; the
+    // persisted `updated_at` only moves on accepted appraisals, so it is the
+    // closest available answer.
+    lastEvidenceAt: Number.isFinite(storedEvidenceAt) && storedEvidenceAt >= 0
+      ? storedEvidenceAt
+      : (hasEvidence && Number.isFinite(updatedAt) ? updatedAt : -1),
     baseline,
     vad,
     band: row.band === 'positive' || row.band === 'negative' ? row.band : 'neutral',
@@ -267,7 +305,7 @@ function parsePersistedStateRow(row: any): PsycheState | null {
 function readPersistedStateFromDb(db: any, characterId: string, project: string): PsycheState | null {
   const row = db.prepare(`
     SELECT version, has_evidence, baseline_valence, baseline_arousal, baseline_dominance,
-           vad_valence, vad_arousal, vad_dominance, band, updated_at, processed_event_ids
+           vad_valence, vad_arousal, vad_dominance, band, updated_at, last_evidence_at, processed_event_ids
     FROM psyche_state WHERE project = ? AND character_id = ?
   `).get(project, characterId) as any;
   return parsePersistedStateRow(row);
@@ -296,8 +334,8 @@ function persistState(characterId: string, project: string | undefined, state: P
       INSERT INTO psyche_state (
         project, character_id, version, has_evidence,
         baseline_valence, baseline_arousal, baseline_dominance,
-        vad_valence, vad_arousal, vad_dominance, band, updated_at, processed_event_ids
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        vad_valence, vad_arousal, vad_dominance, band, updated_at, last_evidence_at, processed_event_ids
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(project, character_id) DO UPDATE SET
         version = excluded.version,
         has_evidence = excluded.has_evidence,
@@ -309,12 +347,13 @@ function persistState(characterId: string, project: string | undefined, state: P
         vad_dominance = excluded.vad_dominance,
         band = excluded.band,
         updated_at = excluded.updated_at,
+        last_evidence_at = excluded.last_evidence_at,
         processed_event_ids = excluded.processed_event_ids
     `).run(
       proj, characterId, state.version, state.hasEvidence ? 1 : 0,
       state.baseline.valence, state.baseline.arousal, state.baseline.dominance,
       state.vad.valence, state.vad.arousal, state.vad.dominance,
-      state.band, state.updatedAt, JSON.stringify(state.processedEventIds),
+      state.band, state.updatedAt, state.lastEvidenceAt, JSON.stringify(state.processedEventIds),
     );
     persistWarnings.delete(stateKey(characterId, project));
     return true;
@@ -391,8 +430,8 @@ export function applyPsycheAppraisal(
         INSERT INTO psyche_state (
           project, character_id, version, has_evidence,
           baseline_valence, baseline_arousal, baseline_dominance,
-          vad_valence, vad_arousal, vad_dominance, band, updated_at, processed_event_ids
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          vad_valence, vad_arousal, vad_dominance, band, updated_at, last_evidence_at, processed_event_ids
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(project, character_id) DO UPDATE SET
           version = excluded.version,
           has_evidence = excluded.has_evidence,
@@ -404,12 +443,13 @@ export function applyPsycheAppraisal(
           vad_dominance = excluded.vad_dominance,
           band = excluded.band,
           updated_at = excluded.updated_at,
+          last_evidence_at = excluded.last_evidence_at,
           processed_event_ids = excluded.processed_event_ids
       `).run(
         proj, characterId, next.version, next.hasEvidence ? 1 : 0,
         next.baseline.valence, next.baseline.arousal, next.baseline.dominance,
         next.vad.valence, next.vad.arousal, next.vad.dominance,
-        next.band, next.updatedAt, JSON.stringify(next.processedEventIds),
+        next.band, next.updatedAt, next.lastEvidenceAt, JSON.stringify(next.processedEventIds),
       );
       db.exec('COMMIT');
       persisted = true;

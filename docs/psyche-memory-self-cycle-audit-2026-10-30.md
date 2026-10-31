@@ -98,6 +98,16 @@ facts 增加 `source_memory_source`、`source_memory_mem_type`，并移除不适
 
 收尾修复位于 `src/store.ts` 的 `saveFacts()`：来源查找从 best-effort 改为写入前硬拒绝，并统一使用规范化的 project/character。新增 `scripts/regression_facts_provenance.mjs`，实体回归增加未知来源和跨角色来源断言。未覆盖生产副本 `D:\\castalia\\run\\Castalia-Anima\\dist`。
 
+### 2026-10-31 复核后修复：band 相对基线与证据有效期
+
+复核发现两处会让状态机持续出错的实现偏差，已修并补断言（`src/psycheState.ts`、`src/db.ts`、`scripts/test_psyche_state.mjs`）：
+
+1. **band 判定从绝对阈值改为相对人格基线**。基线 valence 是 `+0.40`，而进入阈值是 `±0.25`：衰减永远收敛到基线，于是"任何一次事件之后 band 必然 positive"，负向事件静默约 10 天后会翻成 `positive`（实跑：`-0.315 → 静默 240h → v=0.399 → positive`）。现在 `rel = valence - baseline.valence`，进入 `±0.25`、维持 `±0.10`，负向衰减落回 `neutral`。
+2. **`hasEvidence` 有了有效期**。原先一旦观测到证据就永不复位，AgentState 的 `moodValue` 会被永久遮蔽。新增 `psyche_state.last_evidence_at`（`-1` = 从未观测，`0` 是合法时间戳）与 `DEFAULT_EVIDENCE_TTL_HOURS = 72`（3×valence 半衰期），过期后 `hasEvidence=false`、band 回 `neutral`，mood 回退到 AgentState。TTL 可用 `transitionPsycheState(..., { evidenceTtlHours })` 覆盖。
+3. 测试补齐 3 条：衰减后基线必须是 `neutral`、负向事件不能衰减成 `positive`、TTL 过期交还 band。hysteresis 用例改为相对基线表述（原用例把绝对 0.14 当"仍在正区"，在新语义下它低于基线 0.26，属负区）。
+
+未改的部分：批次粒度（一次 flush 最多 15 条只推进一次 psyche）、`self_cycle` 的模板化输出、日记没有自动读取方——这三条属于设计取舍，见 `psyche-full-chain-upgrade-report-2026-10-31.md` §7。
+
 ## 验证
 
 已通过：

@@ -498,6 +498,7 @@ export function initProjectSchema(db: Database.Database) {
       vad_dominance REAL NOT NULL,
       band TEXT NOT NULL DEFAULT 'neutral',
       updated_at INTEGER NOT NULL,
+      last_evidence_at INTEGER,
       processed_event_ids TEXT NOT NULL DEFAULT '[]',
       PRIMARY KEY (project, character_id)
     );
@@ -518,6 +519,7 @@ export function initProjectSchema(db: Database.Database) {
 
   // Safe column migrations (may already exist)
   const migrations = [
+    `ALTER TABLE psyche_state ADD COLUMN last_evidence_at INTEGER`,
     `ALTER TABLE memory ADD COLUMN tier TEXT DEFAULT 'standard'`,
     `ALTER TABLE memory ADD COLUMN expires_at DATETIME`,
     `ALTER TABLE memory ADD COLUMN agent_mood TEXT`,
