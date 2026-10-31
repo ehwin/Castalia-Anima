@@ -2,10 +2,17 @@ import { recallFactsForQuery } from './factRecall.js';
 import { recallTemporalForQuery } from './temporalRecall.js';
 import { localDayOf, localDayOffset } from './dayKey.js';
 import { searchMemory, pinnedAnchors } from './search.js';
-import { injectionPolicy, moodFromScalar } from './emotionalRanking.js';
+import { injectionPolicy, policyAllowsInjection, moodFromScalar } from './emotionalRanking.js';
 export const INJECTION_DEFAULTS = {
     topK: 5,
     minSimilarity: 0.5,
+    // 词法门槛(2026-10-31):实测上调到 0.35 可把噪音注入率从 25~70% 压到 0~35%,
+    // 但 regression_cjk_recall 的三条断言证明它会**重现 2026-10-28 那个 bug**——
+    // 纯词法部署(无向量)里,一条真命中常常只有 0.25~0.3 的词法覆盖率,0.35 会把它丢掉,
+    // 于是"一条都注入不了"。所以默认值保持 0.2:
+    //   · 纯词法部署(EMBED_MODE=none 或嵌入端点不可用) → 用 0.2,否则召回归零;
+    //   · 有向量能力的部署 → 可显式设 MEMORY_INJECT_MIN_SIM_LEXICAL=0.35,实测净收益。
+    // 短查询的漏口由 isFillerQuery 单独处理,不需要靠抬高这个门槛。
     minSimilarityLexical: 0.2,
     // 2026-10-28:向量门槛 0.5 是"近重复"量级。实测 BAAI/bge-m3 上短问句 vs 长记忆的余弦
     // 普遍落在 0.42~0.55(相关问句 top 0.476~0.522,噪音 top 0.415~0.487 —— **两者重叠**,
@@ -206,17 +213,31 @@ export function renderInjectionBlock(hits, options = {}) {
     // 情绪合宜性(2026-10-30):难过的当下不主动翻旧账。情绪显著度落在"中"档、且与当前心情同调的记忆
     // 降为背景(不注入);锚点不受影响(sad 时更该记得约定,而不是回避)。
     // 只在调用方给了 mood、且重排确实算出 salience 时生效 —— 没数据就不猜。
+    // 2026-10-31 修: `injectionPolicy` 有四种返回值(always/inject/context-only/skip)。
+    // 原来只排除 context-only，**skip 反而被保留** —— 低显著度记忆照样进注入。
+    // 现在两种都排除，并分开计数（skip 不该算成"被情绪压掉"）。
     const moodVec = options.mood == null ? null : moodFromScalar(options.mood);
     let kept = keptHits;
     if (moodVec) {
+        let moodSuppressed = 0;
+        let policySuppressed = 0;
         kept = keptHits.filter(h => {
             const s = Number(h.salience);
             if (!Number.isFinite(s))
                 return true;
-            return injectionPolicy(s, { pinned: h.pinned, mood: moodVec }) !== 'context-only';
+            const policy = injectionPolicy(s, { pinned: h.pinned, mood: moodVec });
+            if (policyAllowsInjection(policy))
+                return true;
+            if (policy === 'skip')
+                policySuppressed++;
+            else
+                moodSuppressed++;
+            return false;
         });
-        if (kept.length !== keptHits.length)
-            stats.moodSuppressed = keptHits.length - kept.length;
+        if (policySuppressed > 0)
+            stats.policySuppressed = (Number(stats.policySuppressed) || 0) + policySuppressed;
+        if (moodSuppressed > 0)
+            stats.moodSuppressed = (Number(stats.moodSuppressed) || 0) + moodSuppressed;
     }
     // 锚点无条件排在最前;它们不占 topK 的名额(钉了两条就当两条都在),但共用字符预算。
     const keptIdSet = new Set(kept.map(h => String(h.id)));
@@ -274,6 +295,32 @@ export function renderInjectionBlock(hits, options = {}) {
     };
 }
 /**
+ * 纯语气词/寒暄查询：不需要记忆。
+ *
+ * 2026-10-31 实测：注入证据门对内含实指的问句有效，但 `嗯 / 好 / 在吗 / 继续 /
+ * 然后呢 / 为什么 / 你好 / 测试一下` 这类纯语气词会以 topSim 0.54~1.00 命中任意一条
+ * 记忆 —— 词法相似度是"命中比例"，单 bigram 命中即 1.0，门挡不住。
+ *
+ * 注意范围：换成外部真实语料（LCCC 300 条）复测后，这类纯语气词的拦截率是 0%——
+ * 真实用户短句大多自带实指（"我好饿" "我在值班"），误注入 19~36% 且**随查询变长而
+ * 升高**。所以本函数只修"线上确实会出现的纯语气词"这一小块，不是误注入的解；
+ * 主要漏口见 _测试/2026-10-31_注入实测/报告.md §10。别把它当通用防线。
+ * 只拦"没有实指"的短句：含数字、时间词、回指词的一律放行。
+ */
+export function isFillerQuery(q) {
+    const s = String(q ?? '').replace(/[\s\p{P}\p{S}]/gu, '');
+    if (!s)
+        return true;
+    if (/[0-9]/.test(s))
+        return false;
+    if (/以前|之前|那时|当时|昨天|今天|明天|上周|上个月|生日|约定|答应|那件事|还记得/.test(s))
+        return false;
+    // 8 字上限 + 全字符白名单。原来写 5 字，「哈哈哈哈哈哈」「嗯嗯嗯嗯嗯嗯」「在不在」
+    // 会在 6 字/含"不"处漏掉，同一种寒暄两种行为（评审 P2-5）。上限放到 8 后仍然要求
+    // **每个字**都在语气词集合里，所以「你母亲的死」「三年前的交易」这类实指短句照样放行。
+    return s.length <= 8 && /^[嗯啊哦好行对是的在了吗呢吧哈嘿嘻唉呀喂继续然后为什么你好测试一下不还啦呗喔噢呃额诶哎呦咯咧嗷么嘛要别]+$/.test(s);
+}
+/**
  * 召回 + 渲染。检索失败或没有过门槛的记忆时返回空文本（宁可没记忆，不可阻塞对话）。
  * 调用方负责超时与兜底。
  */
@@ -286,6 +333,10 @@ export async function recallForInjection(query, options = {}) {
     const trimmed = String(query ?? '').trim();
     if (trimmed.length === 0) {
         return { text: '', stats: { ...empty, skipped: 'no-hits' } };
+    }
+    if (isFillerQuery(trimmed)) {
+        // 与「检索了但没命中」分开：语气词是**没检索**，诊断行与统计不该混成一个原因。
+        return { text: '', stats: { ...empty, skipped: 'filler' } };
     }
     let hits = [];
     let vectorRouteFailed = false;

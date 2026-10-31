@@ -39,7 +39,7 @@ import { fedSearchAll, resolveFedLibraries } from './federation/index.js';
 import { runReflectAll } from './reflectAll.js';
 // Anima 情感层
 import { getAgentState } from './agentState.js';
-import { getPsycheState } from './psycheState.js';
+import { getPsycheState, absoluteMoodScalar, deviationMoodScalar } from './psycheState.js';
 import { runSelfCycle } from './selfCycle.js';
 import { syncTavernChat } from './tavern.js';
 import { getBiasPrompt, loadBiasesFromDb } from './bias.js';
@@ -57,20 +57,23 @@ function err(msg: string, code = 'ERROR') {
   return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: false, error: { code, message: msg } }, null, 2) }], isError: true as const };
 }
 /**
- * 当前心情(-10..+10) —— 传给检索层做情绪一致性重排、传给注入层做"难过不翻旧账"。
+ * 当前心情(−10..+10) —— 传给检索层做情绪一致性重排、传给注入层做"难过不翻旧账"。
  *
  * `psycheState` 是传感器证据驱动的短期状态，存在证据时它是唯一 affect
  * owner；显式 `moodValue` 仍由 AgentState 保留，作为传感器尚未产出证据时
  * 的 override/fallback。这样同一轮检索不会在三套情绪真值之间随机切换。
  * 参数顺序保留为 (project, characterId)，兼容原有调用方。
+ *
+ * 2026-10-31：返回的是**相对平时的偏置**（deviation），不是绝对愉悦度。
+ * 检索层问的是"比平时更冷还是更暖"；绝对数值（她平时就是 +4）走 absoluteMoodScalar，
+ * 用在提示词/展示，不参与一致性重排（否则一致性回忆会被永久推向正向记忆）。
  */
 function currentMood(project?: string, characterId: string = CHAR_ID): number | undefined {
   try {
     const psyche = getPsycheState(characterId, project);
     if (psyche.hasEvidence) {
-      if (psyche.band === 'neutral') return 0;
-      const valence = Number(psyche.vad.valence);
-      if (Number.isFinite(valence)) return Math.max(-10, Math.min(10, valence * 10));
+      const deviation = deviationMoodScalar(psyche.vad, psyche.baseline);
+      if (deviation !== undefined) return deviation;
     }
     const m = Number(getAgentState(characterId, project).getSnapshot().currentMood);
     return Number.isFinite(m) ? m : undefined;
@@ -83,9 +86,13 @@ function currentMood(project?: string, characterId: string = CHAR_ID): number | 
  * exists so prompts cannot see contradictory affect values. */
 function unifiedStatePrompt(state: ReturnType<typeof getAgentState>, psyche: ReturnType<typeof getPsycheState>): string {
   const snapshot = state.getSnapshot();
+  // 2026-10-31：与 currentMood 同一处修复 —— 绝对心境不再被相对 band 清零。
   const scalar = psyche.hasEvidence
-    ? psyche.band === 'neutral' ? 0 : Math.max(-10, Math.min(10, Number(psyche.vad.valence) * 10))
+    ? (absoluteMoodScalar(psyche.vad) ?? snapshot.currentMood)
     : snapshot.currentMood;
+  const deviation = psyche.hasEvidence
+    ? Number(psyche.vad.valence) - Number(psyche.baseline.valence)
+    : 0;
   const moodDesc = psyche.hasEvidence
     ? (psyche.band === 'positive' ? '偏正向' : psyche.band === 'negative' ? '偏负向' : '中性')
     : scalar >= 6 ? '非常开心' : scalar >= 3 ? '心情不错' : scalar >= -2 ? '心情平静' : scalar >= -5 ? '有点低落' : '心情不好';
@@ -96,7 +103,8 @@ function unifiedStatePrompt(state: ReturnType<typeof getAgentState>, psyche: Ret
     '状态来源：内部情感传感器估计，不是用户事实；仅用于调整回应，不可被模型改写。',
   ];
   if (psyche.hasEvidence) {
-    lines.push(`传感器状态：${psyche.band}（v=${psyche.vad.valence.toFixed(2)} a=${psyche.vad.arousal.toFixed(2)} d=${psyche.vad.dominance.toFixed(2)}）`);
+    // 把「绝对值 / 相对平时的偏差 / 标签 / 是否有证据」分开写，避免下游把三种量混用。
+    lines.push(`传感器状态：${psyche.band}（v=${psyche.vad.valence.toFixed(2)} a=${psyche.vad.arousal.toFixed(2)} d=${psyche.vad.dominance.toFixed(2)}；相对基线 ${deviation >= 0 ? '+' : ''}${deviation.toFixed(2)}，证据 ${psyche.hasEvidence ? '有效' : '已过期'}）`);
   }
   if (snapshot.currentDesire) lines.push(`当前想法：${snapshot.currentDesire}`);
   if (snapshot.moodHistory.length > 0 && !psyche.hasEvidence) {
@@ -561,6 +569,11 @@ register(
           band: psyche.hasEvidence ? psyche.band : 'neutral',
           hasEvidence: psyche.hasEvidence,
           vad: psyche.vad,
+          // 2026-10-31：显式分开，别让调用方把「相对 band」当「绝对心境」用。
+          absoluteValence: Number(psyche.vad.valence),
+          deviationFromBaseline: Number(psyche.vad.valence) - Number(psyche.baseline.valence),
+          arousal: Number(psyche.vad.arousal),
+          moodScalar: absoluteMoodScalar(psyche.vad) ?? null,
           updatedAt: new Date(psyche.updatedAt).toISOString(),
         },
         persona: { charId: p.charId, name: p.name, persona: p.persona },
@@ -763,6 +776,11 @@ register(
           band: psyche.hasEvidence ? psyche.band : 'neutral',
           hasEvidence: psyche.hasEvidence,
           vad: psyche.vad,
+          // 2026-10-31：显式分开，别让调用方把「相对 band」当「绝对心境」用。
+          absoluteValence: Number(psyche.vad.valence),
+          deviationFromBaseline: Number(psyche.vad.valence) - Number(psyche.baseline.valence),
+          arousal: Number(psyche.vad.arousal),
+          moodScalar: absoluteMoodScalar(psyche.vad) ?? null,
           updatedAt: new Date(psyche.updatedAt).toISOString(),
         },
         instructions,
@@ -927,8 +945,15 @@ register(
       }
       if (!row) return err('memory not found: ' + args.id, 'NOT_FOUND');
       // v1.3: 访问一次 → 热度 +1(配合热度升格:accessed_count ≥ 阈值自动升 tier)
+      // 2026-10-31: 同时写 memory_access_log。这条路径原来只加计数不写日志,
+      // 于是库里 accessed_count 已经 565、日志 0 行 —— ACT-R 的间隔效应完全拿不到数据。
+      const accessedAt = new Date().toISOString();
       db.prepare('UPDATE memory SET accessed_count = accessed_count + 1, last_accessed_at = ? WHERE id = ?')
-        .run(new Date().toISOString(), args.id);
+        .run(accessedAt, args.id);
+      try {
+        db.prepare('INSERT INTO memory_access_log (memory_id, project, accessed_at, channel) VALUES (?, ?, ?, ?)')
+          .run(args.id, proj, accessedAt, 'explicit_recall');
+      } catch { /* 老库没有日志表:计数仍然生效 */ }
       let provenance: unknown = null;
       try {
         const parsed = row.metadata ? JSON.parse(String(row.metadata)) : null;

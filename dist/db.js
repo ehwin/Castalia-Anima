@@ -534,6 +534,13 @@ export function initProjectSchema(db) {
       updated_at INTEGER NOT NULL,
       last_evidence_at INTEGER,
       processed_event_ids TEXT NOT NULL DEFAULT '[]',
+      -- 最近一次被采纳证据的重要性(0..1)。V&L 2014：持续时间由重要性与反刍决定。
+      salience REAL NOT NULL DEFAULT 0,
+      -- 慢层心境（E2/R10 的两层结构）：情绪向它回归，它向人格基线缓慢回落。
+      -- 为空时按人格基线初始化（旧库读出来的行等价于「心境=基线」）。
+      mood_valence REAL,
+      mood_arousal REAL,
+      mood_dominance REAL,
       PRIMARY KEY (project, character_id)
     );
 
@@ -576,6 +583,10 @@ export function initProjectSchema(db) {
     // Safe column migrations (may already exist)
     const migrations = [
         `ALTER TABLE psyche_state ADD COLUMN last_evidence_at INTEGER`,
+        `ALTER TABLE psyche_state ADD COLUMN salience REAL DEFAULT 0`,
+        `ALTER TABLE psyche_state ADD COLUMN mood_valence REAL`,
+        `ALTER TABLE psyche_state ADD COLUMN mood_arousal REAL`,
+        `ALTER TABLE psyche_state ADD COLUMN mood_dominance REAL`,
         `ALTER TABLE memory ADD COLUMN tier TEXT DEFAULT 'standard'`,
         `ALTER TABLE memory ADD COLUMN expires_at DATETIME`,
         `ALTER TABLE memory ADD COLUMN agent_mood TEXT`,

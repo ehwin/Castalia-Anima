@@ -34,7 +34,7 @@ search / recall / 注入 / 反思 / 整合 / 冷存 / 事实来源 / 实体图
   - 只有显式 includeDiary=true 才能翻到日记
 ```
 
-六条不变量，改任何一条都要先改审计文档：
+七条不变量，改任何一条都要先改审计文档：
 
 1. **先存证据，再入队**。不能先改 mood 再补记忆。
 2. 只有 VAD 写回**和** psyche 持久化都成功，队列项才提交为 `analyzed`；格式错、写失败、状态写失败一律保留可重试。
@@ -42,6 +42,7 @@ search / recall / 注入 / 反思 / 整合 / 冷存 / 事实来源 / 实体图
 4. psyche 的读—转移—写在 SQLite `BEGIN IMMEDIATE` 内完成，避免并发版本互相覆盖。
 5. 重放同一 `eventId` 不重复累加（幂等消费，最多记 128 个）。
 6. `agent_diary` 不重新进入 VAD、事实提取、实体来源、普通检索、上下文注入、反思、整合。日记是派生记录，不是用户事实，也不是下一轮自循环的输入。
+7. **原料行（`conversation_log` / `daily_event` / `agent_state` / `agent_diary`）不被任何自动路径标死**：反思 merge/split/delete、冷存、衰减、孤儿清扫都只写 `metadata` / `status` / `affect_status`，不改 `is_active`。一条对话被标死，`emotion.ts` 的 VAD 出队校验（要求 `is_active=1 AND source='conversation_log'`）就把它丢掉且永不重入队，情感证据从此缺失；`reflectionSources` 也不再把它当抽取来源。排除名单统一走 `memoryProvenance.excludeRawMaterialSql()`，不要在各文件里各写一份。人工遗忘（`memory_forget`）不受此限，但仍可 `restoreMemory` 取回。
 
 ## 模块地图
 
@@ -51,7 +52,7 @@ search / recall / 注入 / 反思 / 整合 / 冷存 / 事实来源 / 实体图
 | `emotion.ts` | VAD 队列（去重入队 / 批次分析 / 失败回队 / abstain）、Ollama VAD 与词表兜底、`applyPsycheAppraisal` 接线 |
 | `selfCycle.ts` | 自循环：读证据 → claim → 写日记 → 完成 claim；单飞、过期 claim 回收 |
 | `selfCycleCursor.ts` | `(created_at,rowid)` 游标比较（兼容 ISO 与 SQLite 两种时间格式） |
-| `memoryProvenance.ts` | 派生来源常量与 SQL 谓词（`publicMemorySourceSql` / `memorySourceWithoutStateSql`） |
+| `memoryProvenance.ts` | 派生来源常量与 SQL 谓词（`publicMemorySourceSql` / `memorySourceWithoutStateSql`）；原料行口径 `RAW_MATERIAL_SOURCES` / `excludeRawMaterialSql` |
 | `store.ts` | `saveMemory` / `saveSelfDiary` / `saveFacts`（来源硬校验）/ 存储桥 |
 | `db.ts` | schema v5：`psyche_state`、`self_cycle_runs`、日记 evidence 唯一索引、facts 来源列迁移 |
 | `search.ts` / `recallForInjection.ts` | 两段排序、门槛、注入；默认过滤派生来源 |
@@ -356,12 +357,12 @@ node scripts/memory_maintenance.mjs eval            [bank] [project]   # 小样�
 
 | 类别 | 数量 | 例子 |
 |---|---|---|
-| `regression_*.mjs` | 21 | `role_isolation`、`entities`、`facts_provenance`、`facts_migration`、`diary_isolation`、`self_cycle_process`、`psyche_parse`、`emotion_failure`、`emotion_status_source`、`duplicate_enqueue`、`restart_recovery`、`anima_audit`、`memory_injection`、`store_bridge`、`loop_closure` |
+| `regression_*.mjs` | 22 | `role_isolation`、`entities`、`facts_provenance`、`facts_migration`、`diary_isolation`、`raw_conversation_immutable`、`self_cycle_process`、`psyche_parse`、`emotion_failure`、`emotion_status_source`、`duplicate_enqueue`、`restart_recovery`、`anima_audit`、`memory_injection`、`store_bridge`、`loop_closure` |
 | `test_*.mjs` | 12 | `psyche_state`（状态机数学）、`self_cycle_cursor`（游标序）、`emotional_ranking`、`emotion_wiring`、`affect_lexicon` |
 | `audit_*.mjs` | 3 | `scale`（只读盘点所有 bank 并给结论）、`orphans`、`vector_space` |
 | `bench_*.mjs` + `eval_*.mjs` | 8 | `reflect_quality`、`insight_gates`、`insight_semantics`、`anima_idf`、`anima_redundancy`、`injection` |
 
-回归脚本贴着实现写断言（不是抽样）。**动 psyche / VAD / 日记 / 事实来源时**至少跑：`test_psyche_state`、`regression_psyche_parse`、`test_self_cycle_cursor`、`regression_self_cycle_process`、`regression_diary_isolation`、`regression_emotion_failure`、`regression_emotion_status_source`、`regression_duplicate_enqueue`、`regression_restart_recovery`、`regression_facts_provenance`、`regression_entities`、`regression_anima_audit`。
+回归脚本贴着实现写断言（不是抽样）。**动 psyche / VAD / 日记 / 事实来源 / 原料行软删路径时**至少跑：`test_psyche_state`、`regression_psyche_parse`、`test_self_cycle_cursor`、`regression_self_cycle_process`、`regression_diary_isolation`、`regression_raw_conversation_immutable`、`regression_emotion_failure`、`regression_emotion_status_source`、`regression_duplicate_enqueue`、`regression_restart_recovery`、`regression_facts_provenance`、`regression_entities`、`regression_anima_audit`。
 
 ### 2026-10-31 实跑记录（本次复核）
 
@@ -373,6 +374,7 @@ regression_psyche_parse                 → 12 cases passed
 test_self_cycle_cursor                  → PASS
 regression_self_cycle_process           → 10 checks
 regression_diary_isolation              → PASS
+regression_raw_conversation_immutable   → 27 checks（merge/split/delete/冷存/衰减/孤儿/人工遗忘/普通合并）
 regression_emotion_failure              → 13 / 0
 regression_emotion_status_source        → PASS
 regression_duplicate_enqueue            → PASS
@@ -398,7 +400,11 @@ test_affect_lexicon                     → 17 / 0
 
 ### 部署状态（别把构建当上线）
 
-`D:\castalia\run\Castalia-Anima\dist` 仍是**旧副本**：缺 `psycheState.js` / `selfCycle.js` / `selfCycleCursor.js` / `memoryProvenance.js`，`index.js` 与源码 `dist` 的 md5 不同（2026-10-31 核对）。上线要停宿主、整目录替换、校验 hash、启动后 smoke `context_get` / `self_cycle` / `auto_process`，并保留旧 dist 回滚。
+`D:\castalia\run\Castalia-Anima\dist` 与仓库 `dist` **已对齐**（2026-10-31 12:58 全量同步，同步前备份 `dist.bak-20261031-125817-rawconv`）：两份目录都是 50 个 `.js`，`reflect.js` / `store.js` / `orphan.js` / `reflectionSources.js` / `memoryProvenance.js` / `index.js` 的 md5 一致；`regression_raw_conversation_immutable` 直接对部署目录跑过（27 checks PASS）。
+
+> 2026-10-31 12:58 之前的说法（runtime dist 缺 `psycheState.js` / `selfCycle.js` / `selfCycleCursor.js` / `memoryProvenance.js`、`index.js` md5 不同）**已作废** —— 那些文件当时就在，差异只是缺 10-31 的那次编译。
+
+上线仍然要停宿主、整目录替换、校验 hash、启动后 smoke `context_get` / `self_cycle` / `auto_process`，并保留旧 dist 回滚。**改完 dist 必须重启常驻 `CastaliaNode` 桥**：已建立的 MCP 桥进程不会热加载新代码（本机当前有 14 个），重启前它们是旧行为。
 
 ## 已知缺口（写在这里，避免被当成已完成）
 

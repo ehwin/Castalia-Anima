@@ -20,7 +20,7 @@ import { computeBiasBoost } from './bias.js';
 import { computeDecay, computeBaseIntensity, computeRecency, isNightTime } from './emotion.js';
 import { parseTagsSafe } from './tags.js';
 import { chunkKnnSearch } from './chunkIndex.js';
-import { rankBySalience, moodFromScalar } from './emotionalRanking.js';
+import { rankBySalience, moodFromScalar, shouldCountAccess } from './emotionalRanking.js';
 import { memorySourceWithoutStateSql, publicMemorySourceSql } from './memoryProvenance.js';
 
 function visibleMemorySourceSql(alias: string, includeDiary?: boolean): string {
@@ -44,8 +44,34 @@ export { parseTagsSafe };
 // "同样相关时"的偏好,不再是主锚);偏差保留 0.10 让它那个"不像她的瞬间"特性仍然有效。
 const WEIGHT_CONSISTENCY = parseFloat(process.env.WEIGHT_CONSISTENCY || '1.00');  // 标签/语义匹配 — 主轴
 const WEIGHT_EMOTION     = parseFloat(process.env.WEIGHT_EMOTION || '0.12');      // 情感强度(同等相关时)
-const WEIGHT_TIME        = parseFloat(process.env.WEIGHT_TIME || '0.15');         // 时间衰减(回忆一次刷新时钟)
+const WEIGHT_TIME        = parseFloat(process.env.WEIGHT_TIME || '0.03'); // 时间衰减：0.15→0.03（R38：金标 R@1 68.1%→76.8%；回忆一次刷新时钟）
 const WEIGHT_DEVIATION   = parseFloat(process.env.WEIGHT_DEVIATION || '0.10');    // "不像她"的珍贵瞬间
+
+/**
+ * 向量路降级的可见性（2026-10-31）。
+ *
+ * 这两处原来是空 `catch`：embed 失败、vec_chunk 表不存在、vec_memory 为空，
+ * 在引擎侧全都表现为「检索正常返回，只是没有向量结果」。结果是一个部署可以
+ * 跑几个月都不知道自己的向量路是死的（论文 §3.3 只能靠库外探端口反推）。
+ *
+ * 只加日志与计数，不改控制流：向量故障仍按设计降级到词法通道（返回结果比返回
+ * 500 好），60s 内同类只报一条，避免刷屏。
+ */
+const _vectorWarnAt = new Map<string, number>();
+let vectorDegradedCount = 0;
+function warnVectorDegraded(kind: 'embed_or_knn' | 'chunk_knn', e: unknown): void {
+  vectorDegradedCount++;
+  const now = Date.now();
+  if (now - (_vectorWarnAt.get(kind) ?? 0) < 60_000) return;
+  _vectorWarnAt.set(kind, now);
+  const msg = (e as any)?.message ?? String(e);
+  console.warn(`[search] 向量路降级(${kind}): ${msg} —— 本次检索按词法继续；同类告警 60s 内静默`);
+}
+
+/** 向量路降级计数（自检口径，供 /health 与回归脚本断言）。 */
+export function getVectorDegradedCount(): number {
+  return vectorDegradedCount;
+}
 
 
 export interface SearchOptions {
@@ -153,13 +179,18 @@ function computeEmotionalIntensity(row: any): { emotionalIntensity: number; base
 }
 
 /** 统一评分:一致性 + 情感强度(主锚) + 时间衰减 + 偏离加成,乘 bias/importance/tier/access */
-function computeScore(row: any, similarity: number, project?: string): { score: number; biasBoost: number } {
+/**
+ * 单行打分。导出是为了让回归脚本能**直接**验「时间项还有多少分量」这类性质 ——
+ * 端到端比较会被相似度差异干扰（两条不同文本的相似度差 0.008 就能盖过时间项），
+ * 见 scripts/regression_superseded_recall.mjs §4。
+ */
+export function computeScore(row: any, similarity: number, project?: string): { score: number; biasBoost: number } {
   // v1.28: 时间衰减锚点用 last_accessed_at（缺失才回退 created_at）—— 回忆一次就刷新时钟。
   // 原来只认 created_at：半年前写下、昨天刚被反复用到的记忆，时间衰减分接近 0。
   const touchedAt = row.last_accessed_at || row.created_at;
   const hoursSinceTouched = (Date.now() - new Date(touchedAt).getTime()) / (1000 * 60 * 60);
   const { emotionalIntensity, isHighEmotion } = computeEmotionalIntensity(row);
-  const consistency = Math.min(Math.max(similarity, 0), 0.7);  // 上限 0.7,避免过度拟合人设
+  const consistency = Math.min(Math.max(similarity, 0), 0.95);  // 上限 0.95（R35：0.7→0.95，金标 R@1 52.3%→63.6%）
   const timeDecay = computeRecency(hoursSinceTouched);
   const deviationBonus = (similarity < 0.3 && isHighEmotion) ? 0.8 : 0;  // 低一致性+高情绪=珍贵"不像她"瞬间
   // 2026-10-28:这三个原来是**乘在总分上的**乘数(critical ×3.0、importance ×(0.5+imp)、
@@ -504,8 +535,10 @@ async function searchInDb(db: Database.Database, options: SearchOptions, memoryD
   const tagResults = tagSearch(db, scoped);
 
   // 标签结果足够好 → 直接返回
+  // 2026-10-31: 这条快速路径原来绕过 guard，既丢了 accessChannel（请求 explicit_recall
+  // 却记成 'search'），也不受渠道契约约束。改走同一个入口。
   if (tagResults.length >= topK && tagResults[0].score >= 0.5) {
-    if (scoped.countAccess !== false) updateAccessed(db, tagResults.slice(0, topK));
+    updateAccessedGuard(db, tagResults.slice(0, topK), scoped.countAccess, scoped.accessChannel, memoryDbs);
     return tagResults.slice(0, topK);
   }
 
@@ -520,11 +553,13 @@ async function searchInDb(db: Database.Database, options: SearchOptions, memoryD
       const floatQuery = new Float32Array(queryVector);
       // 2026-10-28:片段级 KNN(整行向量在长记忆上被稀释,见 chunkIndex.ts 里的实测数字)
       let chunkSims: Map<number, number> | undefined;
-      try { chunkSims = chunkKnnSearch(db, floatQuery, topK); } catch { chunkSims = undefined; }
+      try { chunkSims = chunkKnnSearch(db, floatQuery, topK); }
+      catch (e) { chunkSims = undefined; warnVectorDegraded('chunk_knn', e); }
       vectorResults = vectorKnnSearch(db, scoped, floatQuery, existingIds, topK, minScore, chunkSims);
       vecOk = true;
-    } catch {
+    } catch (e) {
       vecOk = false;
+      warnVectorDegraded('embed_or_knn', e);
     }
     // v1.28-fix(移植自 Lite 修 E6a):原来只在 embed/KNN **抛错**时回退。vec_memory 为空
     // (换模型清空后尚未补齐、维度刚重建、批量嵌入没跑)时 KNN 会"成功返回 0 行",
@@ -1061,16 +1096,24 @@ function supersededRecall(db: any, options: SearchOptions, excludeIds: Set<strin
 /** 更新记忆访问计数 + 写访问日志(v1.29:ACT-R 需要多次呈现的时间戳,不是只有一个 last) */
 function updateAccessed(db: any, results: SearchResult[], channel?: string) {
   if (results.length === 0) return;
+  const ch = String(channel || 'search').slice(0, 32);
+  // 2026-10-31: 渠道契约在这里执行。此前 shouldReinforce('diagnostic') 返回 false,
+  // 但没有任何写路径读它 —— 诊断读取照样把 accessed_count 和 last_accessed_at 改掉。
+  if (!shouldCountAccess(ch)) { accessSuppressed++; return; }
   try {
     // v1.23 冷存回温：被检索命中即回到工作集（清掉 status='cold'）。
     // 否则"冷"会变成永久标记 —— 经常被用的记忆反而永远被排除在新沉淀之外。
     const stmt = db.prepare("UPDATE memory SET accessed_count = accessed_count + 1, last_accessed_at = ?, status = CASE WHEN status = 'cold' THEN NULL ELSE status END WHERE id = ?");
     const now = new Date().toISOString();
     // 日志表可能不存在(老库没迁移/迁移失败) —— 那就不记,不影响计数这条主路径。
+    // 但失败必须可见：审计里 memory_access_log 全库 0 行、accessed_count 却有 565，
+    // 就是因为这里静默吞掉了错误，ACT-R 的间隔效应悄悄失效（2026-10-31）。
     let logStmt: any = null;
     try { logStmt = db.prepare('INSERT INTO memory_access_log (memory_id, project, accessed_at, channel) VALUES (?, ?, ?, ?)'); }
-    catch { logStmt = null; }
-    const ch = String(channel || 'search').slice(0, 32);
+    catch (e: any) {
+      logStmt = null; accessLogFailures++;
+      if (accessLogFailures === 1) console.warn(`[search] memory_access_log 不可写，ACT-R 访问间隔将丢失: ${e?.message || e}`);
+    }
     const tx = db.transaction((rows: SearchResult[]) => {
       for (const r of rows) {
         stmt.run(now, r.id);
@@ -1087,6 +1130,13 @@ function updateAccessed(db: any, results: SearchResult[], channel?: string) {
 }
 
 let accessWrites = 0;
+let accessSuppressed = 0;
+let accessLogFailures = 0;
+
+/** 访问记账的自检口径：写入次数 / 被渠道契约拦下的次数 / 日志写失败次数。 */
+export function getAccessStats(): { writes: number, suppressed: number, logFailures: number } {
+  return { writes: accessWrites, suppressed: accessSuppressed, logFailures: accessLogFailures };
+}
 
 /** v1.23 Parent-Child 回捞结果 */
 export interface HydratedParent {

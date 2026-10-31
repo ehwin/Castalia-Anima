@@ -1,0 +1,40 @@
+{
+ "_meta": {
+  "说明": "default 臂（当前 src 默认常量）的期望值。低于 hit1−容差 时 run_arms.mjs 退出码 1；同时给了 constant 臂时，常数基线必须 ≤0.05。",
+  "构建": "src/search.ts：相似度上限 0.95、WEIGHT_TIME 0.03、WEIGHT_EMOTION 0.12（含 2026-10-31 的向量降级日志）",
+  "快照": "副本_SMP输入端_20261031070833",
+  "快照库sha256": "244e63615f1afb59463ce4f8a1d53e704e3b9c04b55a6a589f446e0fccc53e7b",
+  "嵌入": "none（纯词法，跨机器可复现）",
+  "topK": 10,
+  "协议": "检索以 accessChannel:'diagnostic' 调用 —— 访问计数与 last_accessed_at 都不刷新，69 条查询相互独立。",
+  "实测": "2026-10-31T18:30+08:00",
+  "实测命令": "node scripts/eval/run_arms.mjs --db <快照>/airi --project airi --arms default,time015,constant --embed none",
+  "与交接报告的差异": "报告记 default=76.8%（53/69）。那是在默认渠道下连跑 69 条测出来的：命中行被 +accessed_count 且 last_accessed_at 刷成现在，于是它们在**后续查询**里分数更高（accessBoost 最高 +8%、时间衰减接近 1.0）。按 diagnostic（不强化、查询相互独立）重测：default=72.5%（50/69），旧常量=55.1%（38/69）。差的 3 条是跨查询污染，不是参数效果。"
+ },
+ "hit1": 0.725,
+ "hit5": 1,
+ "hit10": 1,
+ "mrr": 0.833,
+ "容差": 0.02,
+ "对照臂": {
+  "旧常量（0.7 / WEIGHT_TIME 0.15，另建 dist）": {
+   "hit1": 0.551,
+   "hit5": 0.899,
+   "mrr": 0.698,
+   "配对": "default vs 旧常量 @1：0 : 12，精确 McNemar p=0.0005；@5：0 : 7，p=0.0156（没有任何一条查询变差）"
+  },
+  "time015": {
+   "hit1": 0.681,
+   "hit5": 0.942,
+   "note": "只把 WEIGHT_TIME 拨回 0.15 —— 与报告里的 68.1% 一致"
+  },
+  "emo0": {
+   "hit1": 0.754,
+   "note": "与 default 的差异不可判定（上一轮 R33 同一结论：情感权重 0.12 与 0 分不出来）"
+  },
+  "constant": {
+   "hit1": 0,
+   "note": "常数基线：永远返回同一批 id。必须为 0，否则金标太宽 = 基准没有判别力（门禁会拦）"
+  }
+ }
+}

@@ -23,6 +23,7 @@ import { currentMemDir } from './db.js';
 import { emotionalReflectPrompt } from './reflectionFidelity.js';
 import { getUnanalyzedConversations } from './reflectionSources.js';
 import { parseTagsSafe, serializeTags } from './tags.js';
+import { excludeRawMaterialSql, isRawMaterialSource } from './memoryProvenance.js';
 export { getUnanalyzedConversations, markConversationsReflected } from './reflectionSources.js';
 /**
  * 获取所有记忆（供大模型分析）
@@ -269,7 +270,8 @@ export async function applyReflectActions(actions, characterId = CHAR_ID, projec
                         const sdb = memDbFor(id, project, db, characterId);
                         // 原料行（对话流水 / 事件层 / 状态快照）不接受整合合并：它们是"原文与导航层"，
                         // 不是可再生的摘要 —— 合并只留一份改写稿，原文就再也回不来了（2026-10-30）。
-                        const src = sdb.prepare("SELECT id FROM memory WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical' AND COALESCE(source, '') NOT IN ('conversation_log', 'daily_event', 'agent_state', 'agent_diary')").get(id);
+                        // 2026-10-31: 排除名单收敛到 excludeRawMaterialSql()，与软删语句共用同一口径。
+                        const src = sdb.prepare(`SELECT id FROM memory WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical' AND ${excludeRawMaterialSql()}`).get(id);
                         if (!src) {
                             mergeInvalid = `source not found, locked, critical, or raw-material: ${id}`;
                             break;
@@ -303,7 +305,12 @@ export async function applyReflectActions(actions, characterId = CHAR_ID, projec
                     for (const src of mergeSources) {
                         if (src.id === merged.id)
                             continue;
-                        src.db.prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical' AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").run(src.id);
+                        // 2026-10-31: 上面的预检已经挡住了原料行；这里再带一次同一口径的谓词，
+                        // 让"软删语句"自身就是安全的（预检被重构/绕过时不至于把原文标死）。
+                        const retired = src.db.prepare(`UPDATE memory SET is_active = 0 WHERE id = ? AND is_active = 1 AND (locked IS NULL OR locked = 0) AND COALESCE(tier, 'standard') <> 'critical' AND ${excludeRawMaterialSql()}`).run(src.id);
+                        if (retired.changes === 0) {
+                            result.errors.push(`merge: source not retired (raw-material, locked or already inactive): ${src.id}`);
+                        }
                         try {
                             const row = src.db.prepare('SELECT rowid FROM memory WHERE id = ?').get(src.id);
                             if (row)
@@ -326,7 +333,8 @@ export async function applyReflectActions(actions, characterId = CHAR_ID, projec
                     if (!row || row.locked || row.identity_locked)
                         throw new Error('split: target locked or inactive');
                     // 2026-10-30: 原料行不可拆分/替换 —— 拆分会把源软删，原文与事件引文就没了。
-                    if (['conversation_log', 'daily_event', 'agent_state', 'agent_diary'].includes(String(row.source || ''))) {
+                    // 2026-10-31: 判定收敛到 isRawMaterialSource()（与软删语句同一口径）。
+                    if (isRawMaterialSource(row.source)) {
                         throw new Error('split: raw-material row is immutable');
                     }
                     const children = [];
@@ -339,7 +347,7 @@ export async function applyReflectActions(actions, characterId = CHAR_ID, projec
                         }));
                     }
                     if (!children.some(child => child.id === source.id)) {
-                        source.db.prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')").run(source.id);
+                        source.db.prepare(`UPDATE memory SET is_active = 0 WHERE id = ? AND ${excludeRawMaterialSql()}`).run(source.id);
                         try {
                             source.db.prepare('DELETE FROM vec_memory WHERE rowid = (SELECT rowid FROM memory WHERE id = ?)').run(source.id);
                         }
@@ -586,8 +594,10 @@ export async function applyReflectActions(actions, characterId = CHAR_ID, projec
                         catch { /* 链接失败不影响提取 */ }
                     }
                     receipt.rowsAffected = 1;
-                    // 给源记忆 +reference_count（v5.1: LIKE 匹配短ID）
-                    memDbFor(action.sourceId, project, db, characterId).prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(action.sourceId);
+                    // 2026-10-31: 不再给源记忆 reference_count +1。
+                    // 反思抽取是**内部使用**，不是外部又一次提及；加计数会让
+                    // consolidate.ts 的「reference_count>2 → 提重要度」把系统读自己当成独立证据，
+                    // 正是审计 §5 第 4 项描述的自我强化路径。真正的外部重复由 store.ts 计。
                     if (receipt.status === 'applied')
                         result.applied++;
                     result.details.push(`extract: from ${action.sourceId} → ${validType}/${validCat} (${tier})`);
@@ -604,7 +614,7 @@ export async function applyReflectActions(actions, characterId = CHAR_ID, projec
                     // v1.23: critical 核心记忆不得被自动反思删除
                     // 2026-10-30: 原料行（对话流水/事件层/状态快照）同样不得被删除 —— 原文永不删除是这套记忆的地基，
                     //   事件层则带着逐字引文与来源 rowid，重建需要重跑且 progress 表已经挡掉重跑。
-                    const _delR = memDbFor(action.targetId, project, db, characterId).prepare("UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical' AND COALESCE(source, '') NOT IN ('conversation_log', 'daily_event', 'agent_state', 'agent_diary')").run(action.targetId);
+                    const _delR = memDbFor(action.targetId, project, db, characterId).prepare(`UPDATE memory SET is_active = 0 WHERE id = ? AND (locked IS NULL OR locked = 0) AND COALESCE(identity_locked, 0) = 0 AND COALESCE(tier, 'standard') <> 'critical' AND ${excludeRawMaterialSql()}`).run(action.targetId);
                     receipt.rowsAffected = _delR.changes;
                     if (_delR.changes === 0) {
                         receipt.status = 'failed';

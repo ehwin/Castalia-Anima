@@ -14,7 +14,7 @@ import { scoreAffect, affectImpact } from './affectLexicon.js';
 import { isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
 import { parseTagsSafe, normalizeTagsForWrite, serializeTags } from './tags.js';
 import { estimatePredicateVolatility, needsEvidence, shouldSupersede } from './volatility.js';
-import { isDerivedMemorySource } from './memoryProvenance.js';
+import { isDerivedMemorySource, isGeneratedSource, excludeRawMaterialSql } from './memoryProvenance.js';
 let saveCount = 0;
 const CONSOLIDATE_INTERVAL = 50;
 function serializeMetadata(value) {
@@ -147,7 +147,20 @@ export async function saveMemory(params) {
       LIMIT 1
     `).get(project, text?.trim() || '', params.sessionId ?? null, params.subject ?? 'user', charId, ...(params.source === 'conversation_log' ? [params.source] : []));
     if (exactDup) {
-        db.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(exactDup.id);
+        // 2026-10-31: 只有**外部**重复写入才算一次独立引用。派生记录（reflect_*/agent_*）
+        // 复述同一段原文时，它的来源就是那条原文本身 —— 加 reference_count 会让
+        // consolidate.ts「reference_count>2 → 提重要度」把内部重新派生当成独立支持
+        // （审计 §5 第 4 项）。
+        if (!isGeneratedSource(params.source)) {
+            db.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(exactDup.id);
+        }
+        else {
+            try {
+                db.prepare("UPDATE memory SET metadata = json_set(COALESCE(NULLIF(metadata,''),'{}'), '$.derivedRewrites', COALESCE(json_extract(metadata,'$.derivedRewrites'),0)+1) WHERE id = ?")
+                    .run(exactDup.id);
+            }
+            catch { /* metadata 非 JSON 时忽略：只是诊断字段 */ }
+        }
         // Re-enqueue only rows that are still waiting for affect analysis. Once a
         // row is analyzed or explicitly abstained, saving the same text again
         // must not make the local fallback overwrite the durable result.
@@ -196,7 +209,10 @@ export async function saveMemory(params) {
                 if (dupRow) {
                     dupId = dupRow.id;
                     isNearDup = true;
-                    db.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(dupId);
+                    // 2026-10-31: 同上 —— 生成型来源的重复只记诊断字段，不算独立引用
+                    if (!isGeneratedSource(params.source)) {
+                        db.prepare('UPDATE memory SET reference_count = reference_count + 1 WHERE id = ?').run(dupId);
+                    }
                 }
             }
         }
@@ -586,12 +602,14 @@ export function markColdMemories(project, characterId = CHAR_ID) {
             // 两种格式，直接做字符串比较会把同一天不同时刻判错（' ' < 'T'），差一天。
             // 统一过 datetime() 归一化后再比。
             // v1.24: 角色隔离 — 维护动作只作用于本实例角色,不替其它角色降权。
+            // 2026-10-31: 原料行(对话流水/事件层/状态快照/日记)不参与冷存降级 ——
+            //   它们不是"可降权的记忆"，降成 cold 会让反思/事实抽取的 WHERE 把它们筛掉。
             const r = db.prepare(`
         UPDATE memory SET status = 'cold'
         WHERE project = ? AND character_id = ? AND is_active = 1
           AND COALESCE(status, '') NOT IN ('cold', 'superseded')
           AND COALESCE(tier, 'standard') = 'standard'
-          AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
+          AND ${excludeRawMaterialSql()}
           AND (locked IS NULL OR locked = 0)
           AND importance < ?
           AND COALESCE(reference_count, 0) = 0

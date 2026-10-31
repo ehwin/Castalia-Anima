@@ -18,7 +18,7 @@ Object.assign(process.env, {
 const load = name => import(pathToFileURL(path.join(root, 'dist', name + '.js')).href);
 const { DatabaseManager } = await load('db');
 const { saveMemory, findDbByMemoryId } = await load('store');
-const { searchMemory, isBackReferenceQuery, SUPERSEDED_PENALTY } = await load('search');
+const { searchMemory, isBackReferenceQuery, SUPERSEDED_PENALTY, computeScore } = await load('search');
 
 let checks = 0;
 const check = (value, message) => { assert.ok(value, message); checks++; };
@@ -83,8 +83,24 @@ hits = await searchMemory({ query: '灯塔 旧船票', project, topK: 5 });
 const freshHit = hits.find(h => h.id === fresh.id);
 const staleHit = hits.find(h => h.id === stale.id);
 check(!!freshHit && !!staleHit, '两条都返回（同一文本、同一重要度）');
-check(freshHit.score > staleHit.score,
-  `刚被回忆过的记忆分数更高（${freshHit.score} > ${staleHit.score}）—— 衰减锚点不是 created_at`);
+
+// 2026-10-31: 这里原来比的是**两条文本的端到端分数**。WEIGHT_TIME 0.15→0.03 之后它
+// 不再成立，因为尾句不同（"说想去看看" / "记在了小本子上"）带来的相似度差 ≈0.008，
+// 已经能盖过时间项 ≈0.027 —— 这不是时间项坏了，是这条断言一直在借相似度做支撑。
+// 性质本身改成对着打分函数验：除 last_accessed_at 外**完全相同**的两行。
+const baseRow = {
+  id: 'probe', project, character_id: 'airi', importance: 0.8, emotional_impact: 0,
+  accessed_count: 0, tier: 'standard', tags: '[]', source: 'conversation_log',
+  text: '她昨天提到过灯塔与旧船票，说想去看看', created_at: ago(200),
+};
+const scoreFresh = computeScore({ ...baseRow, last_accessed_at: ago(1 / 24) }, 0.8).score;
+const scoreStale = computeScore({ ...baseRow, last_accessed_at: ago(200) }, 0.8).score;
+check(scoreFresh > scoreStale, `刚被回忆过的记忆分数更高（${scoreFresh} > ${scoreStale}）`);
+check(scoreFresh - scoreStale > 0.02,
+  `时间项必须仍有分量（Δ=${(scoreFresh - scoreStale).toFixed(4)}）—— 调到 0 就等于删掉"回忆刷新时钟"`);
+// 锚点是 last_accessed_at 而不是 created_at：只把 created_at 拨新、last_accessed_at 不动，分数不变。
+check(computeScore({ ...baseRow, created_at: ago(1 / 24), last_accessed_at: ago(200) }, 0.8).score === scoreStale,
+  '锚点是 last_accessed_at：改 created_at 不刷新时钟');
 
 // ── 5. 稳定性：同一查询连跑两次，结果 id 一致（无随机、无跨请求污染）────────
 const again = await searchMemory({ query: '杭州 近况', project, topK: 5 });

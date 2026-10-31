@@ -1,3 +1,4 @@
+import { excludeRawMaterialSql } from './memoryProvenance.js';
 /**
  * 找出(并可选地软删)指向已消失会话的记忆。
  *
@@ -42,7 +43,7 @@ export function orphanMemories(db, opts) {
         rows = db.prepare(`
       SELECT m.id, m.session_id, m.text, m.created_at, m.source, m.metadata
       FROM memory m
-      WHERE COALESCE(m.source, '') NOT IN ('agent_diary', 'agent_state') AND ${where}
+      WHERE ${excludeRawMaterialSql('m')} AND ${where}
       ORDER BY m.created_at DESC
       LIMIT ?
     `).all(...alive, limit);

@@ -16,6 +16,7 @@
  * session 存活集合对账 —— 我们这边的锚点只有 session 级(见 airi bank:38 条有 session_id)。
  */
 import type Database from 'better-sqlite3';
+import { excludeRawMaterialSql } from './memoryProvenance.js';
 
 export interface OrphanOptions {
   /** 项目名(必填):孤儿只在同一个 project 内判定 */
@@ -96,7 +97,7 @@ export function orphanMemories(db: Database.Database, opts: OrphanOptions): Orph
     rows = db.prepare(`
       SELECT m.id, m.session_id, m.text, m.created_at, m.source, m.metadata
       FROM memory m
-      WHERE COALESCE(m.source, '') NOT IN ('agent_diary', 'agent_state') AND ${where}
+      WHERE ${excludeRawMaterialSql('m')} AND ${where}
       ORDER BY m.created_at DESC
       LIMIT ?
     `).all(...alive, limit) as any[];

@@ -109,6 +109,9 @@ export function getUnanalyzedConversations(
           -- 实测:被软删的自检对话仍被当成"待分析",抽出「自检习惯」这类事实写回库;
           -- 删掉的东西又被反刍复活,是用户永远关不掉的污染源。
           AND is_active = 1
+          -- 2026-10-31: 显式标了 noReflect 的行(如按批次恢复的历史原文)不参与重抽,
+          -- 否则恢复三个月前的对话等于把同一批原文再抽一遍,产出重复洞察。
+          AND COALESCE(metadata, '') NOT LIKE '%"noReflect":true%'
           AND project = ?
           -- Legacy NULL rows are unowned; only an explicit cross-role caller
           -- may inspect them.

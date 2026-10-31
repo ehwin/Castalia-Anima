@@ -30,3 +30,5 @@ keys.key
 *.bak2-*
 *.bak3-*
 *.old*
+# 一次性审计/实验脚手架(2026-10-31)：.tmp-build/、.tmp-psyche/、.tmp-all-sql*.txt 等
+.tmp-*

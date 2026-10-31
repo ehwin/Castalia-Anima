@@ -15,7 +15,7 @@
 
 import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { normalizeCharacterId, normalizeProject, CHAR_ID } from './env.js';
-import { flushVadQueueDetailed, recoverPendingVadQueue, regressToBaseline, isNightTime } from './emotion.js';
+import { flushVadQueueDetailed, recoverPendingVadQueue } from './emotion.js';
 import { cleanupExpiredMemories } from './store.js';
 import { getAgentState } from './agentState.js';
 

@@ -43,6 +43,15 @@ class AgentState {
   private currentDesire: string | null = null;
   private energy: number = 100;
   private lastUpdated: number = Date.now();
+  /**
+   * 精力有自己时钟（2026-10-31）。
+   *
+   * 原来 energy 与 mood/desire 共用 `lastUpdated`，而 `getCurrentEnergy()` 只在读取时
+   * 衰减、从不写回：空闲 24h 显示 30，只要调一次 `setDesire`/`addMood` 把时间戳一按，
+   * 显示立刻回到 100 —— 改一个想法凭空恢复了精力。现在精力单独记账，
+   * 任何改变 energy 的操作先结算到当前时刻。
+   */
+  private energyUpdatedAt: number = Date.now();
 
   // Mood events are signed impacts around a neutral baseline (0). A seven
   // hour half-life makes an isolated event return to baseline over time.
@@ -139,20 +148,32 @@ class AgentState {
   }
 
   /**
-   * Get current energy (decreases over time, resets on interaction).
+   * Get current energy (decreases over time; it does NOT reset on interaction).
+   *
+   * 恢复只来自显式的 boostEnergy（合意活动/休息）。修改 mood/desire 不再影响这个读数。
    */
   getCurrentEnergy(): number {
-    const hoursSinceUpdate = (Date.now() - this.lastUpdated) / (1000 * 60 * 60);
+    const hoursSinceUpdate = (Date.now() - this.energyUpdatedAt) / (1000 * 60 * 60);
     const decayed = this.energy * Math.exp(-0.05 * hoursSinceUpdate);
     return Math.round(Math.max(0, Math.min(100, decayed)));
   }
 
+  /** 把衰减结算进 this.energy，并把精力时钟拨到当前时刻。 */
+  private settleEnergy(now: number = Date.now()): void {
+    const hours = Math.max(0, now - this.energyUpdatedAt) / (1000 * 60 * 60);
+    this.energy = Math.max(0, Math.min(100, this.energy * Math.exp(-0.05 * hours)));
+    this.energyUpdatedAt = now;
+  }
+
   /**
-   * Boost energy (e.g., after positive interaction).
+   * Boost energy (e.g., after a rest event or a welcome activity).
    */
   boostEnergy(amount: number): void {
+    const now = Date.now();
+    this.settleEnergy(now);            // 先结算旧的，再叠加，避免把陈旧值当当前值
     this.energy = Math.min(100, this.energy + amount);
-    this.lastUpdated = Date.now();
+    this.energyUpdatedAt = now;
+    this.lastUpdated = now;
   }
 
   /**

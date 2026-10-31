@@ -73,24 +73,43 @@ export const AIRI_BASELINE: PersonalityBaseline = {
   },
 };
 
-/** 差异化半衰期（小时）— Verduyn & Lavrijsen 2014 */
-export const HALF_LIFE = {
-  valence:   24,   // 情绪效价最持久
-  arousal:   4,    // 唤醒度快速消退
-  dominance: 36,   // 支配感最持久
+/**
+ * 记忆 VAD 的衰减时间常数 τ（小时）—— 注意是 τ，不是半衰期。
+ * `decayDimension` 用的是 exp(−h/τ)，24h 后剩 e⁻¹≈0.368；真正的半衰期要写 2^(−h/H)。
+ *
+ * 2026-10-31：撤掉「Verduyn & Lavrijsen 2014」这个依据声明 —— 那篇比较的是不同情绪
+ * 经历的持续时间（悲伤最久等），没有给出 V/A/D 三个维度各自的衰减常数。
+ * 24/4/36 是产品初值，不是论文常数。
+ */
+export const DECAY_TAU = {
+  valence:   24,
+  arousal:   4,
+  dominance: 36,
 } as const;
+/** @deprecated 名字有误导（它是 τ 不是半衰期），仅为兼容保留；新代码用 DECAY_TAU。 */
+export const HALF_LIFE = DECAY_TAU;
 
-/** 夜间衰减倍率 — 模拟睡眠情绪调节 */
+/**
+ * 夜间倍率与傲娇减速：默认**停用**。
+ *
+ * 反例（可复现）：一条 24h 的旧记忆只因为查询时刻落在 22:00 之后，arousal 就从
+ * 2.48e−3 掉到 1.52e−8、dominance 反而从 0.513 升到 0.717 —— 同一段过去被重新解释，
+ * 且入夜时支配感突然回升。傲娇减速同理：它让「傲娇浓度」直接决定记忆衰减率，
+ * 而人格表达不该等于遗忘速度。
+ * 需要复现实验时用 ANIMA_NIGHT_DECAY=1 / ANIMA_TSUNDERE_DECAY=1 显式打开。
+ */
 const NIGHT_MULTIPLIER = {
   valence:   1.5,
   arousal:   3.0,   // 睡眠时激活度大幅下降
   dominance: 0.5,   // 支配感在夜间反而不易衰减
 };
+const NIGHT_DECAY_ENABLED = process.env.ANIMA_NIGHT_DECAY === '1';
 
-/** 傲娇减速因子 — 傲娇记忆衰减更慢 */
+/** 傲娇减速因子 — 默认停用，见上。 */
 const TSUNDERE_SLOWDOWN_MAX = 0.5; // 最高减速 50%
+const TSUNDERE_DECAY_ENABLED = process.env.ANIMA_TSUNDERE_DECAY === '1';
 
-/** 基线回归速率 — 每轮操作回归比例 */
+/** @deprecated 未接入（全仓无调用）。保留仅为记录旧的每轮回归实验；按真实时间的恢复走 psycheState.decay。 */
 const REGRESSION_RATE = 0.05;
 
 // ═══════════════════════════════════════════════════════════════════
@@ -156,22 +175,25 @@ export function computeDecay(
     return { vad: { valence: 0, arousal: 0, dominance: 0 }, intensity: 0 };
   }
 
-  // 傲娇减速因子：傲娇浓度越高，衰减越慢
-  // tsundereLevel=0 → slowdown=1.0（正常）；=10 → slowdown=0.5（半速衰减）
-  const tsundereSlowdown = 1 - TSUNDERE_SLOWDOWN_MAX * (tsundereLevel / 10);
+  // 傲娇减速因子：默认停用（见 TSUNDERE_DECAY_ENABLED）
+  const tsundereSlowdown = TSUNDERE_DECAY_ENABLED
+    ? 1 - TSUNDERE_SLOWDOWN_MAX * (tsundereLevel / 10)
+    : 1;
+  const nightMult = (dim: 'valence' | 'arousal' | 'dominance') =>
+    (NIGHT_DECAY_ENABLED && isNight) ? NIGHT_MULTIPLIER[dim] : 1;
 
   // 计算各维度衰减
   const decayValence = decayDimension(
-    storedVAD.valence, hoursSince, HALF_LIFE.valence,
-    tsundereSlowdown, isNight ? NIGHT_MULTIPLIER.valence : 1
+    storedVAD.valence, hoursSince, DECAY_TAU.valence,
+    tsundereSlowdown, nightMult('valence')
   );
   const decayArousal = decayDimension(
-    storedVAD.arousal, hoursSince, HALF_LIFE.arousal,
-    tsundereSlowdown, isNight ? NIGHT_MULTIPLIER.arousal : 1
+    storedVAD.arousal, hoursSince, DECAY_TAU.arousal,
+    tsundereSlowdown, nightMult('arousal')
   );
   const decayDominance = decayDimension(
-    storedVAD.dominance, hoursSince, HALF_LIFE.dominance,
-    tsundereSlowdown, isNight ? NIGHT_MULTIPLIER.dominance : 1
+    storedVAD.dominance, hoursSince, DECAY_TAU.dominance,
+    tsundereSlowdown, nightMult('dominance')
   );
 
   const vad = { valence: decayValence, arousal: decayArousal, dominance: decayDominance };
@@ -213,6 +235,11 @@ export function isNightTime(now: Date = new Date()): boolean {
 /**
  * 将当前 VAD 向人格基线回归一步
  * dX = theta(mu - X) * rate
+ *
+ * @deprecated 全仓无调用（只有一个遗留 import，已于 2026-10-31 移除）。
+ * `rate` 是「每次调用」的比例，不是按真实时间的恢复率 —— 调一次算一次会随调用频率
+ * 改变衰减速度。按真实时间的恢复请用 psycheState.decay（2^(−dt/H)）。
+ * 这个函数还会把「人格基线」和「当前心境」混在一次算术里，正是上一轮报告点名的问题。
  */
 export function regressToBaseline(
   currentVAD: VADVector,
@@ -458,12 +485,12 @@ export function computeBaseIntensity(storedVAD: VADVector | null): number {
 }
 
 /**
- * 纯时间衰减因子 — 不涉及情感维度，只代表"这件事有多新鲜"
- * recency = exp(-t / halfLife)
- * 使用各维度中衰减最慢的 dominance 半衰期（36h）作为统一基准
+ * 纯时间衰减因子 — 不涉及情感维度，只代表"这件事有多新鲜"。
+ * 近因权重：exp(−h/τ)。参数是**时间常数 τ**，不是半衰期（半衰期要 2^(−h/H)）。
+ * 默认沿用 dominance 的 36h 只是因为历史上就这么取，不代表「支配感 = 可提取性」。
  */
-export function computeRecency(hoursSince: number, halfLife: number = HALF_LIFE.dominance): number {
-  return Math.exp(-hoursSince / halfLife);
+export function computeRecency(hoursSince: number, tauHours: number = DECAY_TAU.dominance): number {
+  return Math.exp(-hoursSince / tauHours);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -798,10 +825,124 @@ function pendingPsycheIds(
 }
 
 /**
+ * 词表 → psyche 的 arousal 适配器。
+ *
+ * 词表 `scoreAffect` 的 arousal 是 **0..1 的非负强度**（`Math.max(0, min(1, …))`），
+ * 而 psyche 的 arousal 是 **−1..1 的双极量**（默认基线 +0.3）。直接传递会把「平静」
+ * 也变成正唤醒。这里用 0.5 作中性点换算：a_bipolar = 2·a01 − 1。
+ *
+ * 两个例外必须保留：
+ *  - 原始值 0 表示「没有任何唤醒线索」，不是「极度平静」→ 返回 undefined，不更新这一维。
+ *  - 非数值同样返回 undefined。
+ *
+ * 这是工程近似（需要轨迹评价来校准），不是心理测量结论。只作用于进入 psyche 的路径；
+ * 库里已写入的行仍是 0..1（用 affect_source='local_lexicon' 可识别，后续可单向回填）。
+ */
+export function lexiconArousalToBipolar<T extends { arousal: number }>(vad: T): Omit<T, 'arousal'> & { arousal?: number } {
+  const a = Number(vad.arousal);
+  if (!Number.isFinite(a) || a <= 0) return { ...vad, arousal: undefined };
+  return { ...vad, arousal: Math.max(-1, Math.min(1, 2 * a - 1)) };
+}
+
+/**
  * Summarize the same lexicon scores written by tagWithLocalAffect.
  * The local path has no trajectory model, so the batch mean is the safest
  * appraisal: one long message cannot push the state several times.
  */
+
+/**
+ * 同一时刻（同一秒）的多个批合并成一个。
+ *
+ * 为什么：一次 flush 里同一秒的 5 个 chunk 如果各自推进，elapsed 全是 0，
+ * 每个 chunk 都会以 gain 朝自己的目标走一步，最后一条把前面全盖掉（R1 实测
+ * 到均值距离 0.158，与旧实现 0.163 几乎相同）。同一时刻的多条证据应该是
+ * **一个观测**；跨时刻的仍然分开推进，保留「一句话一句话地变」。
+ */
+export function mergeSameMomentBatches<
+  T extends { project: string; characterId: string; entries: Array<{ timestamp?: number }> },
+>(batches: T[], fallback = Date.now()): T[] {
+  const groups = new Map<string, T>();
+  for (const batch of batches) {
+    const moment = Math.floor(batchEvidenceNow(batch.entries, fallback) / 1000);
+    const key = `${batch.project}|${batch.characterId}|${moment}`;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.entries = [...existing.entries, ...batch.entries] as T['entries'];
+    } else {
+      groups.set(key, { ...batch, entries: [...batch.entries] as T['entries'] });
+    }
+  }
+  return [...groups.values()];
+}
+
+/**
+ * 一批 chunk 的「现在」应该是这批证据自己的时间，不是墙钟。
+ *
+ * 实测（R1）：同一秒进来的 5 个 chunk 全用 `Date.now()` 推进 → elapsed=0，
+ * 于是每个 chunk 都以 gain 朝自己的目标走一次，最后一条把前面全盖掉。
+ * 用 entry.timestamp 推进后，chunk 之间的真实间隔参与衰减；同一秒的再合并
+ * （见 mergeSameMomentBatches），两条一起才把「末条覆盖」关掉。
+ */
+export function batchEvidenceNow(
+  entries: Array<{ timestamp?: number }>,
+  fallback = Date.now(),
+): number {
+  let latest = Number.NEGATIVE_INFINITY;
+  for (const entry of entries) {
+    const t = Number(entry?.timestamp);
+    if (Number.isFinite(t) && t > latest) latest = t;
+  }
+  return Number.isFinite(latest) ? latest : fallback;
+}
+
+/**
+ * importance(0..1) 与 emotional_impact(0..10，引擎老字段) → salience(0..1)。
+ *
+ * 两个字段标度不同：`memory.importance` 原本就是 0..1，而 `emotional_impact`
+ * 是 0..10（见 affectLexicon.ts 的「emotional_impact 的 0..10 标度」）。
+ * 不做归一化就会让任何 impact≥1 的记忆把 salience 顶到 1（41 条真实会话里
+ * 有 8 条 impact ≥ 3.3，全都会被钉死成 1.0）。
+ */
+export function salienceFromEvidence(importance: unknown, impact: unknown): number {
+  const imp = Number(importance);
+  const rawImpact = Number(impact);
+  const normalizedImpact = Number.isFinite(rawImpact) ? Math.abs(rawImpact) / 10 : 0;
+  const value = Math.max(Number.isFinite(imp) ? imp : 0, normalizedImpact);
+  return Math.max(0, Math.min(1, value));
+}
+
+/**
+ * 事件重要性 → salience（0..1）。
+ *
+ * 这条链接此前在生产上是断的：`applyPsycheAppraisal` 早就支持 `options.salience`
+ * （重要性延长偏离持续时间，Verduyn & Lavrijsen 2014），但 flush 层从没传过它 ——
+ * 「重要性 → 持续更久」因此只在单测里成立。这里从 memory 行读
+ * importance / emotional_impact。
+ */
+export function batchSalience(
+  entries: Array<{ memoryId?: string }>,
+  project: string,
+  characterId: string = CHAR_ID,
+): number {
+  const ids = Array.from(new Set(entries.map(entry => entry.memoryId).filter(Boolean) as string[]));
+  if (ids.length === 0) return 0;
+  const proj = normalizeProject(project);
+  try {
+    const db = DatabaseManager.getInstance(proj);
+    const placeholders = ids.map(() => '?').join(',');
+    const row = db.prepare(`
+      SELECT MAX(importance) AS importance,
+             MAX(ABS(COALESCE(emotional_impact, 0))) AS impact
+      FROM memory WHERE id IN (${placeholders}) AND project = ? AND character_id = ?
+    `).get(...ids, proj, normalizeCharacterId(characterId)) as any;
+    return salienceFromEvidence(row?.importance, row?.impact);
+  } catch {
+    // Importance is an amplifier, not correctness: a read failure must never
+    // block the transition.
+    return 0;
+  }
+}
+
 export function summarizeLocalAffect(
   entries: Array<{ text: string }>,
 ): VADVector | null {
@@ -888,6 +1029,16 @@ async function flushVadQueueInternal(
     return { analysis: null, updated: 0, batches: 0, source: 'none' };
   }
 
+  // 同一秒的 chunk 合并成一次跃迁。
+  //
+  // R1 实测：一次 flush 里 5 个 chunk 各自 `applyPsycheAppraisal(..., Date.now())`，
+  // elapsed 全是 0，于是每个 chunk 都以 gain 朝自己的目标走一步，最后一条把前面
+  // 全盖掉（状态到「五条均值」的距离 0.158，与旧实现 0.163 几乎相同）。
+  // 同一时刻的多条证据应当合成为一个观测；跨时刻的仍然分开推进。
+  const mergedBatches = mergeSameMomentBatches(batches, now);
+  batches.length = 0;
+  batches.push(...mergedBatches);
+
   // 只摘掉本次真正要处理的条目；未达阈值/别的项目的条目留在队列里
   const taken = new Set<VadQueueEntry>();
   for (const b of batches) for (const e of b.entries) taken.add(e);
@@ -949,9 +1100,17 @@ async function flushVadQueueInternal(
           // The lexicon summarizes the current batch observation. Treating it
           // as a delta would accumulate the same repeated wording toward a
           // rail; a bounded target keeps retries and recurring batches stable.
-          targetAppraisalFromVAD(localVad, `vad:${batch.project}:${eventIds.join(',')}`),
-          Date.now(),
-          { requirePersistence: true },
+          // 2026-10-31: 词表 arousal 是 0..1 强度，psyche 是 −1..1 双极量 ——
+          // 必须过适配器，否则「平静」也会把唤醒度往上推（见 lexiconArousalToBipolar）。
+          // 词表只对部分维度有证据（无唤醒线索时 arousal 缺失），所以 allowPartial。
+          targetAppraisalFromVAD(lexiconArousalToBipolar(localVad), `vad:${batch.project}:${eventIds.join(',')}`, { allowPartial: true }),
+          // 证据自己的时间，不是墙钟：同一秒的多个 chunk 不再互相覆盖（R1）。
+          batchEvidenceNow(batch.entries, now),
+          {
+            requirePersistence: true,
+            // 重要性随证据进来，让「重要的事持续更久」在生产上真正生效。
+            salience: batchSalience(batch.entries, batch.project, batch.characterId),
+          },
         );
         finalizeAffectPsyche(eventIds.map(memoryId => ({ memoryId })), batch.project, batch.characterId);
       }
@@ -999,8 +1158,11 @@ async function flushVadQueueInternal(
           // the psyche toward that target; do not accumulate it as an event
           // delta (the local lexicon path above remains event-like).
           targetAppraisalFromVAD(result.vad, `vad:${batch.project}:${eventIds.join(',')}`),
-          Date.now(),
-          { requirePersistence: true },
+          batchEvidenceNow(batch.entries, now),
+          {
+            requirePersistence: true,
+            salience: batchSalience(batch.entries, batch.project, batch.characterId),
+          },
         );
         finalizeAffectPsyche(eventIds.map(memoryId => ({ memoryId })), batch.project, batch.characterId);
       }

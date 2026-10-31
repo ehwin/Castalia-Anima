@@ -72,6 +72,120 @@ const ADDITIVE = [
 export function hasAdditiveContent(text) {
     return ADDITIVE.some(re => re.test(String(text || '')));
 }
+/** 闸 1b/1c 用的词面工具（2026-10-31） */
+const NEGATORS = /[不没勿未非禁拒否莫]/;
+/** 态度/否定动词：出现在术语前 = 对它的否定（"排斥加糖" ≡ "不接受加糖"） */
+const NEG_PHRASE_TAIL = /(不接受|不愿意|不喜欢|不再|不想|禁止|避免|拒绝|排斥|反感|讨厌|谢绝|戒|忌|不能|不要)$/;
+/**
+ * 结论里更常见的否定形态：「不要熬夜」「别再熬夜了」「她不该熬夜」。
+ * 只看最后一个字会漏掉「不该」「别再」这类隔着一个情态词的否定（评审 P2-3）。
+ * `别` 要排除「特别/分别/区别」这种构词。
+ */
+const NEGATOR_TAIL = /(?:(?<![特分级区差])别|[不没勿未非禁拒否莫](?:该|会|能|要|想|应|得|可|愿|必|敢|再|曾)?)$/;
+/** 来源把某术语评价为负面 —— 此时结论否定它是同向改写，不是翻转。 */
+const NEG_EVAL = /(不好|不对|有害|伤身|伤害|伤身|危险|风险|后悔|受不了|难受|生病|糟糕|错误|坏处|副作用|上瘾|过敏|失败|痛苦)/;
+/** 名词化后缀：术语后面跟着它就不是在断言这个动作（"接受度" ≠ "接受"） */
+const NOMINAL_SUFFIX = /[度性率感者]/;
+const CAUSAL_MARK = /(因为|由于|因此|所以|导致|说明|证明)/;
+const OBLIGATION_MARK = /(必须|务必|一定|只能|绝不能|禁止|不要再)/;
+const PREFERENCE_MARK = /(喜欢|偏好|讨厌|反感|不吃|不喝|只喝|只吃|每天|从不|总是|习惯)/;
+/**
+ * 术语在文本里的极性：+1 断言、−1 被否定、0 未出现。
+ *
+ * 只看术语**之前**最多 4 个字符的窗口 —— 术语内部自带的否定成分（"无糖"的"无"）
+ * 属于术语本身，不是对它的否定。术语后面紧跟名词化后缀（度/性/率/感/者）时
+ * 它不再是动词断言（"观察接受度"），该次出现不计。
+ */
+export function termPolarity(text, term) {
+    const t = String(text || '');
+    let idx = t.indexOf(term);
+    if (idx < 0)
+        return 0;
+    let pos = 0;
+    while (idx >= 0) {
+        const next = t.slice(idx + term.length, idx + term.length + 1);
+        const nominalized = NOMINAL_SUFFIX.test(next);
+        if (!nominalized) {
+            const before = t.slice(Math.max(0, idx - 4), idx);
+            const negated = NEGATORS.test(before.slice(-1)) || NEG_PHRASE_TAIL.test(before) || NEGATOR_TAIL.test(before);
+            pos += negated ? -1 : 1;
+        }
+        idx = t.indexOf(term, idx + term.length);
+    }
+    return pos > 0 ? 1 : pos < 0 ? -1 : 0;
+}
+/**
+ * 结论与来源在**共享术语**上是否极性冲突。
+ *
+ * 审计 §4.2 的核心反例：来源"只喝无糖咖啡，不接受加糖"，结论"必须加糖" ——
+ * 引文是真实子串，闸 1 通过。这里的检查是：结论断言某词为正，而来源对同一个词是
+ * 否定（或反之），即为未被支持的翻转。返回冲突词，没有冲突返回 null。
+ *
+ * 例外（评审 P2-3）：来源把该术语**评价为负面**时，结论去否定它不算冲突 ——
+ * 「来源：熬夜对身体不好」+「结论：不要熬夜」是同向改写，原来会拒。
+ */
+export function claimSourceConflict(claim, source) {
+    const c = String(claim || ''), s = String(source || '');
+    if (!c || !s)
+        return null;
+    const seen = new Set();
+    const sNorm = normText(s);
+    for (const term of charNgrams(c, 2)) {
+        if (seen.has(term))
+            continue;
+        seen.add(term);
+        if (!sNorm.includes(term))
+            continue;
+        const pc = termPolarity(c, term);
+        const ps = termPolarity(s, term);
+        if (pc === 0 || ps === 0 || pc === ps)
+            continue;
+        // 结论否定、来源肯定，但来源在术语附近把它说成坏事 → 这是「规则化改写」，不是翻转。
+        if (pc < 0 && NEG_EVAL.test(sourceWindow(s, term)))
+            continue;
+        return term;
+    }
+    return null;
+}
+/** 术语在来源里前后各取一小段，用来判断来源是不是在评价它。 */
+function sourceWindow(text, term) {
+    const idx = text.indexOf(term);
+    if (idx < 0)
+        return '';
+    return text.slice(Math.max(0, idx - 6), idx + term.length + 10);
+}
+/**
+ * 强断言（因果/义务）却在来源里几乎没有词面依据。
+ *
+ * 审计 §4.2 的第二类反例："因为患严重糖尿病，所以必须胰岛素治疗" —— 糖尿病/胰岛素
+ * 在来源里根本不存在，却因为引文是真实子串而被接收。这里用"结论的 2-gram 与来源
+ * 的重合比例"做保守判定；弱动词（"可能/建议/可以"）不在义务标记里，不会被误伤。
+ */
+export function unsupportedCausalClaim(claim, source) {
+    const t = String(claim || '');
+    if (!CAUSAL_MARK.test(t) && !OBLIGATION_MARK.test(t))
+        return false;
+    const sG = charNgrams(source, 2);
+    // 取不到来源文本 ≠ 没有依据（评审 P2-4）：跨实例/联邦来源、recMeta 里查不到的行
+    // 会传空串。此时不判「编造」，只让闸 1（引文必须是子串）去管伪造引文。
+    if (sG.size === 0)
+        return false;
+    // 分句（只按标点切，保留"因为/所以/必须"在分句里做标记）：
+    // 真实的失败形态是"真前提 + 假推论"——整句往往与来源有重合，必须逐分句判。
+    const clauses = t.split(/[，,。；;！!？?\n]/).map(x => x.trim()).filter(x => x.length >= 4);
+    for (const cl of clauses) {
+        if (!CAUSAL_MARK.test(cl) && !OBLIGATION_MARK.test(cl))
+            continue;
+        const g = charNgrams(cl, 2);
+        if (g.size === 0)
+            continue;
+        // 阈值 0.08 ≈ "最多一个偶然重合的 2-gram"：合法的改写型分句（"提供咖啡时应默认无糖"）
+        // 与来源有 咖啡/无糖 这类实质重合，不会被误伤。
+        if (overlapRatio(g, sG) < 0.08)
+            return true;
+    }
+    return false;
+}
 /**
  * 评估一条洞察。
  * @param existing 已有洞察(用于近重复判定);不传则跳过第 3 闸
@@ -92,6 +206,21 @@ export function evaluateInsight(input) {
         if (!evidenceOk)
             reasons.push('evidence-not-in-source');
     }
+    // ═══ 闸 1b/1c/1d（2026-10-31）：引文存在 ≠ 结论被支持 ═══
+    //
+    // 审计 §4.2 的反例：来源「只喝无糖咖啡，不接受加糖」，结论「必须加糖」被接收，
+    // 因为闸 1 只验证引文是来源子串，从不验证结论的方向。这里补三条确定性检查：
+    //   1b 极性冲突：结论与来源在共享术语上方向相反 → evidence-contradicts-claim
+    //   1c 无依据因果：强因果/义务断言在来源里几乎没有词面支持 → unsupported-cause
+    //   1d 缺引文的事实断言：声称用户偏好却不给任何引文 → evidence-missing
+    const strict = p.strictSupport !== false;
+    const conflictTerm = claimSourceConflict(text, srcConcat);
+    if (conflictTerm)
+        reasons.push(`evidence-contradicts-claim:${conflictTerm}`);
+    if (unsupportedCausalClaim(text, srcConcat))
+        reasons.push('unsupported-cause');
+    if (evidenceOk === null && PREFERENCE_MARK.test(text) && strict)
+        reasons.push('evidence-missing');
     // 闸 2:复述(低新颖度且无新增成分)
     if (novelty < p.minNovelty && !hasAdditiveContent(text))
         reasons.push('restatement');
@@ -119,7 +248,8 @@ export function evaluateInsight(input) {
         + 0.2 * Math.min(1, cross / 2)
         + 0.3 * Math.min(1, novelty / 0.6)));
     const blocking = reasons.filter(r => r === 'evidence-not-in-source' || r === 'restatement'
-        || r === 'summary-only' || r === 'near-duplicate');
+        || r === 'summary-only' || r === 'near-duplicate'
+        || r.startsWith('evidence-contradicts-claim') || r === 'unsupported-cause' || r === 'evidence-missing');
     return {
         ok: blocking.length === 0,
         reasons: [...new Set(reasons)],

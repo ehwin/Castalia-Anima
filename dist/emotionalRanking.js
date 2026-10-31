@@ -93,6 +93,32 @@ export function shouldReinforce(channel) {
     return REINFORCEMENT_CHANNELS.has(String(channel || '').toLowerCase());
 }
 /**
+ * 明确只读的渠道（2026-10-31）。
+ *
+ * `shouldReinforce` 定义的是"哪些读取算外部证据级的强化支持"（研究口径，白名单），
+ * 它从来没被执行过 —— 于是 accessChannel:'diagnostic' 的诊断读取照样 +1 访问计数、
+ * 刷新 last_accessed_at，把后续检索分数从 .656 抬到 .845（审计 §4.1）。
+ *
+ * 这个黑名单是**执行口径**：命中即不写访问、不写日志。默认（未标渠道的老调用）
+ * 保持原行为，避免把普通检索的强化一并关掉。
+ *
+ * 现状（评审 P2-2）：执行点已就位，但 `src/` 里目前**没有**把渠道标成 diagnostic 的
+ * 调用方 —— MCP 的 memory_search 走默认 'search'。要真正生效，得在诊断/基准/自检
+ * 的调用点显式传 `accessChannel: 'diagnostic'`（scripts/eval 已这么做）。别把它当成
+ * 「线上已经不会再被诊断读取抬分」来引用。
+ */
+export const NON_REINFORCING_CHANNELS = new Set([
+    'diagnostic', 'injection', 'internal', 'reflection', 'reflect',
+    'self_cycle', 'maintenance', 'audit', 'test', 'dry_run', 'system',
+]);
+export function isNonReinforcingChannel(channel) {
+    return NON_REINFORCING_CHANNELS.has(String(channel || '').toLowerCase());
+}
+/** 该渠道的读取是否允许落库（计数 + 日志）。 */
+export function shouldCountAccess(channel) {
+    return !isNonReinforcingChannel(channel);
+}
+/**
  * 情绪一致性:mood-congruent recall。
  *
  * - 同向(valence 符号一致)加分,反向减分;arousal 越接近越"同调"。
@@ -161,6 +187,15 @@ export function rankBySalience(candidates, now, mood, seeds = [], weights = SALI
         return { id: c.id, score: clamp(score, 0, 1), parts };
     });
     return out.sort((a, b) => b.score - a.score);
+}
+/**
+ * 这个策略能不能真的进注入块。
+ *
+ * 2026-10-31：`context-only`（降为背景）和 `skip`（显著度太低）都不能进；
+ * 调用方此前只排除了前者，`skip` 被漏掉，低显著度记忆照旧出现在提示词里。
+ */
+export function policyAllowsInjection(policy) {
+    return policy === 'always' || policy === 'inject';
 }
 export function injectionPolicy(score, opts = {}) {
     if (opts.pinned)

@@ -47,10 +47,14 @@ const BIAS_DECAY_RATE = Math.LN2 / (BIAS_DECAY_HALF_LIFE_DAYS * 24);
 /**
  * Record topic mentions from a conversation.
  * Call this after each conversation turn.
+ *
+ * `at`（2026-10-31）：这次提及对应的**真实发生时间**。冷启动从库里回填时必须传
+ * 记忆的 created_at —— 否则每次重启都会把三个月前的话题按"刚刚又提了一次"记入，
+ * 旧兴趣被重启刷成新兴趣（审计报告 §5 第 3 项）。缺省仍取当前时间。
  */
-export function recordTopics(characterId: string, topics: string[], project?: string): void {
+export function recordTopics(characterId: string, topics: string[], project?: string, at?: number): void {
   const map = biasMapFor(characterId, project);
-  const now = Date.now();
+  const now = Number.isFinite(at) && (at as number) > 0 ? (at as number) : Date.now();
 
   for (const topic of topics) {
     const key = topic.toLowerCase().trim();
@@ -144,26 +148,34 @@ export function loadBiasesFromDb(characterId: string, project?: string): void {
   if (_biasesLoaded.has(key)) return; // v5.3: prevent double-load from AgentState (now per project)
   _biasesLoaded.add(key);
   try {
-    const allTags: string[] = [];
-    // v1.23.2-fix: 冷启动回填所有已存在的分类库（此前只看 general，user/project 里的 tags 丢了）
+    const staged: Array<{ tags: string[], at: number }> = [];
     for (const mt of DatabaseManager.existingMemTypes(proj)) {
       try {
         const db = DatabaseManager.getInstance(proj, mt);
         const rows = db.prepare(`
-          SELECT tags FROM memory WHERE project = ? AND character_id = ? AND is_active = 1
+          SELECT tags, created_at, updated_at FROM memory WHERE project = ? AND character_id = ? AND is_active = 1
             AND ${publicMemorySourceSql()}
         `).all(proj, characterId) as any[];
         for (const row of rows) {
           try {
             // v1.28-fix: 走唯一共享解码入口 —— 非字符串元素不再下传给 recordTopics/tag.toLowerCase()
-            allTags.push(...parseTagsSafe(row.tags));
+            const tags = parseTagsSafe(row.tags);
+            if (tags.length === 0) continue;
+            const at = Date.parse(String(row.created_at || row.updated_at || '')) || 0;
+            staged.push({ tags, at });
           } catch { /* 脏 tags 忽略 */ }
         }
       } catch { /* 单库失败不影响其它库 */ }
     }
 
-    if (allTags.length > 0) {
-      recordTopics(characterId, allTags, proj);
+    // 时间升序：同一 tag 多次出现时，最后一次写入决定 lastSeen（= 最新那次真实提及）
+    staged.sort((a, b) => a.at - b.at);
+    // 缺时间戳的行（旧库没有 created_at）用已知最早时间兜底，绝不退回 Date.now()
+    const known = staged.filter(s => s.at > 0).map(s => s.at);
+    const fallbackAt = known.length ? Math.min(...known) : 0;
+    for (const item of staged) {
+      const at = item.at > 0 ? item.at : fallbackAt;
+      recordTopics(characterId, item.tags, proj, at > 0 ? at : undefined);
     }
   } catch (e) {
     // DB not ready yet
