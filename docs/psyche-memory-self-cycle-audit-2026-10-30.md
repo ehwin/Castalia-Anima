@@ -108,6 +108,18 @@ facts 增加 `source_memory_source`、`source_memory_mem_type`，并移除不适
 
 未改的部分：批次粒度（一次 flush 最多 15 条只推进一次 psyche）、`self_cycle` 的模板化输出、日记没有自动读取方——这三条属于设计取舍，见 `psyche-full-chain-upgrade-report-2026-10-31.md` §7。
 
+### 2026-10-31 第二批：粒度、可调参、历史表、日记读者
+
+上一条里"未改的部分"已经处理掉三条中的两条半：
+
+1. **粒度**：`emotion.ts` 现在按 `VAD_APPRAISAL_CHUNK`（默认 3）切批，一次 flush 的 15 条对话最多产生 `ceil(n/chunk)` 次 appraisal，而不是 1 次。实测 7 条对话 → `VAD flush: 3 project batch(es), 7 memories tagged`。模型提示词仍是"SINGLE VAD"，但作用域从 15 条缩到 3 条，单句强度不再被整批平均掉。
+2. **可调参**：`psycheState.ts` 新增 `readPsycheTuning()`，基线、各维半衰期、target/event gain、band 进入/维持阈值、证据 TTL 全部可由 env 覆盖（`PSYCHE_BASELINE_*`、`PSYCHE_HALF_LIFE_*_HOURS`、`PSYCHE_TARGET_GAIN`、`PSYCHE_EVENT_GAIN`、`PSYCHE_BAND_ENTER`、`PSYCHE_BAND_HOLD`、`PSYCHE_EVIDENCE_TTL_HOURS`），校准不再需要改代码重建。
+3. **历史表**：新增 append-only `psyche_events`（from/to VAD、baseline、band、version、event_id、at），随被接受的转移在同一事务内写入，重复 eventId 不写；`PSYCHE_EVENT_RETENTION_DAYS`（默认 90）控制保留。这是把审计 §7.5"用轨迹拟合衰减与阈值"变成可做的事——之前只有当前一行，没有轨迹可拟合。
+4. **日记的合法读者**：`context_get` 新增 `includeDiary: true`（默认 false），返回 `derivedDiary`（带 `derived: true`、`evidenceIds`、`stateVersion`）并在状态块追加"派生观察（自我日记，不是用户事实，仅作背景）"。默认过滤一条都没放宽。
+5. **测试去绝对路径**：`regression_psyche_parse.mjs` 找不到仓外传感器时打印 `SKIP` 并 exit 0（可用 `PSYCHE_SENSOR_SCRIPT` 指定路径），不再在新机器上抛 ENOENT 冒充回归失败。
+
+仍在的原设计取舍：`self_cycle` 输出仍是模板拼接，没有 LLM 反思；日记除了上面这个显式入口，没有别的消费者。
+
 ## 验证
 
 已通过：

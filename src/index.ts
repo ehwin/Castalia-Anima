@@ -105,6 +105,48 @@ function unifiedStatePrompt(state: ReturnType<typeof getAgentState>, psyche: Ret
   return lines.join('\n');
 }
 
+/**
+ * The one explicit reader for self-cycle output.
+ *
+ * Diary rows are derived observations, so every default path (search, recall,
+ * injection, reflect, consolidate, facts, entities) excludes them. That left
+ * the whole self-cycle write-only: nothing ever read what it produced. This
+ * helper returns the newest diary for a role so a caller can opt in via
+ * `context_get { includeDiary: true }` without widening any default filter.
+ */
+function latestSelfDiary(project: string): {
+  id: string;
+  text: string;
+  createdAt: string;
+  evidenceIds: string[];
+  stateVersion: number;
+} | null {
+  try {
+    const db = DatabaseManager.getInstance(project, 'project');
+    const row = db.prepare(`
+      SELECT id, text, created_at AS createdAt, metadata
+      FROM memory
+      WHERE source = 'agent_diary' AND subject = 'self' AND project = ?
+        AND character_id = ? AND is_active = 1
+      ORDER BY datetime(created_at) DESC, rowid DESC
+      LIMIT 1
+    `).get(project, CHAR_ID) as any;
+    if (!row) return null;
+    let meta: any = {};
+    try { meta = JSON.parse(String(row.metadata || '{}')); } catch { /* legacy diary */ }
+    return {
+      id: String(row.id),
+      text: String(row.text || ''),
+      createdAt: String(row.createdAt || ''),
+      evidenceIds: Array.isArray(meta?.evidence_ids) ? meta.evidence_ids.map(String) : [],
+      stateVersion: Number(meta?.state_version) || 1,
+    };
+  } catch {
+    // A project without a `project` memType bank simply has no diary yet.
+    return null;
+  }
+}
+
 /** Sweep every known project for pending affect work. */
 function scheduleDigestSweep(): void {
   const projects = new Set<string>([normalizeProject()]);
@@ -488,7 +530,10 @@ register(
 register(
   'context_get', 'admin',
   'Get agent state (mood/energy/desire), bias layer, user profile, and memory context summary for prompt injection.',
-  { project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")') },
+  {
+    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
+    includeDiary: z.boolean().optional().describe('Opt in to the newest self-cycle diary as an explicitly-labelled derived observation. Default false: diary rows never enter ordinary context.'),
+  },
   async (args) => {
     try {
       const proj = normalizeProject(args.project);
@@ -498,13 +543,20 @@ register(
       const bias = getBiasPrompt(CHAR_ID, args.project);
       const profile = getUserProfilePrompt(CHAR_ID, 'default', args.project);
       const recent = getRecentMemories(CHAR_ID, 5, 24, proj);
+      const diary = args.includeDiary === true ? latestSelfDiary(proj) : null;
       // memdir 分库:总数跨 user/feedback/project/reference/general 聚合(v1.24: 只数本角色)
       const total = DatabaseManager.queryAll<{ c: number }>(args.project,
         "SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')", [proj, CHAR_ID])
         .reduce((n, r) => n + (r.c || 0), 0);
+      const stateText = roleDeclaration() + '\n' + unifiedStatePrompt(state, psyche)
+        + (diary
+          ? '\n派生观察（自我日记，不是用户事实，仅作背景）：' + diary.text.replace(/\s+/g, ' ').trim().slice(0, 240)
+          : '')
       return ok({
         op: 'context',
-        state: roleDeclaration() + '\n' + unifiedStatePrompt(state, psyche),
+        state: stateText,
+        // Only present when explicitly requested; typed as a derived record.
+        ...(diary ? { derivedDiary: { ...diary, derived: true } } : {}),
         psyche: {
           band: psyche.hasEvidence ? psyche.band : 'neutral',
           hasEvidence: psyche.hasEvidence,

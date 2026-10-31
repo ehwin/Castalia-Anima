@@ -549,6 +549,29 @@ export function initProjectSchema(db) {
       claimed_at TEXT NOT NULL,
       PRIMARY KEY (project, character_id, evidence_key)
     );
+
+    -- Append-only history of accepted psyche transitions. psyche_state keeps
+    -- only the current row, which makes replay/calibration impossible: the
+    -- audit's §7 asks for half-life and threshold fitting from trajectories,
+    -- and there was no trajectory to fit. One row per accepted appraisal.
+    CREATE TABLE IF NOT EXISTS psyche_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project TEXT NOT NULL,
+      character_id TEXT NOT NULL,
+      at INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      event_id TEXT,
+      from_valence REAL NOT NULL,
+      from_arousal REAL NOT NULL,
+      from_dominance REAL NOT NULL,
+      to_valence REAL NOT NULL,
+      to_arousal REAL NOT NULL,
+      to_dominance REAL NOT NULL,
+      baseline_valence REAL NOT NULL,
+      band TEXT NOT NULL,
+      version INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_psyche_events_role ON psyche_events(project, character_id, at);
   `);
     // Safe column migrations (may already exist)
     const migrations = [

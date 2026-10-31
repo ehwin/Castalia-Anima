@@ -7,6 +7,34 @@ export const DEFAULT_PSYCHE_BASELINE = {
 };
 /** 3× the valence half-life: leftover deviation is ~12%, i.e. no longer an observation. */
 export const DEFAULT_EVIDENCE_TTL_HOURS = 72;
+function envNumber(name, fallback) {
+    const raw = Number(process.env[name]);
+    return Number.isFinite(raw) ? raw : fallback;
+}
+/**
+ * Runtime tuning. The constants below started as placeholders: the audit says
+ * half-life and thresholds must come from a replay/calibration set, so every
+ * one of them is overridable from the environment instead of needing a rebuild.
+ */
+export function readPsycheTuning() {
+    return {
+        baseline: {
+            valence: envNumber('PSYCHE_BASELINE_VALENCE', DEFAULT_PSYCHE_BASELINE.valence),
+            arousal: envNumber('PSYCHE_BASELINE_AROUSAL', DEFAULT_PSYCHE_BASELINE.arousal),
+            dominance: envNumber('PSYCHE_BASELINE_DOMINANCE', DEFAULT_PSYCHE_BASELINE.dominance),
+        },
+        halfLife: {
+            valence: envNumber('PSYCHE_HALF_LIFE_VALENCE_HOURS', DEFAULT_HALF_LIFE.valence),
+            arousal: envNumber('PSYCHE_HALF_LIFE_AROUSAL_HOURS', DEFAULT_HALF_LIFE.arousal),
+            dominance: envNumber('PSYCHE_HALF_LIFE_DOMINANCE_HOURS', DEFAULT_HALF_LIFE.dominance),
+        },
+        targetGain: envNumber('PSYCHE_TARGET_GAIN', 0.55),
+        eventGain: envNumber('PSYCHE_EVENT_GAIN', 0.35),
+        bandEnter: envNumber('PSYCHE_BAND_ENTER', 0.25),
+        bandHold: envNumber('PSYCHE_BAND_HOLD', 0.1),
+        evidenceTtlHours: envNumber('PSYCHE_EVIDENCE_TTL_HOURS', DEFAULT_EVIDENCE_TTL_HOURS),
+    };
+}
 const psycheStates = new Map();
 const loadedKeys = new Set();
 const loadWarnings = new Set();
@@ -23,7 +51,7 @@ function finite(value) {
     const n = typeof value === 'number' ? value : Number(value);
     return Number.isFinite(n) ? n : undefined;
 }
-function bandFor(valence, baselineValence, previous) {
+function bandFor(valence, baselineValence, previous, enter, hold) {
     // Hysteresis prevents a model hovering around a boundary from changing the
     // externally visible label on every turn.
     //
@@ -32,13 +60,13 @@ function bandFor(valence, baselineValence, previous) {
     // be re-crossed by decay (it converges on 0.40 → permanently "positive",
     // and a negative event used to flip to "positive" after ~10 days of silence).
     const rel = valence - baselineValence;
-    if (previous === 'positive' && rel > 0.1)
+    if (previous === 'positive' && rel > hold)
         return 'positive';
-    if (previous === 'negative' && rel < -0.1)
+    if (previous === 'negative' && rel < -hold)
         return 'negative';
-    if (rel >= 0.25)
+    if (rel >= enter)
         return 'positive';
-    if (rel <= -0.25)
+    if (rel <= -enter)
         return 'negative';
     return 'neutral';
 }
@@ -49,10 +77,11 @@ function decay(current, baseline, elapsedHours, halfLife) {
     return baseline + (current - baseline) * factor;
 }
 export function createPsycheState(baseline = {}, now = Date.now()) {
+    const tuning = readPsycheTuning();
     const b = {
-        valence: clamp(finite(baseline.valence) ?? DEFAULT_PSYCHE_BASELINE.valence),
-        arousal: clamp(finite(baseline.arousal) ?? DEFAULT_PSYCHE_BASELINE.arousal),
-        dominance: clamp(finite(baseline.dominance) ?? DEFAULT_PSYCHE_BASELINE.dominance),
+        valence: clamp(finite(baseline.valence) ?? tuning.baseline.valence),
+        arousal: clamp(finite(baseline.arousal) ?? tuning.baseline.arousal),
+        dominance: clamp(finite(baseline.dominance) ?? tuning.baseline.dominance),
     };
     return {
         version: 1,
@@ -74,7 +103,8 @@ export function transitionPsycheState(previous, appraisal, now = Date.now(), opt
     // apply the same decay twice.
     const effectiveNow = Math.max(Number.isFinite(now) ? now : Date.now(), previous.updatedAt);
     const elapsedHours = Math.max(0, effectiveNow - previous.updatedAt) / 3600000;
-    const halfLife = { ...DEFAULT_HALF_LIFE, ...(options.halfLifeHours || {}) };
+    const tuning = readPsycheTuning();
+    const halfLife = { ...tuning.halfLife, ...(options.halfLifeHours || {}) };
     const decayed = {
         valence: decay(previous.vad.valence, previous.baseline.valence, elapsedHours, halfLife.valence),
         arousal: decay(previous.vad.arousal, previous.baseline.arousal, elapsedHours, halfLife.arousal),
@@ -99,7 +129,7 @@ export function transitionPsycheState(previous, appraisal, now = Date.now(), opt
     // deltas around the current state, so applying the target gain to them would
     // make one noisy turn dominate the short-term psyche. Callers can still
     // provide eventGain when a source has its own calibration.
-    const gain = clamp(finite(options.eventGain) ?? (effectiveKind === 'target' ? 0.55 : 0.35), 0, 1);
+    const gain = clamp(finite(options.eventGain) ?? (effectiveKind === 'target' ? tuning.targetGain : tuning.eventGain), 0, 1);
     const next = { ...decayed };
     if (shouldApply) {
         if (effectiveKind === 'neutral') {
@@ -149,7 +179,7 @@ export function transitionPsycheState(previous, appraisal, now = Date.now(), opt
     // gets the state back, even after days of pure `abstain`.
     const evidenceTtlHours = finite(options.evidenceTtlHours) !== undefined
         ? Math.max(1, Number(options.evidenceTtlHours))
-        : DEFAULT_EVIDENCE_TTL_HOURS;
+        : Math.max(1, tuning.evidenceTtlHours);
     // -1 means "never observed"; 0 is a legitimate timestamp in tests and replays.
     const evidenceAgeHours = previous.lastEvidenceAt >= 0
         ? (effectiveNow - previous.lastEvidenceAt) / 3600000
@@ -177,7 +207,7 @@ export function transitionPsycheState(previous, appraisal, now = Date.now(), opt
                     ? previous.band
                     : holdNeutralBand
                         ? 'neutral'
-                        : bandFor(next.valence, previous.baseline.valence, previous.band))
+                        : bandFor(next.valence, previous.baseline.valence, previous.band, tuning.bandEnter, tuning.bandHold))
             : 'neutral',
         updatedAt: effectiveNow,
         processedEventIds,
@@ -329,6 +359,34 @@ export function getPsycheState(characterId, project, now = Date.now()) {
     }
     return cloneState(state);
 }
+/**
+ * Append one row per accepted appraisal. Retention is bounded so the history
+ * cannot grow without limit inside the general database.
+ */
+function recordPsycheEvent(db, project, characterId, base, next, appraisal) {
+    const retentionDays = Math.max(1, envNumber('PSYCHE_EVENT_RETENTION_DAYS', 90));
+    try {
+        const eventId = typeof appraisal.eventId === 'string' ? appraisal.eventId : null;
+        db.prepare(`
+      INSERT INTO psyche_events (
+        project, character_id, at, kind, event_id,
+        from_valence, from_arousal, from_dominance,
+        to_valence, to_arousal, to_dominance,
+        baseline_valence, band, version
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(project, characterId, next.updatedAt, String(appraisal.kind || 'unknown'), eventId, base.vad.valence, base.vad.arousal, base.vad.dominance, next.vad.valence, next.vad.arousal, next.vad.dominance, next.baseline.valence, next.band, next.version);
+        db.prepare('DELETE FROM psyche_events WHERE project = ? AND character_id = ? AND at < ?')
+            .run(project, characterId, Date.now() - retentionDays * 86400000);
+    }
+    catch (error) {
+        // History is observability, not correctness: never fail the transition.
+        const key = `${project}|${characterId}`;
+        if (!persistWarnings.has(key)) {
+            persistWarnings.add(key);
+            console.warn(`[psyche] event history write failed for ${key}: ${error?.message || error}`);
+        }
+    }
+}
 export function applyPsycheAppraisal(characterId, project, appraisal, now = Date.now(), options = {}) {
     characterId = normalizeCharacterId(characterId);
     const key = stateKey(characterId, project);
@@ -367,6 +425,8 @@ export function applyPsycheAppraisal(characterId, project, appraisal, now = Date
           last_evidence_at = excluded.last_evidence_at,
           processed_event_ids = excluded.processed_event_ids
       `).run(proj, characterId, next.version, next.hasEvidence ? 1 : 0, next.baseline.valence, next.baseline.arousal, next.baseline.dominance, next.vad.valence, next.vad.arousal, next.vad.dominance, next.band, next.updatedAt, next.lastEvidenceAt, JSON.stringify(next.processedEventIds));
+            if (next.version > base.version)
+                recordPsycheEvent(db, proj, characterId, base, next, appraisal);
             db.exec('COMMIT');
             persisted = true;
         }

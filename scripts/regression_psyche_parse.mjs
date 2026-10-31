@@ -3,7 +3,14 @@
 import fs from 'node:fs';
 import vm from 'node:vm';
 
-const deployed = 'D:/castalia/run/Castalia/scripts/psyche_npu.mjs';
+const deployed = process.env.PSYCHE_SENSOR_SCRIPT || 'D:/castalia/run/Castalia/scripts/psyche_npu.mjs';
+if (!fs.existsSync(deployed)) {
+  // The sensor is deployed outside this repo (it belongs to the runtime tree),
+  // so a missing path must be an explicit skip, not an ENOENT crash that looks
+  // like a failing regression on a fresh machine.
+  console.log(`SKIP psyche parse regression: sensor not found at ${deployed} (set PSYCHE_SENSOR_SCRIPT to point at it)`);
+  process.exit(0);
+}
 const source = fs.readFileSync(deployed, 'utf8');
 const start = source.indexOf('function parseVal(txt)');
 const end = source.indexOf('function loadCfg', start);

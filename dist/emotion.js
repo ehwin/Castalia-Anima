@@ -712,7 +712,16 @@ async function flushVadQueueInternal(project, opts = {}) {
             continue;
         // Drop stale pointers. They must not be requeued forever and must never
         // become affect evidence after a source row changed underneath the queue.
-        batches.push({ project: proj, characterId, entries: verified });
+        //
+        // Psyche advances once per batch, and the model is asked for a SINGLE VAD
+        // across the whole batch. One batch of 15 turns therefore collapsed 15
+        // utterances into one state step, so a single cutting remark was averaged
+        // away by its neighbours. Split the verified rows into bounded appraisal
+        // chunks instead: 15 turns become at most ceil(15/chunk) transitions.
+        const chunkSize = Math.max(1, Math.min(VAD_QUEUE_MAX_SIZE, Number.parseInt(process.env.VAD_APPRAISAL_CHUNK || '3', 10) || 3));
+        for (let i = 0; i < verified.length; i += chunkSize) {
+            batches.push({ project: proj, characterId, entries: verified.slice(i, i + chunkSize) });
+        }
     }
     if (batches.length === 0) {
         if (stale.size > 0)
