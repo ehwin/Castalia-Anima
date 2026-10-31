@@ -20,7 +20,7 @@ fs.writeFileSync(path.join(temp, 'config.json'), JSON.stringify({}))
 Object.assign(process.env, {
   MEMORY_DB_DIR: temp,
   MEMORY_CONFIG: path.join(temp, 'config.json'),
-  CHAR_ID: 'airi',
+  CHAR_ID: 'default',
   CASTALIA_PROJECT: 'looptest',
   EMBED_MODE: 'none',
 })
@@ -55,25 +55,25 @@ const rows = [
   { text: '用户熬夜折腾技术到凌晨三点，第二天照样上班', tags: ['习惯'] },
   { text: '下周三要去医院复查，记得提前一天提醒', tags: ['日程'] },
 ]
-for (const r of rows) await saveMemory({ ...r, type: 'semantic', memType: 'general', importance: 0.8, characterId: 'airi', project: 'looptest' })
+for (const r of rows) await saveMemory({ ...r, type: 'semantic', memType: 'general', importance: 0.8, characterId: 'default', project: 'looptest' })
 
 const sumAccessed = () => Number(db.prepare('SELECT COALESCE(SUM(accessed_count),0) s FROM memory').get().s)
 // 词法覆盖率要过 0.2 的门（'我喜欢什么样的散步' 只有 0.163，会被门槛挡掉，不能拿它做断言）
 const q = '用户喜欢散步'
 
 const before = sumAccessed()
-const inj = await recallForInjection(q, { project: 'looptest', characterId: 'airi' })
+const inj = await recallForInjection(q, { project: 'looptest', characterId: 'default' })
 const afterInj = sumAccessed()
 eq(afterInj, before, '注入路径不得刷新 accessed_count')
 check(inj.stats.count > 0, '注入本身要能命中（否则上面的断言是空转）')
 check(inj.text.includes('<memory'), '注入块仍带容器')
 
-await searchMemory({ query: q, project: 'looptest', characterId: 'airi', topK: 3, minScore: 0, profile: 'deep', includeGeneral: true })
+await searchMemory({ query: q, project: 'looptest', characterId: 'default', topK: 3, minScore: 0, profile: 'deep', includeGeneral: true })
 const afterSearch = sumAccessed()
 check(afterSearch > afterInj, '用户主动检索必须照常记账')
 
 // 注入两次也不能把计数带起来（同话题连续两轮是常态）
-await recallForInjection(q, { project: 'looptest', characterId: 'airi' })
+await recallForInjection(q, { project: 'looptest', characterId: 'default' })
 eq(sumAccessed(), afterSearch, '第二次注入同样不记账')
 
 DatabaseManager.close()

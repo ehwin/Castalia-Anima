@@ -1,7 +1,7 @@
 /**
  * 本地情感词表(affect lexicon)—— 离线 VAD 回退
  *
- * 为什么需要:实测 airi bank **262 条活跃记忆里 0 条有 vad_valence**,原因是引擎唯一的
+ * 为什么需要:实测 default bank **262 条活跃记忆里 0 条有 vad_valence**,原因是引擎唯一的
  * VAD 来源是 `ollamaDetectVAD`(emotion.ts),而本机 Ollama 根本没跑(11434 无监听)。
  * 于是 search.ts 的 computeEmotionalIntensity 永远走 emotional_impact 回退(多数为 0),
  * 情感权重 0.12 × 0 = 0 —— 整套情感机制在线上是空转的。

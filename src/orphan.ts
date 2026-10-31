@@ -13,7 +13,7 @@
  *  - dryRun 只报告不写,必须先跑一遍再落地。
  *
  * 与 LivingMemory 的 snapshot 对账是同一个问题的两种解:它按 turn 快照删尾部,我们按
- * session 存活集合对账 —— 我们这边的锚点只有 session 级(见 airi bank:38 条有 session_id)。
+ * session 存活集合对账 —— 我们这边的锚点只有 session 级(见 default bank:38 条有 session_id)。
  */
 import type Database from 'better-sqlite3';
 import { excludeRawMaterialSql } from './memoryProvenance.js';

@@ -6,8 +6,8 @@
  *   node scripts/audit_orphans.mjs --alive a,b,c          # 对账(dry-run)
  *   node scripts/audit_orphans.mjs --alive a,b,c --apply  # 真软删
  *
- * 环境:MEMORY_DB_DIR 指向 bank 根(如 D:/castalia/memory-banks/airi),
- *      --project 默认取 CASTALIA_PROJECT 或 'airi'。
+ * 环境:MEMORY_DB_DIR 指向 bank 根(如 D:/castalia/memory-banks/default),
+ *      --project 默认取 CASTALIA_PROJECT 或 'default'。
  */
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -19,7 +19,7 @@ const argv = process.argv.slice(2);
 const arg = (k, d) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] : d; };
 const APPLY = argv.includes('--apply');
 const aliveArg = arg('--alive', '');
-const project = arg('--project', process.env.CASTALIA_PROJECT || 'airi');
+const project = arg('--project', process.env.CASTALIA_PROJECT || 'default');
 
 if (!process.env.MEMORY_DB_DIR) {
   console.error('需要 MEMORY_DB_DIR(bank 根)');

@@ -1,13 +1,14 @@
 {
-  "name": "castalia-anima",
-  "version": "1.23.2",
-  "description": "Castalia Anima — emotional memory MCP server: Castalia core + agent state, bias layer, user learning, emotion-weighted search",
+  "name": "castalia-anima-memory",
+  "version": "2.0.0",
+  "description": "Emotional memory body MCP server: memory store/search/reflect/facts/entities with VAD-weighted retrieval, no runtime emotional state machine. Cross-library reflection ships as an opt-in CLI plugin.",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "build": "node scripts/gen_version.mjs && tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
-    "fed-server": "node dist/fedServer.js"
+    "fed-server": "node dist/fedServer.js",
+    "full-pipeline": "node dist/plugins/fullPipeline/cli.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
@@ -24,12 +25,14 @@
   },
   "bin": {
     "castalia": "dist/index.js",
-    "castalia-federation": "dist/fedServer.js"
+    "castalia-federation": "dist/fedServer.js",
+    "castalia-full-pipeline": "dist/plugins/fullPipeline/cli.js"
   },
   "allowScripts": {
     "better-sqlite3": true
   },
   "engines": {
     "node": ">=20"
-  }
+  },
+  "license": "MIT"
 }

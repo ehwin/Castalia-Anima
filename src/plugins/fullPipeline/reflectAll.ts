@@ -15,22 +15,22 @@ import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import fs from 'node:fs';
 import path from 'node:path';
-import { resolveFedLibraries, type FedLibrary } from './federation/index.js';
-import { currentMemDir, DatabaseManager, generateId, initProjectSchema, memTypeDir } from './db.js';
-import { evaluateInsight, charNgrams } from './insightQuality.js';
-import { localDayOffset } from './dayKey.js';
-import { makeLlmChannel, callLlm, REFLECT_DEEP_MAX_TOKENS } from './reflectionLlm.js';
-import { normalizeMemType, MemType } from './memType.js';
-import { EMOTIONAL_FIDELITY, wholeRecordBatches } from './reflectionFidelity.js';
-import { CHAR_ID } from './env.js';
+import { resolveFedLibraries, type FedLibrary } from '../../federation/index.js';
+import { currentMemDir, DatabaseManager, generateId, initProjectSchema, memTypeDir } from '../../db.js';
+import { evaluateInsight, charNgrams } from '../../insightQuality.js';
+import { localDayOffset } from '../../dayKey.js';
+import { makeLlmChannel, callLlm, REFLECT_DEEP_MAX_TOKENS } from '../../reflectionLlm.js';
+import { normalizeMemType, MemType } from '../../memType.js';
+import { EMOTIONAL_FIDELITY, wholeRecordBatches } from '../../reflectionFidelity.js';
+import { CHAR_ID } from '../../env.js';
 import crypto from 'node:crypto';
-import { serializeTags } from './tags.js';
+import { serializeTags } from '../../tags.js';
 
 export interface ReflectAllOptions {
   maxTotal?: number;   // 总记忆数上限,默认 300
   maxPerLib?: number;  // 每库上限,默认 100
   dryRun?: boolean;    // true = 只分析不写入
-  projects?: string[]; // 只反思指定 project 库(如 ['hermes']),默认全部库
+  projects?: string[]; // 只反思指定 project 库(如 ['shared']),默认全部库
   all?: boolean;       // true = 忽略增量账本,全量反思(逃生门)
 }
 

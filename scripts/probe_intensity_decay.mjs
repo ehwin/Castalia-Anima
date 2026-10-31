@@ -4,7 +4,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const DIST = 'D:/AI/castalia/Castalia-Anima/dist';
-const BANK = process.argv[2] || 'D:/castalia/memory-banks/airi';
+const BANK = process.argv[2] || 'D:/castalia/memory-banks/default';
 const emo = await import(pathToFileURL(path.join(DIST, 'emotion.js')).href);
 const D = (await import('better-sqlite3')).default;
 

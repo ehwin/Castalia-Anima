@@ -203,7 +203,7 @@ export interface SalienceResult {
  *
  * @param candidates 候选(通常 = 词法/向量/标签召回并集)
  * @param now 当前时间 ms
- * @param mood 当前心情(AIRI 的 VAD)
+ * @param mood 当前心情(−10..+10；调用方给就给，不给按中性)
  * @param seeds 已确定在场的记忆 id(用于共振)
  */
 export function rankBySalience(

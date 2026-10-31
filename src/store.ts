@@ -167,9 +167,6 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
       throw new Error('agent_diary memories must be written through saveSelfDiary()');
     }
   }
-  if (params.source === 'agent_state') {
-    throw new Error('agent_state memories are runtime snapshots and must use the AgentState writer');
-  }
   const now = new Date().toISOString();
   const skipEmbed = params.skipEmbed === true;
   const project = normalizeProject(params.project);
@@ -222,7 +219,7 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
     // must not make the local fallback overwrite the durable result.
     const affectStatus = String(exactDup.affect_status ?? '').trim();
     const needsVad = params.source === 'conversation_log'
-      && (['pending', 'pending_psyche'].includes(affectStatus)
+      && (affectStatus === 'pending'
         || (!affectStatus
           && exactDup.vad_valence == null
           && exactDup.vad_arousal == null
@@ -320,7 +317,7 @@ export async function saveMemory(params: StoreParams): Promise<MemoryRecord> {
   const metadata = serializeMetadata(params.metadata);
 
   // 写路径补情感(2026-10-29):嵌入形态下没有 autoProcess/digest 周期,VAD 的唯一来源
-  // Ollama 通常不在跑(实测 airi bank 262 条 0 条 VAD)。所以落库时用词表补一次:
+  // Ollama 通常不在跑(实测 default bank 262 条 0 条 VAD)。所以落库时用词表补一次:
   // 只补空缺(调用方给了 emotionalImpact 就尊重),只影响 vad_*/emotional_impact。
   // 放在 store 层而不是宿主层:bank.save、store-tools、MCP、直连引擎都走这里,只写一处。
   let writeVad: { valence: number; arousal: number; dominance: number } | null = null;
@@ -523,9 +520,6 @@ export async function updateMemory(id: string, updates: Partial<StoreParams>, ch
       throw new Error('agent_diary memories are immutable; use the self-cycle writer');
     }
   }
-  if (existing.source === 'agent_state') {
-    throw new Error('agent_state memories are runtime snapshots; use the AgentState writer');
-  }
 
   // memdir 跨分类移动:memType 变更 → 复制到新分类库 + 软删原库
   const newMt = updates.memType !== undefined ? normalizeMemType(updates.memType) : found.memType;
@@ -643,8 +637,6 @@ export async function saveConversationTurn(
   userMsg: string,
   assistantMsg: string,
   characterId: string = CHAR_ID,
-  moodValue?: number,
-  moodReason?: string,
   project?: string,  // v1.5: 项目隔离
 ): Promise<any> {
   characterId = normalizeCharacterId(characterId);
@@ -653,15 +645,8 @@ export async function saveConversationTurn(
   const id = generateId();
   const proj = normalizeProject(project);
 
-  let moodPrefix = '';
-  if (moodValue !== undefined) {
-    moodPrefix = `[mood: ${moodValue}`;
-    if (moodReason) moodPrefix += `, "${moodReason}"`;
-    moodPrefix += ']\n';
-  }
-
   const assistantName = (process.env.CASTALIA_ASSISTANT_NAME || '助手').trim() || '助手';
-  const text = `${moodPrefix}用户: ${userMsg}\n${assistantName}: ${assistantMsg}`;
+  const text = `用户: ${userMsg}\n${assistantName}: ${assistantMsg}`;
 
   db.prepare(`
     INSERT INTO memory (id, text, project, type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, affect_status, affect_source)

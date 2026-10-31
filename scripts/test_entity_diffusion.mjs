@@ -20,7 +20,7 @@ function check(name, cond, detail = '') {
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'castalia-entity-'));
 process.env.MEMORY_DB_DIR = tmp;
-process.env.CHAR_ID = 'airi';
+process.env.CHAR_ID = 'default';
 process.env.EMBED_MODE = 'none';
 
 const dbMod = await import(pathToFileURL(path.join(DIST, 'db.js')).href);
@@ -36,7 +36,7 @@ const texts = {
 };
 const ids = {};
 for (const [k, text] of Object.entries(texts)) {
-  const r = await storeMod.saveMemory({ text, project: 'default', characterId: 'airi', skipEmbed: true });
+  const r = await storeMod.saveMemory({ text, project: 'default', characterId: 'default', skipEmbed: true });
   ids[k] = r.id;
 }
 
@@ -52,7 +52,7 @@ entMod.linkMemoryToEntityIds(db, ids.C, [entRain.id]);                // 只共�
 console.log(`[entity-diffusion] 临时库 ${tmp}`);
 
 const hits = await searchMod.searchMemory({
-  query: '黑潮', project: 'default', characterId: 'airi', topK: 5, minScore: 0,
+  query: '黑潮', project: 'default', characterId: 'default', topK: 5, minScore: 0,
 });
 const byId = new Map(hits.map(h => [h.id, h]));
 
@@ -74,7 +74,7 @@ check('C 未命中', !byId.has(ids.C), [...byId.keys()].join(','));
 
 console.log('\n4) 关闭开关后行为回到原样');
 const noExpand = await searchMod.searchMemory({
-  query: '黑潮', project: 'default', characterId: 'airi', topK: 5, minScore: 0, noEntityExpand: true,
+  query: '黑潮', project: 'default', characterId: 'default', topK: 5, minScore: 0, noEntityExpand: true,
 });
 check('noEntityExpand:true 时 B 不再出现', !noExpand.some(h => h.id === ids.B), noExpand.map(h => h.basis).join(','));
 

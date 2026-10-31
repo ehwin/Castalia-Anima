@@ -16,7 +16,7 @@ Object.assign(process.env, {
   MEMORY_CONFIG: config,
   EMBED_MODE: 'none',
   CASTALIA_PROJECT: 'duplicate-enqueue',
-  CHAR_ID: 'airi',
+  CHAR_ID: 'default',
   OLLAMA_URL: 'http://127.0.0.1:1',
 });
 
@@ -32,7 +32,7 @@ const project = 'duplicate-enqueue';
 const params = {
   text: '用户: 我很开心，今天聊得很好\n助手: 我也很开心',
   project,
-  characterId: 'airi',
+  characterId: 'default',
   memType: 'general',
   source: 'conversation_log',
   subject: 'user',
@@ -40,30 +40,30 @@ const params = {
 };
 
 const first = await saveMemory(params);
-assert.equal(vadQueueStatus(project, 'airi').size, 1, 'first conversation save queues affect work');
+assert.equal(vadQueueStatus(project, 'default').size, 1, 'first conversation save queues affect work');
 
 const pendingDuplicate = await saveMemory(params);
 assert.equal(pendingDuplicate.id, first.id, 'exact duplicate returns the original row');
-assert.equal(vadQueueStatus(project, 'airi').size, 1, 'pending duplicate does not add a second queue entry');
+assert.equal(vadQueueStatus(project, 'default').size, 1, 'pending duplicate does not add a second queue entry');
 
 await flushVadQueue(project, { force: true });
 const db = DatabaseManager.getInstance(project, 'general');
 const analyzed = db.prepare('SELECT affect_status FROM memory WHERE id = ?').get(first.id);
 assert.equal(analyzed?.affect_status, 'analyzed', 'fallback flush durably marks the row analyzed');
-assert.equal(vadQueueStatus(project, 'airi').size, 0, 'flush drains the pending queue');
+assert.equal(vadQueueStatus(project, 'default').size, 0, 'flush drains the pending queue');
 
 await saveMemory(params);
-assert.equal(vadQueueStatus(project, 'airi').size, 0, 'analyzed duplicate does not restart affect processing');
+assert.equal(vadQueueStatus(project, 'default').size, 0, 'analyzed duplicate does not restart affect processing');
 
 db.prepare('UPDATE memory SET affect_status = ?, vad_valence = NULL, vad_arousal = NULL, vad_dominance = NULL WHERE id = ?')
   .run('abstain', first.id);
 await saveMemory(params);
-assert.equal(vadQueueStatus(project, 'airi').size, 0, 'abstained duplicate does not restart affect processing');
+assert.equal(vadQueueStatus(project, 'default').size, 0, 'abstained duplicate does not restart affect processing');
 
 db.prepare('UPDATE memory SET affect_status = NULL, vad_valence = NULL, vad_arousal = NULL, vad_dominance = NULL WHERE id = ?')
   .run(first.id);
 await saveMemory(params);
-assert.equal(vadQueueStatus(project, 'airi').size, 1, 'missing affect status can be recovered by a duplicate save');
+assert.equal(vadQueueStatus(project, 'default').size, 1, 'missing affect status can be recovered by a duplicate save');
 
 DatabaseManager.close();
 fs.rmSync(temp, { recursive: true, force: true });

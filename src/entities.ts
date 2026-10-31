@@ -43,7 +43,7 @@ export function isUsableEntityKey(key: string, kind: EntityKind = 'topic'): bool
  * 给实体分类,便于把"角色位/文件路径/URL/配置项/数字"从真正的知识实体里分出来。
  *
  * 为什么需要:实测线上数据里,从 facts.object 直接归一化出来的实体有相当比例是
- * `D:\AI\...`、`http://localhost:11434`、`.env.bak-20260731`、`1024`、`¥0.07/M` 这类东西。
+ * `C:\path\...`、`http://localhost:11434`、`.env.bak-20260731`、`1024`、`¥0.07/M` 这类东西。
  * 它们不是知识图谱的节点,而是"当时顺手记下的字符串"。分类之后:
  *   - 查询仍能命中(kind 只是标注,不删数据);
  *   - memory_graph 只画 topic/role,不把路径噪声画成节点。
@@ -79,7 +79,7 @@ export function classifyEntityKey(key: string): EntityKind {
   return 'topic';
 }
 
-/** 路径/URL 这类键保留分隔符(否则 `D:\AI\x` 会变成 `d ai x`,再也匹配不回去) */
+/** 路径/URL 这类键保留分隔符(否则 `C:\path\x` 会变成 `d ai x`,再也匹配不回去) */
 export function entityKeyFor(raw: string, kind: EntityKind): string {
   const s = String(raw ?? '').trim();
   return kind === 'path' || kind === 'url' ? s.toLowerCase() : normalizeEntityKey(s);
@@ -245,7 +245,7 @@ export function linkMemoryToEntities(db: any, memoryId: string | null | undefine
 /** 名字 → 实体:先精确 key,再前缀,再包含(都按 mention_count 排序) */
 export function findEntities(db: any, query: string, limit = 10): any[] {
   const raw = String(query ?? '').trim();
-  // 同时试"归一化键"和"路径/URL 原样小写键",否则 D:\AI\x 这类查询永远匹配不到
+  // 同时试"归一化键"和"路径/URL 原样小写键",否则 C:\path\x 这类查询永远匹配不到
   const keys = [...new Set([normalizeEntityKey(raw), raw.toLowerCase()])].filter(Boolean);
   if (keys.length === 0) return [];
   const clauses = keys.map(() => 'key = ? OR key LIKE ? OR key LIKE ?').join(' OR ');

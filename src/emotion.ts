@@ -14,7 +14,6 @@ import { normalizeCharacterId, normalizeProject, CHAR_ID } from './env.js';
 import { scoreAffect, affectImpact } from './affectLexicon.js';
 import { DatabaseManager } from './db.js';
 import { serializeTags } from './tags.js';
-import { applyPsycheAppraisal, targetAppraisalFromVAD } from './psycheState.js';
 
 // ═══════════════════════════════════════════════════════════════════
 // Types
@@ -64,7 +63,7 @@ export interface DecayedVAD {
 // ═══════════════════════════════════════════════════════════════════
 
 /** Anima 人格基线 — "sharp, resourceful, no-nonsense" */
-export const AIRI_BASELINE: PersonalityBaseline = {
+export const DEFAULT_BASELINE: PersonalityBaseline = {
   vad: { valence: 0.4, arousal: 0.3, dominance: 0.6 },
   traits: {
     sharp:       { valence: 0, arousal: 0.15, dominance: 0.10 },
@@ -243,7 +242,7 @@ export function isNightTime(now: Date = new Date()): boolean {
  */
 export function regressToBaseline(
   currentVAD: VADVector,
-  baseline: VADVector = AIRI_BASELINE.vad,
+  baseline: VADVector = DEFAULT_BASELINE.vad,
   rate: number = REGRESSION_RATE,
 ): VADVector {
   return {
@@ -572,7 +571,7 @@ function smoothedFor(project?: string, characterId: string = CHAR_ID): { vad: VA
   const key = smoothedKey(proj, characterId);
   let s = smoothedByProject.get(key);
   if (!s) {
-    s = { vad: { ...AIRI_BASELINE.vad }, tsundere: 0 };
+    s = { vad: { ...DEFAULT_BASELINE.vad }, tsundere: 0 };
     smoothedByProject.set(key, s);
   }
   return s;
@@ -729,7 +728,7 @@ function validateVadEntry(entry: VadQueueEntry): VadEntryValidation {
 /**
  * 离线兜底:按词表给每条记忆打 VAD 并写库(只在 ollamaDetectVAD 不可用时调用)。
  *
- * 实测背景:airi bank 262 条活跃记忆里 0 条有 vad_valence —— 唯一来源是 Ollama,
+ * 实测背景:default bank 262 条活跃记忆里 0 条有 vad_valence —— 唯一来源是 Ollama,
  * 而本机没跑 Ollama,于是情感维度整体空转。词表兜底的目标是"让争吵和吃了面分开";
  * confidence 故意压低(0.25~0.75),不与模型结果混淆。
  */
@@ -744,7 +743,7 @@ export function tagWithLocalAffect(
   const stmt = db.prepare(`UPDATE memory SET character_id = ?, vad_valence = ?, vad_arousal = ?, vad_dominance = ?,
       emotional_impact = CASE WHEN COALESCE(emotional_impact, 0) = 0 THEN ? ELSE emotional_impact END,
       tags = CASE WHEN tags IS NULL OR tags = '[]' THEN ? ELSE tags END,
-      affect_status = 'pending_psyche', affect_analyzed_at = ?, affect_source = 'local_lexicon'
+      affect_status = 'pending', affect_analyzed_at = ?, affect_source = 'local_lexicon'
       WHERE id = ? AND project = ? AND character_id = ?
         AND source = 'conversation_log' AND is_active = 1`);
   const abstain = db.prepare(`UPDATE memory SET character_id = ?, affect_status = 'abstain', affect_analyzed_at = ?, affect_source = 'local_lexicon'
@@ -781,8 +780,12 @@ export function tagWithLocalAffect(
   return updated;
 }
 
-/** Commit the affect row only after the deterministic psyche state is durable. */
-export function finalizeAffectPsyche(
+/**
+ * Mark the rows whose affect analysis has landed (VAD + impact written).
+ * Conversation-log rows enter the queue as `pending`; the local lexicon
+ * fallback commits them here, the model path writes `analyzed` directly.
+ */
+export function markAffectAnalyzed(
   entries: Array<{ memoryId?: string }>,
   project?: string,
   characterId: string = CHAR_ID,
@@ -795,153 +798,11 @@ export function finalizeAffectPsyche(
   const result = db.prepare(`
     UPDATE memory SET affect_status = 'analyzed', affect_analyzed_at = COALESCE(affect_analyzed_at, ?)
     WHERE id IN (${placeholders}) AND project = ? AND character_id = ?
-      AND source = 'conversation_log' AND is_active = 1 AND affect_status = 'pending_psyche'
+      AND source = 'conversation_log' AND is_active = 1 AND affect_status = 'pending'
   `).run(new Date().toISOString(), ...ids, proj, characterId);
   return result.changes;
 }
 
-/**
- * Return only rows whose affect write is actually waiting for psyche commit.
- * Queue entries are disposable pointers: a row may be deleted, reassigned, or
- * abstained while the model call is in flight. Building an event from the
- * original queue would then advance state for evidence that never landed.
- */
-function pendingPsycheIds(
-  entries: Array<{ memoryId?: string }>,
-  project: string,
-  characterId: string,
-): string[] {
-  const ids = Array.from(new Set(entries.map(entry => entry.memoryId).filter(Boolean) as string[]));
-  if (ids.length === 0) return [];
-  const db = DatabaseManager.getInstance(project);
-  const placeholders = ids.map(() => '?').join(',');
-  const rows = db.prepare(`
-    SELECT id FROM memory
-    WHERE id IN (${placeholders}) AND project = ? AND character_id = ?
-      AND source = 'conversation_log' AND is_active = 1 AND affect_status = 'pending_psyche'
-    ORDER BY id ASC
-  `).all(...ids, project, characterId) as Array<{ id: string }>;
-  return rows.map(row => String(row.id));
-}
-
-/**
- * 词表 → psyche 的 arousal 适配器。
- *
- * 词表 `scoreAffect` 的 arousal 是 **0..1 的非负强度**（`Math.max(0, min(1, …))`），
- * 而 psyche 的 arousal 是 **−1..1 的双极量**（默认基线 +0.3）。直接传递会把「平静」
- * 也变成正唤醒。这里用 0.5 作中性点换算：a_bipolar = 2·a01 − 1。
- *
- * 两个例外必须保留：
- *  - 原始值 0 表示「没有任何唤醒线索」，不是「极度平静」→ 返回 undefined，不更新这一维。
- *  - 非数值同样返回 undefined。
- *
- * 这是工程近似（需要轨迹评价来校准），不是心理测量结论。只作用于进入 psyche 的路径；
- * 库里已写入的行仍是 0..1（用 affect_source='local_lexicon' 可识别，后续可单向回填）。
- */
-export function lexiconArousalToBipolar<T extends { arousal: number }>(vad: T): Omit<T, 'arousal'> & { arousal?: number } {
-  const a = Number(vad.arousal);
-  if (!Number.isFinite(a) || a <= 0) return { ...vad, arousal: undefined };
-  return { ...vad, arousal: Math.max(-1, Math.min(1, 2 * a - 1)) };
-}
-
-/**
- * Summarize the same lexicon scores written by tagWithLocalAffect.
- * The local path has no trajectory model, so the batch mean is the safest
- * appraisal: one long message cannot push the state several times.
- */
-
-/**
- * 同一时刻（同一秒）的多个批合并成一个。
- *
- * 为什么：一次 flush 里同一秒的 5 个 chunk 如果各自推进，elapsed 全是 0，
- * 每个 chunk 都会以 gain 朝自己的目标走一步，最后一条把前面全盖掉（R1 实测
- * 到均值距离 0.158，与旧实现 0.163 几乎相同）。同一时刻的多条证据应该是
- * **一个观测**；跨时刻的仍然分开推进，保留「一句话一句话地变」。
- */
-export function mergeSameMomentBatches<
-  T extends { project: string; characterId: string; entries: Array<{ timestamp?: number }> },
->(batches: T[], fallback = Date.now()): T[] {
-  const groups = new Map<string, T>();
-  for (const batch of batches) {
-    const moment = Math.floor(batchEvidenceNow(batch.entries, fallback) / 1000);
-    const key = `${batch.project}|${batch.characterId}|${moment}`;
-    const existing = groups.get(key);
-    if (existing) {
-      existing.entries = [...existing.entries, ...batch.entries] as T['entries'];
-    } else {
-      groups.set(key, { ...batch, entries: [...batch.entries] as T['entries'] });
-    }
-  }
-  return [...groups.values()];
-}
-
-/**
- * 一批 chunk 的「现在」应该是这批证据自己的时间，不是墙钟。
- *
- * 实测（R1）：同一秒进来的 5 个 chunk 全用 `Date.now()` 推进 → elapsed=0，
- * 于是每个 chunk 都以 gain 朝自己的目标走一次，最后一条把前面全盖掉。
- * 用 entry.timestamp 推进后，chunk 之间的真实间隔参与衰减；同一秒的再合并
- * （见 mergeSameMomentBatches），两条一起才把「末条覆盖」关掉。
- */
-export function batchEvidenceNow(
-  entries: Array<{ timestamp?: number }>,
-  fallback = Date.now(),
-): number {
-  let latest = Number.NEGATIVE_INFINITY;
-  for (const entry of entries) {
-    const t = Number(entry?.timestamp);
-    if (Number.isFinite(t) && t > latest) latest = t;
-  }
-  return Number.isFinite(latest) ? latest : fallback;
-}
-
-/**
- * importance(0..1) 与 emotional_impact(0..10，引擎老字段) → salience(0..1)。
- *
- * 两个字段标度不同：`memory.importance` 原本就是 0..1，而 `emotional_impact`
- * 是 0..10（见 affectLexicon.ts 的「emotional_impact 的 0..10 标度」）。
- * 不做归一化就会让任何 impact≥1 的记忆把 salience 顶到 1（41 条真实会话里
- * 有 8 条 impact ≥ 3.3，全都会被钉死成 1.0）。
- */
-export function salienceFromEvidence(importance: unknown, impact: unknown): number {
-  const imp = Number(importance);
-  const rawImpact = Number(impact);
-  const normalizedImpact = Number.isFinite(rawImpact) ? Math.abs(rawImpact) / 10 : 0;
-  const value = Math.max(Number.isFinite(imp) ? imp : 0, normalizedImpact);
-  return Math.max(0, Math.min(1, value));
-}
-
-/**
- * 事件重要性 → salience（0..1）。
- *
- * 这条链接此前在生产上是断的：`applyPsycheAppraisal` 早就支持 `options.salience`
- * （重要性延长偏离持续时间，Verduyn & Lavrijsen 2014），但 flush 层从没传过它 ——
- * 「重要性 → 持续更久」因此只在单测里成立。这里从 memory 行读
- * importance / emotional_impact。
- */
-export function batchSalience(
-  entries: Array<{ memoryId?: string }>,
-  project: string,
-  characterId: string = CHAR_ID,
-): number {
-  const ids = Array.from(new Set(entries.map(entry => entry.memoryId).filter(Boolean) as string[]));
-  if (ids.length === 0) return 0;
-  const proj = normalizeProject(project);
-  try {
-    const db = DatabaseManager.getInstance(proj);
-    const placeholders = ids.map(() => '?').join(',');
-    const row = db.prepare(`
-      SELECT MAX(importance) AS importance,
-             MAX(ABS(COALESCE(emotional_impact, 0))) AS impact
-      FROM memory WHERE id IN (${placeholders}) AND project = ? AND character_id = ?
-    `).get(...ids, proj, normalizeCharacterId(characterId)) as any;
-    return salienceFromEvidence(row?.importance, row?.impact);
-  } catch {
-    // Importance is an amplifier, not correctness: a read failure must never
-    // block the transition.
-    return 0;
-  }
-}
 
 export function summarizeLocalAffect(
   entries: Array<{ text: string }>,
@@ -1029,15 +890,6 @@ async function flushVadQueueInternal(
     return { analysis: null, updated: 0, batches: 0, source: 'none' };
   }
 
-  // 同一秒的 chunk 合并成一次跃迁。
-  //
-  // R1 实测：一次 flush 里 5 个 chunk 各自 `applyPsycheAppraisal(..., Date.now())`，
-  // elapsed 全是 0，于是每个 chunk 都以 gain 朝自己的目标走一步，最后一条把前面
-  // 全盖掉（状态到「五条均值」的距离 0.158，与旧实现 0.163 几乎相同）。
-  // 同一时刻的多条证据应当合成为一个观测；跨时刻的仍然分开推进。
-  const mergedBatches = mergeSameMomentBatches(batches, now);
-  batches.length = 0;
-  batches.push(...mergedBatches);
 
   // 只摘掉本次真正要处理的条目；未达阈值/别的项目的条目留在队列里
   const taken = new Set<VadQueueEntry>();
@@ -1059,7 +911,7 @@ async function flushVadQueueInternal(
 
     // Ollama 不可用时 ollamaDetectVAD **不抛错**,而是返回 confidence≈0 的默认值
     // (实测日志:"[emotion] Ollama VAD failed: fetch failed");旧代码随后 `confidence<0.3 → continue`
-    // 就静默跳过了 —— 这正是 airi bank 262 条记忆 0 条 VAD 的直接原因。所以两条路都要兜底。
+    // 就静默跳过了 —— 这正是 default bank 262 条记忆 0 条 VAD 的直接原因。所以两条路都要兜底。
     let result: VADAnalysis | null = null;
     try {
       result = await ollamaDetectVAD(batchText);
@@ -1076,7 +928,6 @@ async function flushVadQueueInternal(
         console.warn('[emotion] Ollama 不可用或置信度过低,改用本地情感词表兜底(只影响 VAD,不改其他字段)');
         localAffectWarned = true;
       }
-      const localVad = summarizeLocalAffect(batch.entries);
       const updatedForBatch = tagWithLocalAffect(batch.entries, batch.project, batch.characterId);
       processed += updatedForBatch;
       if (updatedForBatch === 0) {
@@ -1086,34 +937,7 @@ async function flushVadQueueInternal(
         }
       }
       usedLocal = true;
-      // Keep the state machine useful when the local sensor is the only
-      // available sensor. Apply one batch appraisal after durable writes,
-      // using the same idempotency convention as the model path.
-      // Canonicalize the id set. Recovery rebuilds the disposable queue from
-      // SQLite ordering, which may differ from the original enqueue order;
-      // the same durable evidence must therefore produce the same event ID.
-      const eventIds = pendingPsycheIds(batch.entries, batch.project, batch.characterId);
-      if (updatedForBatch > 0 && localVad && eventIds.length > 0) {
-        applyPsycheAppraisal(
-          batch.characterId,
-          batch.project,
-          // The lexicon summarizes the current batch observation. Treating it
-          // as a delta would accumulate the same repeated wording toward a
-          // rail; a bounded target keeps retries and recurring batches stable.
-          // 2026-10-31: 词表 arousal 是 0..1 强度，psyche 是 −1..1 双极量 ——
-          // 必须过适配器，否则「平静」也会把唤醒度往上推（见 lexiconArousalToBipolar）。
-          // 词表只对部分维度有证据（无唤醒线索时 arousal 缺失），所以 allowPartial。
-          targetAppraisalFromVAD(lexiconArousalToBipolar(localVad), `vad:${batch.project}:${eventIds.join(',')}`, { allowPartial: true }),
-          // 证据自己的时间，不是墙钟：同一秒的多个 chunk 不再互相覆盖（R1）。
-          batchEvidenceNow(batch.entries, now),
-          {
-            requirePersistence: true,
-            // 重要性随证据进来，让「重要的事持续更久」在生产上真正生效。
-            salience: batchSalience(batch.entries, batch.project, batch.characterId),
-          },
-        );
-        finalizeAffectPsyche(eventIds.map(memoryId => ({ memoryId })), batch.project, batch.characterId);
-      }
+      if (updatedForBatch > 0) markAffectAnalyzed(batch.entries, batch.project, batch.characterId);
       continue;
     }
     lastResult = result;
@@ -1133,7 +957,6 @@ async function flushVadQueueInternal(
         batch.entries,
         batch.project,
         batch.characterId,
-        true,
         result.vad,
       );
       processed += updatedForBatch;
@@ -1145,26 +968,6 @@ async function flushVadQueueInternal(
         if (retryEntries.length > 0) {
           throw new Error(`VAD batch wrote no rows while ${retryEntries.length} conversation entr${retryEntries.length === 1 ? 'y remains' : 'ies remain'} valid`);
         }
-      }
-      // Advance the deterministic sensor state only after the memory rows have
-      // been written. A retry then cannot create a second state transition.
-      // Keep retries/restarts idempotent even when queue ordering changes.
-      const eventIds = pendingPsycheIds(batch.entries, batch.project, batch.characterId);
-      if (updatedForBatch > 0 && eventIds.length > 0) {
-        applyPsycheAppraisal(
-          batch.characterId,
-          batch.project,
-          // The Ollama prompt asks for the batch's absolute current VAD. Move
-          // the psyche toward that target; do not accumulate it as an event
-          // delta (the local lexicon path above remains event-like).
-          targetAppraisalFromVAD(result.vad, `vad:${batch.project}:${eventIds.join(',')}`),
-          batchEvidenceNow(batch.entries, now),
-          {
-            requirePersistence: true,
-            salience: batchSalience(batch.entries, batch.project, batch.characterId),
-          },
-        );
-        finalizeAffectPsyche(eventIds.map(memoryId => ({ memoryId })), batch.project, batch.characterId);
       }
     } catch (e) {
       // All batches were removed before processing. Put this and later batches
@@ -1219,7 +1022,7 @@ export function recoverPendingVadQueue(project?: string, characterId: string = C
     WHERE source = 'conversation_log' AND project = ?
       AND character_id = ?
       AND is_active = 1
-      AND (affect_status IN ('pending', 'pending_psyche') OR (affect_status IS NULL AND vad_valence IS NULL))
+      AND (affect_status = 'pending' OR (affect_status IS NULL AND vad_valence IS NULL))
     ORDER BY created_at ASC, rowid ASC
   `).all(proj, characterId || CHAR_ID) as any[];
   let added = 0;
@@ -1387,7 +1190,6 @@ export async function batchClassifyAndTag(
   entries: Array<{ text: string; memoryId?: string; timestamp?: number; characterId?: string }>,
   project?: string,
   characterId?: string,
-  deferPsycheFinalize = false,
   fallbackVad?: VADVector,
 ): Promise<number> {
   if (entries.length === 0) return 0;
@@ -1536,7 +1338,7 @@ export async function batchClassifyAndTag(
         const res = write.vad
           ? updateWithVad.run(batchCharacterId, write.category, write.importance, write.tier, write.tags,
               write.vad.valence, write.vad.arousal, write.vad.dominance,
-              deferPsycheFinalize ? 'pending_psyche' : 'analyzed', analyzedAt,
+              'analyzed', analyzedAt,
               write.targetId, proj, batchCharacterId)
           : updateWithoutVad.run(batchCharacterId, write.category, write.importance, write.tier, write.tags,
               'abstain', analyzedAt,

@@ -1,0 +1,38 @@
+{
+  "embedding": {
+    "mode": "ollama",
+    "ollama_url": "http://127.0.0.1:11434",
+    "model": "bge-m3",
+    "dim": 1024,
+    "api_url": "https://api.example.com/v1/embeddings",
+    "api_model": "your-embedding-model",
+    "api_key": ""
+  },
+  "reflect": {
+    "llm_url": "https://api.example.com/v1/chat/completions",
+    "api_key": "",
+    "model": "your-chat-model",
+    "maxTokens": 4096,
+    "factExtraction": "auto",
+    "maxFacts": 15,
+    "minGapHours": 6,
+    "minUnanalyzed": 8
+  },
+  "triage": {
+    "llm_url": "",
+    "api_key": "",
+    "model": "",
+    "bufferSize": 5,
+    "sessionTtlDays": 7
+  },
+  "consolidate": {
+    "minMemories": 15,
+    "similarity": 0.88
+  },
+  "personas": {
+    "default": {
+      "name": "Anima",
+      "persona": "（角色设定写这里；留空则只用 charId）"
+    }
+  }
+}

@@ -28,15 +28,15 @@ const ok = (cond, msg) => {
 
 // ── 临时 bank ────────────────────────────────────────────────────────────────
 const root = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), 'evdigest-'))
-const realCfg = 'D:/castalia/memory-banks/airi/config.json'
+const realCfg = 'D:/castalia/memory-banks/default/config.json'
 const cfg = fs.existsSync(realCfg) ? JSON.parse(fs.readFileSync(realCfg, 'utf8')) : {}
 cfg.embedding = { ...(cfg.embedding || {}), mode: 'none' }
 fs.writeFileSync(path.join(root, 'config.json'), JSON.stringify(cfg, null, 2))
 
 process.env.MEMORY_DB_DIR = root
 process.env.MEMORY_CONFIG = path.join(root, 'config.json')
-process.env.CASTALIA_PROJECT = 'airi'
-process.env.CHAR_ID = 'airi'
+process.env.CASTALIA_PROJECT = 'default'
+process.env.CHAR_ID = 'default'
 process.env.EMBED_MODE = 'none'
 delete process.env.REFLECT_LLM_API_KEY
 process.env.TRIAGE_LLM_API_KEY = 'test-key'
@@ -90,23 +90,23 @@ console.log(`bank: ${root}`)
 // ── 种子 A：本地今天 00:30 的对话（UTC 是昨天 16:30）────────────────────────
 const boundary = new Date()
 boundary.setHours(0, 30, 0, 0)
-const general = DatabaseManager.getInstance('airi', 'general')
-const turn = await saveConversationTurn('凌晨一点还在改向量索引，困得不行', '那我陪你把最后一版跑完。', 'airi')
+const general = DatabaseManager.getInstance('default', 'general')
+const turn = await saveConversationTurn('凌晨一点还在改向量索引，困得不行', '那我陪你把最后一版跑完。', 'default')
 general.prepare('UPDATE memory SET created_at = ?, updated_at = ?, last_accessed_at = ? WHERE id = ?')
   .run(boundary.toISOString(), boundary.toISOString(), boundary.toISOString(), turn.id)
 console.log(`A 边界对话 created_at=${boundary.toISOString()} 本地日=${localDay(boundary)} id=${turn.id.slice(0, 8)}`)
 
 // ── 种子 B：一条落在 project 分类库里的对话（引擎自称会扫所有分类库）──────────
-const projDb = DatabaseManager.getInstance('airi', 'project')
+const projDb = DatabaseManager.getInstance('default', 'project')
 const projId = 'proj0000-1111-2222-3333-444455556666'
 const nowIso = new Date().toISOString()
 projDb.prepare(`
   INSERT INTO memory (id, text, project, type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count)
-  VALUES (?, ?, 'airi', 'episodic', 'conversation', '[]', 0.5, 'airi', 'conversation_log', 'user', 'standard', 1, ?, ?, ?, 0, 0)
+  VALUES (?, ?, 'default', 'episodic', 'conversation', '[]', 0.5, 'default', 'conversation_log', 'user', 'standard', 1, ?, ?, ?, 0, 0)
 `).run(projId, '用户: 项目库里的一条记录，用来验证跨库扫描\n助手: 记下了。', nowIso, nowIso, nowIso)
 
 // ── 跑整理 ───────────────────────────────────────────────────────────────────
-const res = await runEventDigest({ project: 'airi', characterId: 'airi', days: 2 })
+const res = await runEventDigest({ project: 'default', characterId: 'default', days: 2 })
 console.log('digest:', JSON.stringify(res))
 
 const events = general.prepare("SELECT text, tags FROM memory WHERE source = 'daily_event' AND is_active = 1").all()
@@ -122,7 +122,7 @@ if (evA) {
 }
 
 // A：时间路直取
-const today = recallTemporalForQuery('今天在忙什么', { project: 'airi', characterId: 'airi' })
+const today = recallTemporalForQuery('今天在忙什么', { project: 'default', characterId: 'default' })
 ok(today.hits.length > 0 && today.text.includes('测试事件'), `A "今天" 时间路直取到事件（命中 ${today.hits.length} 条）`)
 
 // B：跨分类库
@@ -135,7 +135,7 @@ ok(hasProgress(projDb), 'B 进度表也建在 project 库')
 
 // 已整理的不重复整理：第二遍不应再产出
 const before = events.length
-await runEventDigest({ project: 'airi', characterId: 'airi', days: 2 })
+await runEventDigest({ project: 'default', characterId: 'default', days: 2 })
 const after = general.prepare("SELECT count(*) n FROM memory WHERE source = 'daily_event' AND is_active = 1").get().n
 ok(after === before, `重复运行不新增事件行（${before} → ${after}）`)
 

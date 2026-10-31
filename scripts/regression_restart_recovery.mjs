@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Cross-process recovery regression for affect queue and psyche persistence.
+ * Cross-process recovery regression for the affect (VAD) queue.
  * The first process leaves one conversation pending; the second process must
- * rebuild the disposable queue and finish both affect and psyche state.
+ * rebuild the disposable queue from SQLite and finish the affect write.
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -19,7 +19,7 @@ const env = {
   MEMORY_CONFIG: path.join(temp, 'missing-config.json'),
   EMBED_MODE: 'none',
   CASTALIA_PROJECT: 'restart-check',
-  CHAR_ID: 'airi',
+  CHAR_ID: 'default',
   OLLAMA_URL: 'http://127.0.0.1:1',
 };
 const run = code => {
@@ -41,7 +41,7 @@ try {
     import { DatabaseManager, generateId } from './dist/db.js';
     const db = DatabaseManager.getInstance('restart-check', 'general');
     const id = generateId();
-    db.prepare("INSERT INTO memory (id,text,project,source,character_id,is_active,affect_status) VALUES (?,?,'restart-check','conversation_log','airi',1,'pending')")
+    db.prepare("INSERT INTO memory (id,text,project,source,character_id,is_active,affect_status) VALUES (?,?,'restart-check','conversation_log','default',1,'pending')")
       .run(id, '她说分手，我很难过');
     console.log(id);
     DatabaseManager.close();
@@ -53,21 +53,17 @@ try {
     import { DatabaseManager } from './dist/db.js';
     import { recoverPendingVadQueue, vadQueueStatus, flushVadQueue } from './dist/emotion.js';
     const db = DatabaseManager.getInstance('restart-check', 'general');
-    const recovered = recoverPendingVadQueue('restart-check', 'airi');
-    if (recovered !== 1 || vadQueueStatus('restart-check', 'airi').size !== 1) process.exit(2);
+    const recovered = recoverPendingVadQueue('restart-check', 'default');
+    if (recovered !== 1 || vadQueueStatus('restart-check', 'default').size !== 1) process.exit(2);
     await flushVadQueue('restart-check', { force: true });
     const row = db.prepare("SELECT affect_status, vad_valence, affect_source FROM memory WHERE id = ?").get(${JSON.stringify(memoryId)});
-    const psyche = db.prepare("SELECT version, has_evidence, processed_event_ids FROM psyche_state WHERE project = 'restart-check' AND character_id = 'airi'").get();
-    console.log(JSON.stringify({ row, psyche, queue: vadQueueStatus('restart-check', 'airi').size }));
+    console.log(JSON.stringify({ row, queue: vadQueueStatus('restart-check', 'default').size }));
     DatabaseManager.close();
   `);
   const result = JSON.parse(recoverOutput.trim().split(/\r?\n/).at(-1));
   assert.equal(result.row.affect_status, 'analyzed');
   assert.equal(result.row.affect_source, 'local_lexicon');
   assert.notEqual(result.row.vad_valence, null);
-  assert.equal(result.psyche.has_evidence, 1);
-  assert.equal(result.psyche.version, 2);
-  assert.equal(JSON.parse(result.psyche.processed_event_ids).length, 1);
   assert.equal(result.queue, 0);
   console.log('PASS restart recovery');
 } finally {

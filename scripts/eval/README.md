@@ -21,8 +21,8 @@ scripts/eval/
 npm run build                                     # 被测的是 dist/，先构建
 
 node scripts/eval/run_arms.mjs \
-  --db <库根>/airi \                              # 其下有 airi/<角色>/<memtype>/memory.sqlite
-  --project airi \
+  --db <库根>/default \                              # 其下有 default/<角色>/<memtype>/memory.sqlite
+  --project default \
   --arms default,constant,time015,emo0 \
   --embed none \                                  # 纯词法：跨机器可复现
   --out /tmp/eval.json
@@ -53,11 +53,11 @@ emo0            75.4%  100.0%  100.0%  0.850  0
 
 ```bash
 git worktree add C:/tmp/base HEAD~1 && (cd C:/tmp/base && npm ci && npm run build)
-node scripts/eval/run_arms.mjs --db <库> --project airi --dist D:/AI/castalia/Castalia-Anima/dist --arms default
+node scripts/eval/run_arms.mjs --db <库> --project default --dist D:/AI/castalia/Castalia-Anima/dist --arms default
 # ⚠️ --dist 必须是一个**带 node_modules 的检出内**的 dist（副本不能搬到仓库外：
 #    dist/*.js 会按自身路径向上找 better-sqlite3，找不到就 ESM 解析失败）
 cp -r dist .tmp-olddist && sed -i 's/, 0.95)/, 0.7)/' .tmp-olddist/search.js
-node scripts/eval/run_arms.mjs --db <库> --project airi --dist .tmp-olddist --arms default
+node scripts/eval/run_arms.mjs --db <库> --project default --dist .tmp-olddist --arms default
 ```
 
 **负控制（2026-10-31 实跑，用来证明这个门禁真的会拦）**：把 dist 里的
@@ -105,7 +105,7 @@ default vs 旧常量 @5：仅前者命中 0 / 仅后者  7，p=0.0156
 `queries.gold.json` 的 `gold` 是**某一份快照里的行 id**（见 `_meta.源库sha256`），
 只对同一份快照成立：
 
-- 快照：`副本_SMP输入端_20261031070833`（airi 项目，197 行，211 个候选片段）
+- 快照：`副本_SMP输入端_20261031070833`（default 项目，197 行，211 个候选片段）
 - 造法（论文侧）：取活跃行的原文片段当查询，`gold` = 包含该片段的**所有**活跃行 id；
   60 条单 gold、9 条双 gold。
 - **换库就要重造**：行 id 会变。重造的最小步骤是「随机取活跃行的一个片段 → 用

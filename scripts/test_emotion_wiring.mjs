@@ -27,8 +27,8 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'castalia-emowire-'));
 // env 必须在 import dist 之前设好(env.ts 在模块加载时读)
 process.env.MEMORY_DB_DIR = tmp;
 process.env.MEMORY_CONFIG = path.join(tmp, 'missing-config.json');
-process.env.CASTALIA_PROJECT = 'airi';
-process.env.CHAR_ID = 'airi';
+process.env.CASTALIA_PROJECT = 'default';
+process.env.CHAR_ID = 'default';
 process.env.EMBED_MODE = 'none';
 process.env.CONSOLIDATE_AUTO_ON_START = '0';
 process.env.REFLECT_INTERVAL_HOURS = '0';
@@ -45,8 +45,8 @@ const check = (name, cond, detail = '') => {
   else { fail++; console.log(`  FAIL ${name}${detail ? ' — ' + detail : ''}`); }
 };
 
-const PROJECT = 'airi';
-const CHAR = 'airi';
+const PROJECT = 'default';
+const CHAR = 'default';
 const db = () => DatabaseManager.getInstance(PROJECT, 'general');
 const PROJ = path.join(tmp, PROJECT, 'general', 'memory.sqlite');
 

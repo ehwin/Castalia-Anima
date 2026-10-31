@@ -24,12 +24,11 @@ const { saveMemory, saveSelfDiary, updateMemory, forgetMemory, restoreMemory, ma
 const { searchMemory, pinnedAnchors, getRecentMemories } = await load('search');
 const { recallForInjection } = await load('recallForInjection');
 const { listAllMemories } = await load('reflect');
-const { runSelfCycle } = await load('selfCycle');
 const { getRecentConversations } = await load('digest');
 const { vadQueueStatus } = await load('emotion');
 
 const project = 'diary-isolation';
-const characterId = 'airi';
+const characterId = 'default';
 const projectDb = DatabaseManager.getInstance(project, 'project');
 const evidence = await saveMemory({
   text: '用户事实：喜欢蓝色咖啡杯，蓝色咖啡杯是重要偏好。',
@@ -49,28 +48,11 @@ const queueAfterDiary = vadQueueStatus(project, characterId);
 assert.equal(queueAfterDiary.size, queueBeforeDiary.size, 'diary writes do not add VAD work');
 
 // Derived records are append-only outputs. Generic memory mutation must not
-// be able to hide, restore, or rewrite them behind the self-cycle cursor.
+// be able to hide, restore, or rewrite them.
 assert.equal(forgetMemory(diary.id, project, characterId), false, 'generic delete cannot retire agent_diary');
 assert.equal(restoreMemory(diary.id, project, characterId), false, 'generic restore cannot mutate agent_diary');
 const diaryRowAfterRejectedDelete = projectDb.prepare('SELECT is_active FROM memory WHERE id = ?').get(diary.id);
 assert.equal(diaryRowAfterRejectedDelete?.is_active, 1, 'rejected diary delete leaves row active');
-
-const stateId = 'state_snapshot_regression';
-const now = new Date().toISOString();
-projectDb.prepare(`
-  INSERT INTO memory (id, text, project, type, mem_type, category, tags, importance,
-    character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at)
-  VALUES (?, ?, ?, 'episodic', 'project', 'mood_snapshot', '[]', 0.4, ?,
-    'agent_state', 'self', 'temporary', 1, ?, ?, ?)
-`).run(stateId, '[情绪快照] 回归测试', project, characterId, now, now, now);
-await assert.rejects(
-  () => updateMemory(stateId, { text: '被通用 API 改写' }, characterId),
-  /agent_state|runtime snapshot/i,
-  'generic memory updates cannot mutate agent_state',
-);
-assert.equal(forgetMemory(stateId, project, characterId), false, 'generic delete cannot retire agent_state');
-assert.equal(restoreMemory(stateId, project, characterId), false, 'generic restore cannot mutate agent_state');
-assert.equal(projectDb.prepare('SELECT is_active FROM memory WHERE id = ?').get(stateId)?.is_active, 1, 'state snapshot remains active');
 
 // Maintenance must preserve the derived-record boundary too: an old diary is
 // still a diary, not a normal standard memory eligible for cold storage.
@@ -125,11 +107,5 @@ const freshEvidence = await saveMemory({
   text: '用户事实：今天继续确认蓝色咖啡杯的偏好。',
   project, characterId, source: 'conversation_log', skipEmbed: true,
 });
-const cycle = await runSelfCycle({ project, characterId, hoursBack: 24, minIntervalHours: 0, limit: 20 });
-assert.equal(cycle.skipped, false, 'self-cycle writes from conversation evidence');
-assert.deepEqual(cycle.evidenceIds, [freshEvidence.id], 'self-cycle records only new source evidence ids');
-const replay = await runSelfCycle({ project, characterId, hoursBack: 24, minIntervalHours: 0, limit: 20 });
-assert.equal(replay.skipped, true, 'self-cycle does not read its own diary as new evidence');
-assert.equal(replay.reason, 'no_new_evidence');
 DatabaseManager.close();
 console.log('PASS diary isolation');

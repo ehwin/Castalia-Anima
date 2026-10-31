@@ -62,7 +62,7 @@ test('invalid snapshot cannot erase a previously saved chat', () => {
   assert.throws(() => syncTavernChat(project, [row, row]), /Duplicate/);
   const db = DatabaseManager.getInstance(project);
   assert.equal(db.prepare('SELECT count(*) n FROM memory WHERE is_active=1').get().n, 1);
-  assert.throws(() => syncTavernChat('../airi', []), /isolated/);
+  assert.throws(() => syncTavernChat('../default', []), /isolated/);
 });
 
 function fakeChat() {

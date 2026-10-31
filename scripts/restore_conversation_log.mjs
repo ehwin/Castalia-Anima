@@ -1,14 +1,14 @@
 /**
  * 按批次恢复被软删的对话原文（source='conversation_log'）。
  *
- * 背景：2026-10-31 交接单 —— AIRI 库里 23 条对话原文 is_active=0，导致
+ * 背景：2026-10-31 交接单 —— 示例应用 库里 23 条对话原文 is_active=0，导致
  *   emotion.ts 的 VAD 队列丢弃它们（:648 要求 is_active=1）、检索/注入看不到原文。
  *   行还在、正文完整，只是"标死了"。本脚本只翻 is_active 并打批次标记，**不碰向量**。
  *
  * 用法：
  *   node scripts/restore_conversation_log.mjs                       # dry-run，只报数
- *   node scripts/restore_conversation_log.mjs --apply               # 真写（默认 bank = airi）
- *   node scripts/restore_conversation_log.mjs --bank D:/castalia/memory-banks/airi --apply
+ *   node scripts/restore_conversation_log.mjs --apply               # 真写（默认 bank = default）
+ *   node scripts/restore_conversation_log.mjs --bank D:/castalia/memory-banks/default --apply
  *   node scripts/restore_conversation_log.mjs --allow-reflect       # 不加 noReflect 标记
  *   node scripts/restore_conversation_log.mjs --rollback --batch 2026-10-31 --apply
  *
@@ -35,12 +35,12 @@ const arg = (name, fallback) => {
 const APPLY = has('--apply');
 const ROLLBACK = has('--rollback');
 const BATCH = arg('--batch', '2026-10-31');
-const RESTORED_BY = arg('--restored-by', 'agent:hermes');
+const RESTORED_BY = arg('--restored-by', 'agent:host');
 const REASON = arg('--reason', 'soft-deleted by reflect/legacy path; see handoff 2026-10-31');
 const ALLOW_REFLECT = has('--allow-reflect');
 const BANK = arg('--bank', process.env.CASTALIA_BANK_ROOT
-  ? path.join(process.env.CASTALIA_BANK_ROOT, 'airi')
-  : 'D:/castalia/memory-banks/airi');
+  ? path.join(process.env.CASTALIA_BANK_ROOT, 'default')
+  : 'D:/castalia/memory-banks/default');
 
 const files = [];
 (function walk(dir) {

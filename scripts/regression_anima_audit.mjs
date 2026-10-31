@@ -41,7 +41,7 @@ const insertConversation = (project, text) => {
   const now = new Date().toISOString();
   db.prepare(`INSERT INTO memory
     (id, text, project, type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, affect_status, affect_source)
-    VALUES (?, ?, ?, 'episodic', 'conversation', '[]', 0.5, 'airi', 'conversation_log', 'user', 'standard', 1, ?, ?, ?, 0, 0, 'pending', 'vad_queue')`)
+    VALUES (?, ?, ?, 'episodic', 'conversation', '[]', 0.5, 'default', 'conversation_log', 'user', 'standard', 1, ?, ?, ?, 0, 0, 'pending', 'vad_queue')`)
     .run(id, text, project, now, now, now);
   return { id, db };
 };
@@ -77,8 +77,8 @@ globalThis.fetch = async (_url, init) => {
 // ══════════════════════════════════════════════════════════════════
 const P1 = 'audit-p1';
 const P2 = 'audit-p2';
-const p1Turn = await saveConversationTurn('P1 用户消息：我喜欢手冲咖啡', 'P1 助手回复', 'airi', undefined, undefined, P1);
-const p2Turn = await saveConversationTurn('P2 用户消息：我在研究航海模型', 'P2 助手回复', 'airi', undefined, undefined, P2);
+const p1Turn = await saveConversationTurn('P1 用户消息：我喜欢手冲咖啡', 'P1 助手回复', 'default', P1);
+const p2Turn = await saveConversationTurn('P2 用户消息：我在研究航海模型', 'P2 助手回复', 'default', P2);
 
 classifyReply = user => user.includes('手冲咖啡')
   ? JSON.stringify([{ importance: 0.85, category: 'identity', tags: ['audit-p1'], vad: { valence: 5, arousal: -3, dominance: 0.5 } }])
@@ -178,15 +178,15 @@ check(regrown.count === 2 && activeCount() === 2, 'equal/growing snapshot is acc
 // ══════════════════════════════════════════════════════════════════
 const B1 = 'audit-bias-1';
 const B2 = 'audit-bias-2';
-recordTopics('airi', ['咖啡', '手冲'], B1);
-recordTopics('airi', ['航海', '模型'], B2);
-check(getBiases('airi', 10, B1).every(b => ['咖啡', '手冲'].includes(b.topic)), 'bias B1 only contains its own topics');
-check(!getBiases('airi', 10, B1).some(b => ['航海', '模型'].includes(b.topic)), 'bias B1 does not see B2 topics');
-check(getBiases('airi', 10, B2).every(b => ['航海', '模型'].includes(b.topic)), 'bias B2 only contains its own topics');
-check(computeBiasBoost('airi', ['咖啡'], B1) > 1, 'bias boost applies inside its own project');
-check(computeBiasBoost('airi', ['咖啡'], B2) === 1, 'bias boost does not leak to another project');
-check(computeBiasBoost('airi', ['航海'], B2) > 1, 'bias boost applies in B2');
-check(getBiasPrompt('airi', B1).includes('咖啡') && !getBiasPrompt('airi', B1).includes('航海'), 'bias prompt is project-scoped');
+recordTopics('default', ['咖啡', '手冲'], B1);
+recordTopics('default', ['航海', '模型'], B2);
+check(getBiases('default', 10, B1).every(b => ['咖啡', '手冲'].includes(b.topic)), 'bias B1 only contains its own topics');
+check(!getBiases('default', 10, B1).some(b => ['航海', '模型'].includes(b.topic)), 'bias B1 does not see B2 topics');
+check(getBiases('default', 10, B2).every(b => ['航海', '模型'].includes(b.topic)), 'bias B2 only contains its own topics');
+check(computeBiasBoost('default', ['咖啡'], B1) > 1, 'bias boost applies inside its own project');
+check(computeBiasBoost('default', ['咖啡'], B2) === 1, 'bias boost does not leak to another project');
+check(computeBiasBoost('default', ['航海'], B2) > 1, 'bias boost applies in B2');
+check(getBiasPrompt('default', B1).includes('咖啡') && !getBiasPrompt('default', B1).includes('航海'), 'bias prompt is project-scoped');
 
 // 一次性加载标志按 project 缓存：先加载 C1 不应阻止 C2 从 DB 加载
 const C1 = 'audit-load-1';
@@ -206,17 +206,17 @@ check(!getBiases('loader', 10, C2).some(b => b.topic === 'db-tag-1'), 'C2 load d
 const U1 = 'audit-user-1';
 const U2 = 'audit-user-2';
 const verbose = '这是一条很长的中文消息，用来验证用户画像不会跨项目串味。'.repeat(20);
-for (let i = 0; i < 3; i++) observeUserMessage('airi', 'default', verbose, U1);
-for (let i = 0; i < 3; i++) observeUserMessage('airi', 'default', '好', U2);
-const u1Prompt = getUserProfilePrompt('airi', 'default', U1);
-const u2Prompt = getUserProfilePrompt('airi', 'default', U2);
+for (let i = 0; i < 3; i++) observeUserMessage('default', 'default', verbose, U1);
+for (let i = 0; i < 3; i++) observeUserMessage('default', 'default', '好', U2);
+const u1Prompt = getUserProfilePrompt('default', 'default', U1);
+const u2Prompt = getUserProfilePrompt('default', 'default', U2);
 check(u1Prompt.includes('喜欢详细回复'), 'U1 learned the verbose style');
 check(u2Prompt.includes('喜欢简短回复'), 'U2 learned the concise style');
 check(!u1Prompt.includes('喜欢简短回复'), 'U1 profile is not polluted by U2 messages');
 check(u1Prompt !== u2Prompt, 'profiles differ per project');
-check(getUserProfile('airi', 'default', U1).interactionCount === 3, 'U1 interaction count is its own');
-check(getUserProfile('airi', 'default', U2).interactionCount === 3, 'U2 interaction count is its own');
-check(getUserProfile('airi', 'default', 'audit-user-none') === null, 'unseen project has no profile');
+check(getUserProfile('default', 'default', U1).interactionCount === 3, 'U1 interaction count is its own');
+check(getUserProfile('default', 'default', U2).interactionCount === 3, 'U2 interaction count is its own');
+check(getUserProfile('default', 'default', 'audit-user-none') === null, 'unseen project has no profile');
 
 // ══════════════════════════════════════════════════════════════════
 // 4) VAD 维度落库 + 越界拒绝（第 4 组）

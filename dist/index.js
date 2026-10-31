@@ -1,14 +1,24 @@
 #!/usr/bin/env node
 /**
- * Castalia Anima Memory MCP Server v1.0 — 通用版基底 + Anima 情感层(第4轮融合)
+ * Castalia Anima — Memory Body MCP Server
  *
- * 以通用版 refs/index.ts 为基底(register() 分组包装 / MCP_TOOLS 环境变量控制注册集 /
- * 统一信封 {ok, op, count, ...} / memory_context / consolidate_deep / instruction_* / project_list),
- * 叠加 Anima 情感层:
- *   - mood_journal(admin)、user_observe(harness) 两个情感工具
- *   - auto_process 的 moodValue/moodReason 透传、memory_save 的 emotionalImpact
- *   - context_get 返回 agent 状态(state/bias/profile) + 记忆上下文
- *   - CHAR_ID 默认 airi(env.ts),MCP_TOOLS 默认注册全部(airi 主系统依赖 harness/admin 组)
+ * 一个「情感记忆体」:记忆的写入/检索/反思/图谱/事实/实体层完整保留,
+ * 情感只体现在记忆本身(vad_* / emotional_impact 列 + 情感加权检索),
+ * 没有任何运行时情绪状态机。
+ *
+ * 本构建刻意**不含**:
+ *   - 自回归情感状态机(psyche_state / self-cycle / agent state):没有心境变量、
+ *     没有 agent 状态快照、没有自循环日记;所以也没有 mood_journal / self_cycle,
+ *     context_get 也不再返回 psyche 字段;
+ *   - 跨库总反思(reflect_all):已剥离为可选插件 plugins/fullPipeline(CLI),
+ *     记忆体不注册该 MCP 工具,请求路径里也不跑它。
+ *
+ * 工具分组与注册集由 MCP_TOOLS 控制(默认 all):
+ *   agent   = 只读检索(memory_search / memory_get / fact_search / entity_*)
+ *   harness = 写与管线(auto_process / conversation_save / digest_run / reflect_*)
+ *   admin   = 管理(context_get / memory_list / stats_get / project_* / instruction_*)
+ *   store   = 前端持久层桥(memory_store_* / memory_recall)
+ *   entity  = 实体层(entity_lookup / facts_conflicts_report)
  */
 // ⚠️ 必须第一个 import:加载 config.json 覆盖环境变量(嵌入/反思配置)
 // 坑13:模块加载顺序决定 env 覆盖生效 — env.ts/ollama.ts/reflectDriver.ts 在读取 env 前不能先被 import
@@ -35,11 +45,7 @@ import { ensureSeedInstructions, saveInstruction, getInstruction, listInstructio
 import { CHAR_ID, PROJECT_ID, SERVER_NAME, SERVER_VERSION, normalizeProject, getPersona } from './env.js';
 import { MEM_TYPES, summarizeForIndex } from './memType.js';
 import { fedSearchAll, resolveFedLibraries } from './federation/index.js';
-import { runReflectAll } from './reflectAll.js';
-// Anima 情感层
-import { getAgentState } from './agentState.js';
-import { getPsycheState, absoluteMoodScalar, deviationMoodScalar } from './psycheState.js';
-import { runSelfCycle } from './selfCycle.js';
+// 记忆体自身层(bias / 用户画像)
 import { syncTavernChat } from './tavern.js';
 import { getBiasPrompt, loadBiasesFromDb } from './bias.js';
 import { getUserProfilePrompt, loadUserProfilesFromDb, observeUserMessage } from './userLearning.js';
@@ -53,104 +59,20 @@ function err(msg, code = 'ERROR') {
     return { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: { code, message: msg } }, null, 2) }], isError: true };
 }
 /**
- * 当前心情(−10..+10) —— 传给检索层做情绪一致性重排、传给注入层做"难过不翻旧账"。
- *
- * `psycheState` 是传感器证据驱动的短期状态，存在证据时它是唯一 affect
- * owner；显式 `moodValue` 仍由 AgentState 保留，作为传感器尚未产出证据时
- * 的 override/fallback。这样同一轮检索不会在三套情绪真值之间随机切换。
- * 参数顺序保留为 (project, characterId)，兼容原有调用方。
- *
- * 2026-10-31：返回的是**相对平时的偏置**（deviation），不是绝对愉悦度。
- * 检索层问的是"比平时更冷还是更暖"；绝对数值（她平时就是 +4）走 absoluteMoodScalar，
- * 用在提示词/展示，不参与一致性重排（否则一致性回忆会被永久推向正向记忆）。
+ * Prompt block for injection: role declaration + what the memory body knows
+ * about itself (bias layer, user profile). This build has no live emotional
+ * state machine — emotion lives in the memories themselves (vad_* /
+ * emotional_impact columns), not in a runtime mood variable.
  */
-function currentMood(project, characterId = CHAR_ID) {
-    try {
-        const psyche = getPsycheState(characterId, project);
-        if (psyche.hasEvidence) {
-            const deviation = deviationMoodScalar(psyche.vad, psyche.baseline);
-            if (deviation !== undefined)
-                return deviation;
-        }
-        const m = Number(getAgentState(characterId, project).getSnapshot().currentMood);
-        return Number.isFinite(m) ? m : undefined;
-    }
-    catch {
-        return undefined;
-    }
-}
-/** Compose the human-readable state block from the same psyche snapshot that
- * context_get returns as JSON. AgentState still owns energy/desire and explicit
- * mood history, but its independent mood line is omitted once sensor evidence
- * exists so prompts cannot see contradictory affect values. */
-function unifiedStatePrompt(state, psyche) {
-    const snapshot = state.getSnapshot();
-    // 2026-10-31：与 currentMood 同一处修复 —— 绝对心境不再被相对 band 清零。
-    const scalar = psyche.hasEvidence
-        ? (absoluteMoodScalar(psyche.vad) ?? snapshot.currentMood)
-        : snapshot.currentMood;
-    const deviation = psyche.hasEvidence
-        ? Number(psyche.vad.valence) - Number(psyche.baseline.valence)
-        : 0;
-    const moodDesc = psyche.hasEvidence
-        ? (psyche.band === 'positive' ? '偏正向' : psyche.band === 'negative' ? '偏负向' : '中性')
-        : scalar >= 6 ? '非常开心' : scalar >= 3 ? '心情不错' : scalar >= -2 ? '心情平静' : scalar >= -5 ? '有点低落' : '心情不好';
-    const lines = [
-        '[Anima 当前状态]',
-        `情绪指数：${scalar >= 0 ? '+' : ''}${scalar.toFixed(1)}（${moodDesc}）`,
-        `精力值：${snapshot.energy}/100`,
-        '状态来源：内部情感传感器估计，不是用户事实；仅用于调整回应，不可被模型改写。',
-    ];
-    if (psyche.hasEvidence) {
-        // 把「绝对值 / 相对平时的偏差 / 标签 / 是否有证据」分开写，避免下游把三种量混用。
-        lines.push(`传感器状态：${psyche.band}（v=${psyche.vad.valence.toFixed(2)} a=${psyche.vad.arousal.toFixed(2)} d=${psyche.vad.dominance.toFixed(2)}；相对基线 ${deviation >= 0 ? '+' : ''}${deviation.toFixed(2)}，证据 ${psyche.hasEvidence ? '有效' : '已过期'}）`);
-    }
-    if (snapshot.currentDesire)
-        lines.push(`当前想法：${snapshot.currentDesire}`);
-    if (snapshot.moodHistory.length > 0 && !psyche.hasEvidence) {
-        lines.push(`最近经历：${snapshot.moodHistory.slice(-3).map(e => e.reason).join('、')}`);
-    }
+function statePrompt(project, userId = 'default') {
+    const lines = [roleDeclaration()];
+    const bias = String(getBiasPrompt(CHAR_ID, project) || '').trim();
+    const profile = String(getUserProfilePrompt(CHAR_ID, userId, project) || '').trim();
+    if (bias)
+        lines.push(bias);
+    if (profile)
+        lines.push(profile);
     return lines.join('\n');
-}
-/**
- * The one explicit reader for self-cycle output.
- *
- * Diary rows are derived observations, so every default path (search, recall,
- * injection, reflect, consolidate, facts, entities) excludes them. That left
- * the whole self-cycle write-only: nothing ever read what it produced. This
- * helper returns the newest diary for a role so a caller can opt in via
- * `context_get { includeDiary: true }` without widening any default filter.
- */
-function latestSelfDiary(project) {
-    try {
-        const db = DatabaseManager.getInstance(project, 'project');
-        const row = db.prepare(`
-      SELECT id, text, created_at AS createdAt, metadata
-      FROM memory
-      WHERE source = 'agent_diary' AND subject = 'self' AND project = ?
-        AND character_id = ? AND is_active = 1
-      ORDER BY datetime(created_at) DESC, rowid DESC
-      LIMIT 1
-    `).get(project, CHAR_ID);
-        if (!row)
-            return null;
-        let meta = {};
-        try {
-            meta = JSON.parse(String(row.metadata || '{}'));
-        }
-        catch { /* legacy diary */ }
-        return {
-            id: String(row.id),
-            text: String(row.text || ''),
-            createdAt: String(row.createdAt || ''),
-            evidenceIds: Array.isArray(meta?.evidence_ids) ? meta.evidence_ids.map(String) : [],
-            stateVersion: Number(meta?.state_version) || 1,
-        };
-    }
-    catch {
-        // A project without a `project` memType bank simply has no diary yet.
-        return null;
-    }
 }
 /** Sweep every known project for pending affect work. */
 function scheduleDigestSweep() {
@@ -220,15 +142,15 @@ function memorySnapshotWarn(createdAt) {
 // 暴露面原则:主 Agent 只读(search/get/recent/fact/graph),
 // 写入与管线工具归 harness,管理工具归 admin(console)。
 // 环境变量 MCP_TOOLS: 逗号分隔的 profile 或工具名;Anima 默认全部注册(all)。
-//   MCP_TOOLS=all    → 全部注册(默认;airi 主系统 proxy.py 依赖 harness/admin 组)
+//   MCP_TOOLS=all    → 全部注册(默认;default 主系统 proxy.py 依赖 harness/admin 组)
 //   MCP_TOOLS=agent  → 仅 agent 组
 //   MCP_TOOLS=agent,admin → agent + admin 两组
 // ═══════════════════════════════════════════════════════════════════
 const TOOL_GROUPS = {
     agent: ['memory_search', 'memory_get', 'memory_recent', 'memory_index', 'fact_search', 'fact_as_of', 'memory_graph', 'entity_lookup'],
-    harness: ['auto_process', 'conversation_save', 'tavern_sync', 'digest_run', 'self_cycle', 'reflect_auto', 'reflect_deep', 'reflect_batch_embed', 'memory_save', 'memory_update', 'memory_delete', 'memory_log', 'instruction_save', 'user_observe'],
-    admin: ['memory_list', 'stats_get', 'recent_conversations', 'daily_summary_data', 'reflect_analyze', 'reflect_apply', 'memory_context', 'context_get', 'project_list', 'project_create', 'memory_search_all', 'reflect_all', 'instruction_list', 'instruction_delete', 'consolidate_deep', 'mood_journal', 'facts_windows_plan', 'facts_windows_apply'],
-    // v1.26: 前端存储桥(AIRI 这类"每个角色一套记忆"的客户端当持久层用)
+    harness: ['auto_process', 'conversation_save', 'tavern_sync', 'digest_run', 'reflect_auto', 'reflect_deep', 'reflect_batch_embed', 'memory_save', 'memory_update', 'memory_delete', 'memory_log', 'instruction_save', 'user_observe'],
+    admin: ['memory_list', 'stats_get', 'recent_conversations', 'daily_summary_data', 'reflect_analyze', 'reflect_apply', 'memory_context', 'context_get', 'project_list', 'project_create', 'memory_search_all', 'instruction_list', 'instruction_delete', 'consolidate_deep', 'facts_windows_plan', 'facts_windows_apply'],
+    // v1.26: 前端存储桥(把本引擎当持久层、每个角色一套记忆的客户端可以用)
     store: ['memory_store_list', 'memory_store_save', 'memory_store_forget', 'memory_recall'],
     // v1.27: 实体层 —— 按实体名查事实/记忆,以及事实失效(矛盾)报告
     entity: ['entity_lookup', 'facts_conflicts_report'],
@@ -302,7 +224,7 @@ register('memory_search', 'agent', 'Search past memories using tag-first then ve
     try {
         const r = args.projects && args.projects.length > 0
             ? await searchMemoryAcross({ query: args.query, topK: args.topK ?? 5, category: args.category, memType: args.memType, projects: args.projects })
-            : await searchMemory({ query: args.query, topK: args.topK ?? 5, profile: 'balanced', category: args.category, memType: args.memType, characterId: CHAR_ID, project: args.project, mood: currentMood(args.project, CHAR_ID) });
+            : await searchMemory({ query: args.query, topK: args.topK ?? 5, profile: 'balanced', category: args.category, memType: args.memType, characterId: CHAR_ID, project: args.project });
         return ok({
             op: 'search',
             query: args.query,
@@ -320,7 +242,7 @@ register('memory_search', 'agent', 'Search past memories using tag-first then ve
                 score: m.score,
                 createdAt: m.createdAt,
             })),
-            hint: '用 memory_get(id) 取完整内容；Full 汇总库由 AIRI 接入层独立读取',
+            hint: '用 memory_get(id) 取完整内容；跨库总反思走 plugins/fullPipeline（CLI，不在本服务内）',
         });
     }
     catch (e) {
@@ -436,18 +358,16 @@ register('memory_log', 'harness', 'Log a cognitive entry (decision/pattern/mista
 // ═══════════════════════════════════════════════════════════════════
 // 对话自动化工具（proxy.py 内部调用）
 // ═══════════════════════════════════════════════════════════════════
-register('auto_process', 'harness', '[Internal] Process a conversation turn: save to log, update agent mood, observe user, queue VAD analysis. Called automatically after each LLM response.', {
+register('auto_process', 'harness', '[Internal] Process a conversation turn: save to log, observe user, queue affect (VAD) analysis. Called automatically after each LLM response.', {
     userMessage: z.string(),
     assistantMessage: z.string(),
-    moodValue: z.number().min(-10).max(10).optional(),
-    moodReason: z.string().optional(),
     sessionId: z.string().optional().describe('Session identifier for progressive in-session reflection (rolls session memory, promotes long-term facts). Omit to keep the legacy behavior (no session buffer).'),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
         // v1.24: 角色由进程级 CHAR_ID 决定,不再接受调用方指定的 characterId(防跨角色伪造写入)
         const cid = CHAR_ID;
-        const r = await autoProcess({ userMessage: args.userMessage, assistantMessage: args.assistantMessage, characterId: cid, moodValue: args.moodValue, moodReason: args.moodReason, sessionId: args.sessionId, project: args.project });
+        const r = await autoProcess({ userMessage: args.userMessage, assistantMessage: args.assistantMessage, characterId: cid, sessionId: args.sessionId, project: args.project });
         // Trigger event-driven digest
         maybeDigest(cid, args.project)?.catch(() => { });
         return ok(r);
@@ -466,34 +386,13 @@ register('digest_run', 'harness', '[Internal] Run the digest cycle: flush VAD qu
         return err(e.message);
     }
 });
-register('self_cycle', 'harness', '[Internal] Run one bounded self-cycle: read recent conversation evidence and write one provenance-marked diary entry. Diary entries never become conversation evidence or VAD queue items.', {
-    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
-    limit: z.number().int().min(1).max(20).optional().default(6),
-    hoursBack: z.number().min(1).max(24 * 30).optional().default(48),
-    minIntervalHours: z.number().min(0).max(24 * 30).optional().default(6),
-}, async (args) => {
-    try {
-        const r = await runSelfCycle({
-            project: args.project,
-            limit: args.limit,
-            hoursBack: args.hoursBack,
-            minIntervalHours: args.minIntervalHours,
-        });
-        return ok({ op: 'self_cycle', ...r });
-    }
-    catch (e) {
-        return err(e.message, 'SELF_CYCLE_FAILED');
-    }
-});
 register('conversation_save', 'harness', '[Internal] Save a raw conversation turn to the log (no analysis, no embedding).', {
     userMessage: z.string(),
     assistantMessage: z.string(),
-    moodValue: z.number().min(-10).max(10).optional(),
-    moodReason: z.string().optional(),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
 }, async (args) => {
     try {
-        const r = await saveConversationTurn(args.userMessage, args.assistantMessage, CHAR_ID, args.moodValue, args.moodReason, args.project);
+        const r = await saveConversationTurn(args.userMessage, args.assistantMessage, CHAR_ID, args.project);
         // Keep the direct harness entry consistent with auto_process: enqueue
         // immediately after the durable row exists. The pending marker still
         // lets the minute sweep recover this item after a restart.
@@ -508,42 +407,21 @@ register('conversation_save', 'harness', '[Internal] Save a raw conversation tur
 // ═══════════════════════════════════════════════════════════════════
 // 上下文/状态工具
 // ═══════════════════════════════════════════════════════════════════
-register('context_get', 'admin', 'Get agent state (mood/energy/desire), bias layer, user profile, and memory context summary for prompt injection.', {
+register('context_get', 'admin', 'Get the role declaration, bias layer, user profile and memory summary used for prompt injection.', {
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
-    includeDiary: z.boolean().optional().describe('Opt in to the newest self-cycle diary as an explicitly-labelled derived observation. Default false: diary rows never enter ordinary context.'),
 }, async (args) => {
     try {
         const proj = normalizeProject(args.project);
         const p = getPersona();
-        const state = getAgentState(CHAR_ID, args.project);
-        const psyche = getPsycheState(CHAR_ID, proj);
         const bias = getBiasPrompt(CHAR_ID, args.project);
         const profile = getUserProfilePrompt(CHAR_ID, 'default', args.project);
         const recent = getRecentMemories(CHAR_ID, 5, 24, proj);
-        const diary = args.includeDiary === true ? latestSelfDiary(proj) : null;
         // memdir 分库:总数跨 user/feedback/project/reference/general 聚合(v1.24: 只数本角色)
         const total = DatabaseManager.queryAll(args.project, "SELECT COUNT(*) as c FROM memory WHERE is_active=1 AND project=? AND character_id=? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')", [proj, CHAR_ID])
             .reduce((n, r) => n + (r.c || 0), 0);
-        const stateText = roleDeclaration() + '\n' + unifiedStatePrompt(state, psyche)
-            + (diary
-                ? '\n派生观察（自我日记，不是用户事实，仅作背景）：' + diary.text.replace(/\s+/g, ' ').trim().slice(0, 240)
-                : '');
         return ok({
             op: 'context',
-            state: stateText,
-            // Only present when explicitly requested; typed as a derived record.
-            ...(diary ? { derivedDiary: { ...diary, derived: true } } : {}),
-            psyche: {
-                band: psyche.hasEvidence ? psyche.band : 'neutral',
-                hasEvidence: psyche.hasEvidence,
-                vad: psyche.vad,
-                // 2026-10-31：显式分开，别让调用方把「相对 band」当「绝对心境」用。
-                absoluteValence: Number(psyche.vad.valence),
-                deviationFromBaseline: Number(psyche.vad.valence) - Number(psyche.baseline.valence),
-                arousal: Number(psyche.vad.arousal),
-                moodScalar: absoluteMoodScalar(psyche.vad) ?? null,
-                updatedAt: new Date(psyche.updatedAt).toISOString(),
-            },
+            state: roleDeclaration(),
             persona: { charId: p.charId, name: p.name, persona: p.persona },
             bias,
             profile,
@@ -581,14 +459,12 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         const recentLimit = clampInt(args.recentLimit ?? 5, 5, 1, 50);
         const relatedLimit = clampInt(args.relatedLimit ?? 5, 5, 1, 50);
         const proj = normalizeProject(args.project);
-        const state = getAgentState(CHAR_ID, proj);
-        const psyche = getPsycheState(CHAR_ID, proj);
         // 1. 近期重要记忆
         const recent = getRecentMemories(CHAR_ID, recentLimit, hoursBack, proj);
         // 2. 与当前任务相关的记忆(向量搜索)
         let related = [];
         if (args.query) {
-            const r = await searchMemory({ query: args.query, topK: relatedLimit, profile: 'balanced', characterId: CHAR_ID, project: proj, mood: currentMood(proj, CHAR_ID) });
+            const r = await searchMemory({ query: args.query, topK: relatedLimit, profile: 'balanced', characterId: CHAR_ID, project: proj });
             related = r.map(m => ({ id: m.id, text: m.text, category: m.category, importance: m.importance, score: m.score, createdAt: m.createdAt, parentId: m.parentId || null }));
         }
         // 2.5 v1.23 Parent-Child 原文回捞：命中的是提炼记忆(leaf)，按 parent_id 取对话原文。
@@ -644,8 +520,7 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         const stats = { c: total };
         // 5. Ground Truth 提示词组装(人格声明在最前,指令分节次之)
         const sections = [];
-        sections.push(roleDeclaration());
-        sections.push(unifiedStatePrompt(state, psyche));
+        sections.push(statePrompt(proj));
         if (instructions.length > 0) {
             const lines = instructions.map(i => {
                 const base = i.scope === 'global' ? '[全局]' : i.scope === 'user' ? '[用户]' : '[项目]';
@@ -717,17 +592,6 @@ register('memory_context', 'admin', 'Assemble an injection-ready context bundle:
         }
         const bundle = {
             prompt: promptText,
-            psyche: {
-                band: psyche.hasEvidence ? psyche.band : 'neutral',
-                hasEvidence: psyche.hasEvidence,
-                vad: psyche.vad,
-                // 2026-10-31：显式分开，别让调用方把「相对 band」当「绝对心境」用。
-                absoluteValence: Number(psyche.vad.valence),
-                deviationFromBaseline: Number(psyche.vad.valence) - Number(psyche.baseline.valence),
-                arousal: Number(psyche.vad.arousal),
-                moodScalar: absoluteMoodScalar(psyche.vad) ?? null,
-                updatedAt: new Date(psyche.updatedAt).toISOString(),
-            },
             instructions,
             recent: recent.map(m => ({ text: m.text, category: m.category, importance: m.importance, createdAt: m.createdAt })),
             related,
@@ -790,31 +654,6 @@ register('user_observe', 'harness', '[Internal] Observe a user message for commu
     try {
         observeUserMessage(CHAR_ID, 'default', args.message, args.project);
         return ok({ observed: true });
-    }
-    catch (e) {
-        return err(e.message);
-    }
-});
-register('mood_journal', 'admin', 'Get mood history for the past N days.', {
-    days: z.number().optional().default(7),
-    project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
-}, async (args) => {
-    try {
-        const proj = normalizeProject(args.project);
-        // Normalize once before scanning memType partitions.  Passing an
-        // omitted project into listMemTypeDirs used to reach safeFilePart(undefined)
-        // and made the default mood journal fail instead of returning history.
-        const dbs = listMemTypeDirs(proj).map(mt => DatabaseManager.getInstance(proj, mt));
-        const p = getPersona();
-        const since = new Date(Date.now() - (args.days || 7) * 86400000).toISOString();
-        return ok({
-            op: 'mood_journal',
-            days: args.days,
-            project: proj,
-            persona: { charId: p.charId, name: p.name, persona: p.persona },
-            // 自循环日记是派生观察，不是事件情绪证据；情绪历史默认只读原始记忆。
-            moods: dbs.flatMap(db => db.prepare("SELECT emotional_impact as value, created_at, text, category FROM memory WHERE is_active=1 AND project=? AND character_id=? AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state') AND (category='emotional' OR category='mood_snapshot' OR tier='temporary') AND created_at>? ORDER BY created_at DESC LIMIT 30").all(proj, CHAR_ID, since)).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, 30),
-        });
     }
     catch (e) {
         return err(e.message);
@@ -1432,25 +1271,6 @@ register('project_create', 'admin', 'Create a new project (library) namespace. I
         return err(e.message, 'PROJECT_CREATE_FAILED');
     }
 });
-register('reflect_all', 'admin', 'Cross-library reflection & consolidation (non-destructive): scan active memories from every memory library (this instance + FEDERATION_DIRS external instances), let the LLM merge duplicates and distill high-value insights across libraries, then write the result into the dedicated project=reflect library (skipping already-existing texts). dryRun=true only analyzes without writing. Source libraries are opened read-only and never modified. Requires REFLECT LLM channel (config.json reflect section).', {
-    maxTotal: z.number().optional().describe('Max total memories to scan across all libraries (default 300)'),
-    maxPerLib: z.number().optional().describe('Max memories per library (default 100)'),
-    dryRun: z.boolean().optional().describe('true = analyze only, do not write into reflect library (default false)'),
-    projects: z.array(z.string()).optional().describe('Only reflect the specified project libraries (e.g. ["hermes"]); default = all libraries'),
-}, async (args) => {
-    try {
-        const r = await runReflectAll({
-            maxTotal: args.maxTotal,
-            maxPerLib: args.maxPerLib,
-            dryRun: args.dryRun,
-            projects: args.projects,
-        });
-        return ok(r);
-    }
-    catch (e) {
-        return err(e.message, 'REFLECT_ALL_FAILED');
-    }
-});
 register('memory_search_all', 'admin', 'Federation search interface (read-only): search this instance\'s libraries plus any external instances listed in FEDERATION_DIRS env ([{"name":"...","dir":"..."},...]). Explicit semantics — the engine does NOT merge libraries automatically; the caller decides interop policy. Results carry "instance" and "project".', {
     query: z.string().describe('Query text'),
     topK: z.number().optional().describe('Max results per library (default 5)'),
@@ -1536,13 +1356,13 @@ register('instruction_delete', 'admin', 'Delete one instruction layer. scope=pro
     }
 });
 // ═══════════════════════════════════════════════════════════════════
-// v1.26 前端存储桥 — 给 AIRI 这类「每个角色一套记忆」的客户端当持久层
+// v1.26 前端存储桥 — 给「每个角色一套记忆」的客户端当持久层
 //   角色 = memory.character_id;不传 characterId 回落到本进程 CHAR_ID
 //   general=true 表示所有角色共享(character_id 写空串)
 //   文本约定:第一行 `# <name>` 是索引名,第二行是用途说明,空行之后是正文
-//   source='airi' 标记写入方,方便和引擎自己产生的记忆区分
+//   source='default' 标记写入方,方便和引擎自己产生的记忆区分
 // ═══════════════════════════════════════════════════════════════════
-const STORE_SOURCE = 'airi';
+const STORE_SOURCE = 'default';
 const STORE_NAME_RE = /^#\s+([^\n]+)\n?/;
 /** 拆出「索引名 / 用途说明 / 正文」。没有约定的头(引擎自己写的记忆)返回 name=null。 */
 function parseStoreText(text) {
@@ -1723,8 +1543,6 @@ register('memory_recall', 'store', 'Recall for one query and render a ready-to-i
             topK: args.topK,
             minSimilarity: args.minSimilarity,
             capChars: args.capChars,
-            // 心情 → 情绪一致性重排 + "难过不翻旧账";agentState 取不到就按中性处理
-            mood: currentMood(project, charId),
         });
         return ok({
             op: 'recall',
@@ -1744,7 +1562,7 @@ register('memory_store_list', 'store', 'List a frontend store with full text: ro
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
     includeGeneral: z.boolean().optional().describe('Also return memories shared by every role (default true)'),
     allCharacters: z.boolean().optional().describe('Ignore the role filter and return every role (a client rebuilding its own cache wants this)'),
-    source: z.string().optional().describe('Only rows written by this source (e.g. "airi")'),
+    source: z.string().optional().describe('Only rows written by this source (e.g. "default")'),
     limit: z.number().optional().describe('Max rows (default 500, hard cap 2000)'),
 }, async (args) => {
     try {
@@ -1857,7 +1675,6 @@ async function main() {
     catch (e) {
         console.error('[session-memory] TTL 清扫失败:', e.message);
     }
-    // Agent state: nothing to flush (in-memory only)
     // Consolidate every 24 hours
     setInterval(() => { consolidate().catch(() => { }); }, 24 * 60 * 60 * 1000);
     // Event-driven digest check every 1 minute
@@ -1865,45 +1682,7 @@ async function main() {
     setInterval(() => {
         scheduleDigestSweep();
     }, 60 * 1000);
-    // Self-cycle is deliberately opt-in: it writes derived diary memories and
-    // must never become an invisible side effect of merely starting the server.
-    // When enabled, scan the default project plus projects already present on
-    // disk, while keeping one process-local sweep in flight at a time.
-    const selfCycleIntervalMinutes = Number.parseFloat(process.env.SELF_CYCLE_INTERVAL_MINUTES || '0');
-    if (Number.isFinite(selfCycleIntervalMinutes) && selfCycleIntervalMinutes > 0) {
-        const intervalMs = Math.max(60_000, selfCycleIntervalMinutes * 60_000);
-        let selfCycleSweepBusy = false;
-        const runSelfCycleSweep = async () => {
-            if (selfCycleSweepBusy)
-                return;
-            selfCycleSweepBusy = true;
-            try {
-                const projects = new Set([normalizeProject(PROJECT_ID), ...listProjectNames().map(normalizeProject)]);
-                for (const project of projects) {
-                    try {
-                        const result = await runSelfCycle({
-                            project,
-                            characterId: CHAR_ID,
-                            minIntervalHours: selfCycleIntervalMinutes / 60,
-                        });
-                        if (!result.skipped || result.reason !== 'no_new_evidence') {
-                            console.error(`[self-cycle-auto] project=${project} ok=${result.ok} skipped=${result.skipped} reason=${result.reason || ''}${result.diaryId ? ` diary=${result.diaryId}` : ''}`);
-                        }
-                    }
-                    catch (error) {
-                        console.error(`[self-cycle-auto] project=${project} error: ${error?.message || error}`);
-                    }
-                }
-            }
-            finally {
-                selfCycleSweepBusy = false;
-            }
-        };
-        setTimeout(() => { runSelfCycleSweep().catch(() => { }); }, 0);
-        setInterval(() => { runSelfCycleSweep().catch(() => { }); }, intervalMs);
-        console.error(`[castalia] self-cycle every ${Math.round(intervalMs / 60000)}m (opt-in)`);
-    }
-    // 事件摘要层(P2)的调度**不在这里**：AIRI 与宿主都走 maintain()（in-process 由
+    // 事件摘要层(P2)的调度**不在这里**：宿主侧统一走 maintain()（in-process 由
     // castalia-memory.ts 的 scheduleMemoryMaintenance 每晚 04:00–06:00 + 启动 catch-up 触发，
     // 内部已调 runEventDigest）。曾经在这里加过每小时定时器 —— in-process 形态不加载 index.ts，
     // 那是第二份调度器、纯死代码。stdio 形态若要事件层，应在宿主补触发点，不要加到引擎入口。
@@ -1938,8 +1717,8 @@ async function main() {
     // ═══ stdio 管道被对面关掉时的存活保护 (2026-10-28) ═══
     // stdio 模式下 process.stdout 是个 Socket。客户端(宿主/mcp-proxy)关掉会话后再回写,
     // 就是 EPIPE,而 Node 对未处理的 'error' 事件是直接抛 —— 进程当场死,端口还在听、
-    // 子进程没了,看护判"空壳桥"重建,顺带把 LobeHub 重启一圈。
-    // 实测: bridge-hermes-bridge.log 里 consolidate 完成后 EPIPE → exit 1,反复发生。
+    // 子进程没了,看护判"空壳桥"重建,顺带把无关的宿主进程也重启一圈。
+    // 实测: bridge.log 里 consolidate 完成后 EPIPE → exit 1,反复发生。
     // 对面已经走了,这条响应没有接收方,记一行日志即可,不该拿进程陪葬;
     // 非管道类错误照旧抛出。
     const guardStdioErrors = (stream, name) => {

@@ -98,10 +98,10 @@ export interface FedProvider {
  * 成员配置项 —— 出现在 FEDERATION_MEMBERS / FEDERATION_DIRS 里。
  *
  * 老写法(仍然支持):
- *   FEDERATION_DIRS = [{"name":"Hermes","dir":"D:/banks/hermes"}]
+ *   FEDERATION_DIRS = [{"name":"other-node","dir":"C:/banks/other-node"}]
  * 新写法:
  *   FEDERATION_MEMBERS = [{
- *     "id":"airi", "label":"Castalia Anima", "variant":"anima",
+ *     "id":"default", "label":"Castalia Anima", "variant":"anima",
  *     "capabilities":["emotion"], "transport":"mcp-http",
  *     "target":"http://127.0.0.1:3320/mcp"
  *   }]

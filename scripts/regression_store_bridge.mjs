@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 回归:前端存储桥(v1.26) — AIRI 这类「每个角色一套记忆」的客户端把引擎当持久层
+ * 回归:前端存储桥(v1.26) — 示例应用 这类「每个角色一套记忆」的客户端把引擎当持久层
  *
  * 覆盖:
  *   1. memory_store_save 能写进 memory 表,character_id = 传进来的角色 id(不是进程 CHAR_ID)。
@@ -47,7 +47,7 @@ async function connect(charId) {
       ...process.env,
       MEMORY_DB_DIR: tmp,
       MEMORY_CONFIG: path.join(tmp, 'missing-config.json'),
-      CASTALIA_PROJECT: 'airi',
+      CASTALIA_PROJECT: 'default',
       CHAR_ID: charId,
       MCP_TOOLS: 'store,agent,admin',
       EMBED_MODE: 'none',
@@ -67,30 +67,30 @@ async function connect(charId) {
 }
 
 async function main() {
-  const { client, call } = await connect('airi-default');
+  const { client, call } = await connect('default-default');
 
   // 1. 两个角色各写一条
   const a = await call('memory_store_save', {
     name: 'favorite-tea', description: 'her favourite drink', body: 'oolong, no sugar, brewed at 90C',
-    characterId: 'role-a', project: 'airi',
+    characterId: 'role-a', project: 'default',
   });
   check('store_save 写入 role-a', a.ok === true && a.updated === false, JSON.stringify(a).slice(0, 200));
 
   const b = await call('memory_store_save', {
     name: 'lives-in', description: 'city', body: 'Hangzhou, near the lake',
-    characterId: 'role-b', project: 'airi',
+    characterId: 'role-b', project: 'default',
   });
   check('store_save 写入 role-b', b.ok === true && b.updated === false);
 
   // 2. 共享条目
   const g = await call('memory_store_save', {
     name: 'user-name', description: 'the owner of the device', body: 'the owner prefers to be called 1',
-    general: true, project: 'airi',
+    general: true, project: 'default',
   });
   check('store_save general=true 写入共享层', g.ok === true && g.general === true);
 
   // 3. 列表隔离
-  const listA = await call('memory_store_list', { characterId: 'role-a', project: 'airi' });
+  const listA = await call('memory_store_list', { characterId: 'role-a', project: 'default' });
   const namesA = (listA.results || []).map(r => r.name);
   check('role-a 能看到自己的条目', namesA.includes('favorite-tea'), namesA.join(','));
   check('role-a 看不到 role-b 的条目', !namesA.includes('lives-in'), namesA.join(','));
@@ -98,38 +98,38 @@ async function main() {
   check('list 返回完整正文(未截断)', (listA.results || []).some(r => r.name === 'favorite-tea' && r.body.includes('brewed at 90C')));
   check('共享条目 general=true / characterId 为空', (listA.results || []).some(r => r.name === 'user-name' && r.general === true && r.characterId === ''));
 
-  const listB = await call('memory_store_list', { characterId: 'role-b', project: 'airi' });
+  const listB = await call('memory_store_list', { characterId: 'role-b', project: 'default' });
   const namesB = (listB.results || []).map(r => r.name);
   check('role-b 看不到 role-a 的条目', !namesB.includes('favorite-tea'), namesB.join(','));
   check('role-b 能看到共享条目', namesB.includes('user-name'), namesB.join(','));
 
   // 4. 不带 characterId → 回落进程 CHAR_ID
-  const listDefault = await call('memory_store_list', { project: 'airi' });
-  check('省略 characterId 时回落 CHAR_ID', listDefault.characterId === 'airi-default', listDefault.characterId);
+  const listDefault = await call('memory_store_list', { project: 'default' });
+  check('省略 characterId 时回落 CHAR_ID', listDefault.characterId === 'default-default', listDefault.characterId);
   check('回落 CHAR_ID 时看不到别的角色条目', !(listDefault.results || []).some(r => r.name === 'favorite-tea'));
 
   // 5. 同名覆盖(更新而非新增)
-  const before = ((await call('memory_store_list', { characterId: 'role-a', project: 'airi' })).results || []).filter(r => r.name === 'favorite-tea').length;
+  const before = ((await call('memory_store_list', { characterId: 'role-a', project: 'default' })).results || []).filter(r => r.name === 'favorite-tea').length;
   const a2 = await call('memory_store_save', {
     name: 'favorite-tea', description: 'her favourite drink', body: 'now prefers green tea',
-    characterId: 'role-a', project: 'airi',
+    characterId: 'role-a', project: 'default',
   });
-  const after = (await call('memory_store_list', { characterId: 'role-a', project: 'airi' })).results || [];
+  const after = (await call('memory_store_list', { characterId: 'role-a', project: 'default' })).results || [];
   check('同名再存标记为更新', a2.ok === true && a2.updated === true, JSON.stringify(a2).slice(0, 160));
   check('同名再存不新增行', before === 1 && after.filter(r => r.name === 'favorite-tea').length === 1, `before=${before} after=${after.filter(r => r.name === 'favorite-tea').length}`);
   check('正文被替换', after.some(r => r.name === 'favorite-tea' && r.body === 'now prefers green tea'));
 
   // 6. 删除只影响本角色
-  const del = await call('memory_store_forget', { name: 'favorite-tea', characterId: 'role-a', project: 'airi' });
-  const afterDel = (await call('memory_store_list', { characterId: 'role-a', project: 'airi' })).results || [];
-  const afterDelB = (await call('memory_store_list', { characterId: 'role-b', project: 'airi' })).results || [];
+  const del = await call('memory_store_forget', { name: 'favorite-tea', characterId: 'role-a', project: 'default' });
+  const afterDel = (await call('memory_store_list', { characterId: 'role-a', project: 'default' })).results || [];
+  const afterDelB = (await call('memory_store_list', { characterId: 'role-b', project: 'default' })).results || [];
   check('store_forget 返回已删除', del.ok === true && del.deleted === true, JSON.stringify(del).slice(0, 160));
   check('删除后 role-a 列表不再有它', !afterDel.some(r => r.name === 'favorite-tea'));
   check('删除不影响 role-b 的条目', afterDelB.some(r => r.name === 'lives-in'));
   check('删除不影响共享条目', afterDelB.some(r => r.name === 'user-name'));
 
   // 7. 引擎侧确实落库(直接看 SQLite,证明不是前端自嗨)
-  const dbFile = path.join(tmp, 'airi', 'general', 'memory.sqlite');
+  const dbFile = path.join(tmp, 'default', 'general', 'memory.sqlite');
   check('落库文件存在', fs.existsSync(dbFile), dbFile);
   if (fs.existsSync(dbFile)) {
     const Database = require(path.join(ROOT, 'node_modules', 'better-sqlite3'));
@@ -146,23 +146,23 @@ async function main() {
   }
 
   // 8. 跨角色一次拉全(前端重建缓存用):allCharacters + source 圈定写入方
-  const all = await call('memory_store_list', { allCharacters: true, source: 'airi', project: 'airi' });
+  const all = await call('memory_store_list', { allCharacters: true, source: 'default', project: 'default' });
   const allNames = (all.results || []).map(r => r.name);
   check('allCharacters 能一次拿到所有角色的条目', allNames.includes('lives-in') && allNames.includes('user-name'), allNames.join(','));
   const allChars = new Set((all.results || []).map(r => r.characterId));
   check('跨角色结果里同时出现 role-b 和共享层', allChars.has('role-b') && allChars.has(''), [...allChars].join('|'));
 
   // 9. 引擎自己的工具也能看到(打通,而非两套):用 CHAR_ID=role-a 起第二个进程
-  await call('memory_store_save', { name: 'pet-cat', description: 'a cat', body: 'Mimi the calico cat sleeps on the keyboard', characterId: 'role-a', project: 'airi' });
+  await call('memory_store_save', { name: 'pet-cat', description: 'a cat', body: 'Mimi the calico cat sleeps on the keyboard', characterId: 'role-a', project: 'default' });
   const roleA = await connect('role-a');
-  const adminList = await roleA.call('memory_list', { project: 'airi' });
+  const adminList = await roleA.call('memory_list', { project: 'default' });
   const adminTexts = (adminList.results || []).map(r => String(r.text || ''));
   check('CHAR_ID=role-a 的引擎 memory_list 能看到前端写的记忆', adminTexts.some(t => t.includes('pet-cat')), `count=${adminTexts.length}`);
-  const found = await roleA.call('memory_search', { query: 'Mimi calico cat', project: 'airi', topK: 5 });
+  const found = await roleA.call('memory_search', { query: 'Mimi calico cat', project: 'default', topK: 5 });
   const hits = (found.results || []).map(r => String(r.text || ''));
   check('CHAR_ID=role-a 的引擎 memory_search 能搜到', hits.some(t => t.includes('Mimi')), `count=${hits.length}`);
   const otherRole = await connect('role-b');
-  const otherList = await otherRole.call('memory_list', { project: 'airi' });
+  const otherList = await otherRole.call('memory_list', { project: 'default' });
   check('换一个角色的引擎进程看不到 role-a 的记忆', !(otherList.results || []).some(r => String(r.text || '').includes('pet-cat')));
   await roleA.client.close();
   await otherRole.client.close();

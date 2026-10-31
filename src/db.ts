@@ -483,77 +483,10 @@ export function initProjectSchema(db: Database.Database) {
       FOREIGN KEY(source_memory_id) REFERENCES memory(id)
     );
 
-    -- Short-term affect is a state snapshot, not a memory record. Keeping it
-    -- in its own table prevents psyche state from entering memory search/VAD.
-    CREATE TABLE IF NOT EXISTS psyche_state (
-      project TEXT NOT NULL,
-      character_id TEXT NOT NULL,
-      version INTEGER NOT NULL DEFAULT 1,
-      has_evidence INTEGER NOT NULL DEFAULT 0,
-      baseline_valence REAL NOT NULL,
-      baseline_arousal REAL NOT NULL,
-      baseline_dominance REAL NOT NULL,
-      vad_valence REAL NOT NULL,
-      vad_arousal REAL NOT NULL,
-      vad_dominance REAL NOT NULL,
-      band TEXT NOT NULL DEFAULT 'neutral',
-      updated_at INTEGER NOT NULL,
-      last_evidence_at INTEGER,
-      processed_event_ids TEXT NOT NULL DEFAULT '[]',
-      -- 最近一次被采纳证据的重要性(0..1)。V&L 2014：持续时间由重要性与反刍决定。
-      salience REAL NOT NULL DEFAULT 0,
-      -- 慢层心境（E2/R10 的两层结构）：情绪向它回归，它向人格基线缓慢回落。
-      -- 为空时按人格基线初始化（旧库读出来的行等价于「心境=基线」）。
-      mood_valence REAL,
-      mood_arousal REAL,
-      mood_dominance REAL,
-      PRIMARY KEY (project, character_id)
-    );
-
-    -- One claim per self-cycle evidence set. This is separate from memory so
-    -- derived diary writes can be retried without becoming new evidence.
-    CREATE TABLE IF NOT EXISTS self_cycle_runs (
-      project TEXT NOT NULL,
-      character_id TEXT NOT NULL,
-      evidence_key TEXT NOT NULL,
-      evidence_watermark_created_at TEXT,
-      evidence_watermark_rowid INTEGER,
-      diary_id TEXT,
-      claimed_at TEXT NOT NULL,
-      PRIMARY KEY (project, character_id, evidence_key)
-    );
-
-    -- Append-only history of accepted psyche transitions. psyche_state keeps
-    -- only the current row, which makes replay/calibration impossible: the
-    -- audit's §7 asks for half-life and threshold fitting from trajectories,
-    -- and there was no trajectory to fit. One row per accepted appraisal.
-    CREATE TABLE IF NOT EXISTS psyche_events (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      project TEXT NOT NULL,
-      character_id TEXT NOT NULL,
-      at INTEGER NOT NULL,
-      kind TEXT NOT NULL,
-      event_id TEXT,
-      from_valence REAL NOT NULL,
-      from_arousal REAL NOT NULL,
-      from_dominance REAL NOT NULL,
-      to_valence REAL NOT NULL,
-      to_arousal REAL NOT NULL,
-      to_dominance REAL NOT NULL,
-      baseline_valence REAL NOT NULL,
-      band TEXT NOT NULL,
-      version INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_psyche_events_role ON psyche_events(project, character_id, at);
   `);
 
   // Safe column migrations (may already exist)
   const migrations = [
-    `ALTER TABLE psyche_state ADD COLUMN last_evidence_at INTEGER`,
-    `ALTER TABLE psyche_state ADD COLUMN salience REAL DEFAULT 0`,
-    `ALTER TABLE psyche_state ADD COLUMN mood_valence REAL`,
-    `ALTER TABLE psyche_state ADD COLUMN mood_arousal REAL`,
-    `ALTER TABLE psyche_state ADD COLUMN mood_dominance REAL`,
     `ALTER TABLE memory ADD COLUMN tier TEXT DEFAULT 'standard'`,
     `ALTER TABLE memory ADD COLUMN expires_at DATETIME`,
     `ALTER TABLE memory ADD COLUMN agent_mood TEXT`,

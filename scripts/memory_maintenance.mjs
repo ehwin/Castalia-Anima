@@ -20,7 +20,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
-const [CMD = 'health', BANK = 'airi', PROJ = 'airi'] = process.argv.slice(2);
+const [CMD = 'health', BANK = 'default', PROJ = 'default'] = process.argv.slice(2);
 const MTS = ['general', 'user', 'project', 'reference', 'feedback'];
 
 // 库根目录可覆盖(自测/沙盘用):CASTALIA_BANK_ROOT=D:/.../bank-sandbox

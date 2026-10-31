@@ -19,7 +19,7 @@ function check(name, cond, detail = '') {
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'castalia-orphan-'));
 process.env.MEMORY_DB_DIR = tmp;
-process.env.CHAR_ID = 'airi';
+process.env.CHAR_ID = 'default';
 process.env.EMBED_MODE = 'none';
 
 const dbMod = await import(pathToFileURL(path.join(DIST, 'db.js')).href);
@@ -28,7 +28,7 @@ const orphan = await import(pathToFileURL(path.join(DIST, 'orphan.js')).href);
 
 const db = dbMod.DatabaseManager.getInstance('default', 'general');
 const mk = async (text, sessionId) => (await storeMod.saveMemory({
-  text, project: 'default', characterId: 'airi', skipEmbed: true, ...(sessionId ? { sessionId } : {}),
+  text, project: 'default', characterId: 'default', skipEmbed: true, ...(sessionId ? { sessionId } : {}),
 })).id;
 
 const alive = await mk('这是还活着的会话里的记忆', 'sess-alive');

@@ -20,7 +20,7 @@ function check(name, cond, detail = '') {
 
 const hit = (id, sim, text = '一段记忆正文') => ({
   id, text, project: 'default', type: 'episodic', memType: 'general', category: 'general',
-  subcategory: null, tags: [], emotionalImpact: 0, importance: 0.6, characterId: 'airi',
+  subcategory: null, tags: [], emotionalImpact: 0, importance: 0.6, characterId: 'default',
   source: null, subject: 'user', agentMood: null, agentDesire: null, tier: 'standard',
   score: sim, similarity: sim, basis: 'vector', createdAt: '2026-10-01T00:00:00Z',
   lastAccessedAt: '2026-10-01T00:00:00Z', accessedCount: 0, biasBoost: 1,

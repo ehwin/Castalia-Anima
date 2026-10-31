@@ -17,7 +17,6 @@ import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { normalizeCharacterId, normalizeProject, CHAR_ID } from './env.js';
 import { flushVadQueueDetailed, recoverPendingVadQueue } from './emotion.js';
 import { cleanupExpiredMemories } from './store.js';
-import { getAgentState } from './agentState.js';
 
 const MIN_DIGEST_GAP_MS = 60 * 1000;
 // v1.23.2-fix: 按 project 节流（旧实现全局单值，一个项目跑 digest 会压制其它项目 60s）

@@ -6,7 +6,7 @@
  * 判定:用当前模型重算同一条文本,与存量向量余弦 < 0.9 即判为不一致。
  *
  * 用法:
- *   MEMORY_BANK_ROOT=D:/castalia/memory-banks node scripts/audit_vector_space.mjs --bank airi
+ *   MEMORY_BANK_ROOT=D:/castalia/memory-banks node scripts/audit_vector_space.mjs --bank default
  *   ... --fix        # 重算并覆盖(只覆盖不一致的行)
  */
 import fs from 'node:fs';
@@ -22,7 +22,7 @@ const BANK = arg('--bank', '');
 const FIX = args.includes('--fix');
 const LIMIT = Number(arg('--limit', '0')) || 0;
 
-process.env.MEMORY_DB_DIR = process.env.MEMORY_DB_DIR || path.join(ROOT, BANK || 'airi');
+process.env.MEMORY_DB_DIR = process.env.MEMORY_DB_DIR || path.join(ROOT, BANK || 'default');
 await import(pathToFileURL(path.resolve('dist', 'configLoader.js')).href);
 const { embed } = await import(pathToFileURL(path.resolve('dist', 'ollama.js')).href);
 

@@ -12,7 +12,7 @@ const config = path.join(temp, 'config.json');
 fs.writeFileSync(config, JSON.stringify({ reflect: { preservation: 'evidence' } }));
 Object.assign(process.env, {
   MEMORY_DB_DIR: temp, MEMORY_CONFIG: config,
-  CHAR_ID: 'airi',                 // v1.24: 角色 = 进程级实例 ID(本回归显式钉成 airi)
+  CHAR_ID: 'default',                 // v1.24: 角色 = 进程级实例 ID(本回归显式钉成 default)
   EMBED_MODE: 'api', OLLAMA_URL: 'https://fixture.invalid', EMBEDDING_API_KEY: 'fixture',
   REFLECT_LLM_API_KEY: 'fixture', REFLECT_LLM_URL: 'https://fixture.invalid', REFLECT_LLM_RETRIES: '1',
 });
@@ -58,13 +58,13 @@ const prompt = buildReflectSystemPrompt();
 check(/subject/.test(prompt) && /predicate/.test(prompt) && /sourceId,"text"|sourceId.*text/.test(prompt), 'emotional prompt documents the facts field contract');
 
 reply = extraction(['纯字符串事实', { sourceId, text: '非三元组' }, { subject: 'user', predicate: '称呼', object: '示例', confidence: 0.9 }]);
-let r = await runAutoReflect('airi', 30, project);
+let r = await runAutoReflect('default', 30, project);
 check(r.ok && r.processedCount === 1 && r.applied === 1, 'batch still advances: ' + JSON.stringify(r));
 check(r.factsInserted === 1, 'only the well-formed fact is stored');
 check((r.warnings || []).some(w => w.includes('facts')), 'dropped facts leave an audit warning');
 
 reply = extraction(['再来一条纯字符串']);
-const r2 = await runAutoReflect('airi', 30, project);
+const r2 = await runAutoReflect('default', 30, project);
 check(r2.skipped || (r2.ok && r2.processedCount === 0), 'no pending sources after advancement');
 
 DatabaseManager.close();

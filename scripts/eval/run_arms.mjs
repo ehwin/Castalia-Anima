@@ -7,14 +7,14 @@
  * 这个跑法把 2026-10-31 那轮实验的判据固化下来（69 条金标，见 queries.gold.json）。
  *
  * 用法：
- *   node scripts/eval/run_arms.mjs --db <库根> --project airi
- *   node scripts/eval/run_arms.mjs --db <库根> --project airi --arms default,time015,emo0
- *   node scripts/eval/run_arms.mjs --db <库根> --project airi --dist <另一个构建的 dist>
+ *   node scripts/eval/run_arms.mjs --db <库根> --project default
+ *   node scripts/eval/run_arms.mjs --db <库根> --project default --arms default,time015,emo0
+ *   node scripts/eval/run_arms.mjs --db <库根> --project default --dist <另一个构建的 dist>
  *
  * 参数：
  *   --db <dir>        库根（其下有 <project>/<character>/<memtype>/memory.sqlite）。
  *                     **必须是一份可丢弃的副本**：每个臂都会再复制一份，源库只读。
- *   --project <name>  项目名，默认 airi
+ *   --project <name>  项目名，默认 default
  *   --character <id>  角色名，默认与 project 相同
  *   --arms <list>     逗号分隔，默认 default。可用臂见 ARMS 表，也可写自定义
  *                     `name:ENV=VAL;ENV=VAL` 形式。
@@ -62,7 +62,7 @@ const ARMS = {
 
 function parseArgs(argv) {
   const out = {
-    db: '', project: 'airi', character: '', arms: 'default', dist: path.join(REPO, 'dist'),
+    db: '', project: 'default', character: '', arms: 'default', dist: path.join(REPO, 'dist'),
     topk: 10, embed: 'none', out: '', keep: false, json: false,
     child: '', childOut: '',
   };

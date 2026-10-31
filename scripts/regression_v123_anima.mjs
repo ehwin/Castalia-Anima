@@ -16,7 +16,7 @@ Object.assign(process.env, {
   MEMORY_CONFIG: config,
   EMBED_MODE: 'none',              // 零网络：不调 Ollama / embedding API
   CASTALIA_PROJECT: 'anima-v123',
-  CHAR_ID: 'airi',                 // v1.24: 角色 = 进程级实例 ID(本回归显式钉成 airi)
+  CHAR_ID: 'default',                 // v1.24: 角色 = 进程级实例 ID(本回归显式钉成 default)
   COLD_AFTER_DAYS: '60',
   COLD_MAX_IMPORTANCE: '0.6',
   REFLECT_LLM_API_KEY: 'fixture',
@@ -62,7 +62,7 @@ const memRow = (id) => memDb(id).prepare('SELECT * FROM memory WHERE id = ?').ge
 // ══════════════════════════════════════════════════════════════
 // 1) facts：功能性谓词失效 / 同批不互相失效 / 复写清空 valid_to
 // ══════════════════════════════════════════════════════════════
-await saveFacts([{ subject: 'user', predicate: '职业', object: '程序员', confidence: 0.9, evidence: '用户说自己是程序员' }], null, 'airi', P);
+await saveFacts([{ subject: 'user', predicate: '职业', object: '程序员', confidence: 0.9, evidence: '用户说自己是程序员' }], null, 'default', P);
 let f1 = factRow('user', '职业', '程序员');
 check(!!f1, 'fact inserted');
 check(f1.valid_to == null, 'new fact is valid (valid_to NULL)');
@@ -70,7 +70,7 @@ check(f1.valid_to == null, 'new fact is valid (valid_to NULL)');
 check(!!f1.valid_from && f1.valid_from >= '2020-01-01', 'new fact carries valid_from = write time');
 check(f1.evidence === '用户说自己是程序员', 'evidence column persisted');
 
-await saveFacts([{ subject: 'user', predicate: '职业', object: '设计师', confidence: 0.9 }], null, 'airi', P);
+await saveFacts([{ subject: 'user', predicate: '职业', object: '设计师', confidence: 0.9 }], null, 'default', P);
 const f1Old = factRow('user', '职业', '程序员');
 const f2 = factRow('user', '职业', '设计师');
 check(!!f1Old.valid_to, 'functional predicate conflict stamps old fact valid_to');
@@ -82,21 +82,21 @@ check(f1Old.id === f1.id, 'same row kept (no duplicate insert)');
 await saveFacts([
   { subject: 'user', predicate: '姓名', object: '张三', confidence: 0.9 },
   { subject: 'user', predicate: '姓名', object: '李四', confidence: 0.9 },
-], null, 'airi', P);
+], null, 'default', P);
 const zs = factRow('user', '姓名', '张三');
 const ls = factRow('user', '姓名', '李四');
 check(!!zs && !!ls, 'both same-batch functional facts stored');
 check(zs.valid_to == null && ls.valid_to == null, 'same-batch functional facts do not invalidate each other');
 
 // 7b) 复写已失效的同一 SPO → valid_to 清空
-await saveFacts([{ subject: 'user', predicate: '职业', object: '程序员', confidence: 0.95 }], null, 'airi', P);
+await saveFacts([{ subject: 'user', predicate: '职业', object: '程序员', confidence: 0.95 }], null, 'default', P);
 const f1Back = factRow('user', '职业', '程序员');
 check(f1Back.valid_to == null || f1Back.valid_to === '', 'rewriting an invalidated SPO clears valid_to');
 const design = factRow('user', '职业', '设计师');
 check(!!design.valid_to, 'rewrite still invalidates the superseded functional value');
 
 // 显式 validTo 不被清空
-await saveFacts([{ subject: 'user', predicate: '昵称', object: '小张', confidence: 0.8, validTo: '2026-01-01T00:00:00.000Z' }], null, 'airi', P);
+await saveFacts([{ subject: 'user', predicate: '昵称', object: '小张', confidence: 0.8, validTo: '2026-01-01T00:00:00.000Z' }], null, 'default', P);
 check(String(factRow('user', '昵称', '小张').valid_to).includes('2026-01-01'), 'explicit validTo is respected');
 
 // ══════════════════════════════════════════════════════════════
@@ -148,20 +148,20 @@ check(!supHits.some(r => r.id === sup.id), 'superseded memory is excluded from r
 // ══════════════════════════════════════════════════════════════
 // 4) 整合 invalidate 动作：只打 valid_to，只对 is_active=1 且 valid_to 为空
 // ══════════════════════════════════════════════════════════════
-await saveFacts([{ subject: 'user', predicate: '偏好饮料', object: '咖啡', confidence: 0.9 }], null, 'airi', P);
+await saveFacts([{ subject: 'user', predicate: '偏好饮料', object: '咖啡', confidence: 0.9 }], null, 'default', P);
 const coffee = factRow('user', '偏好饮料', '咖啡');
 reply = JSON.stringify([{ action: 'invalidate', factId: coffee.id, reason: '用户改喝无咖啡因' }]);
-const cons1 = await runConsolidate('airi', P, undefined, undefined, { force: true });
+const cons1 = await runConsolidate('default', P, undefined, undefined, { force: true });
 check(cons1.scanned >= 2, 'consolidate scanned window (got ' + cons1.scanned + ')');
 check(cons1.invalidated === 1, 'invalidate action stamped exactly one fact (got ' + cons1.invalidated + ')');
 check(!!factRow('user', '偏好饮料', '咖啡').valid_to, 'invalidated fact has valid_to');
-const cons2 = await runConsolidate('airi', P, undefined, undefined, { force: true });
+const cons2 = await runConsolidate('default', P, undefined, undefined, { force: true });
 check(cons2.invalidated === 0, 'already-invalidated fact is not stamped twice');
 
 // ══════════════════════════════════════════════════════════════
 // 5) Parent-Child 回捞：锚点窗口 / 整段 / 锚点失败=head / 检索带 parentId
 // ══════════════════════════════════════════════════════════════
-const anchorSentence = '锚点句：用户说把端口从 8080 改成了 9090，并且记下了路径 D:\\AI\\castalia\\Castalia-Anima。';
+const anchorSentence = '锚点句：用户说把端口从 8080 改成了 9090，并且记下了路径 C:\\bank。';
 const parentText = '【对话原文】' + '前'.repeat(2800) + anchorSentence + '后'.repeat(1200);
 const parent1 = await saveMemory({ project: P, text: parentText, source: 'conversation_log', importance: 0.5 });
 const leaf1 = await saveMemory({ project: P, text: anchorSentence, source: 'reflect_extract', tags: ['anchor-leaf'], importance: 0.6 });
@@ -211,7 +211,7 @@ const resA = await applyReflectResult({
       { subject: 'server', predicate: '端口', object: '9090', confidence: 0.8 },
     ],
   }],
-}, 'airi', P, { allowedSourceIds: new Set([srcA.id]) });
+}, 'default', P, { allowedSourceIds: new Set([srcA.id]) });
 check(resA.actionsApplied === 1, 'extract action applied with hardFacts');
 const hfIp = gdb.prepare('SELECT * FROM facts WHERE project=? AND subject=? AND predicate=?').get(P, 'server', 'ip');
 check(!!hfIp, 'hardFacts landed in facts table');
@@ -225,7 +225,7 @@ const srcB = await saveMemory({ project: P, text: '源对话二：用户说项�
 await applyReflectResult({
   summary: '', highlights: [], facts: [], insights: [],
   actions: [{ action: 'extract', sourceId: srcB.id, newText: '项目代号 bluebird-7', hardFacts: [{ subject: 'project', predicate: '代号', object: 'bluebird-7', confidence: 0.8 }] }],
-}, 'airi', P, { allowedSourceIds: new Set([srcB.id]) });
+}, 'default', P, { allowedSourceIds: new Set([srcB.id]) });
 const hfCodename = gdb.prepare('SELECT * FROM facts WHERE project=? AND subject=? AND predicate=?').get(P, 'project', '代号');
 check(!!hfCodename && hfCodename.source_memory_id === null, 'general-lib extract also stores NULL source_memory_id');
 // extract 记忆本身仍挂 parent_id（leaf → 对话原文），与 facts 的 source_memory_id 是两件事
@@ -235,11 +235,11 @@ check(!!extractRow && extractRow.parent_id === srcB.id, 'extract leaf points bac
 // ══════════════════════════════════════════════════════════════
 // 7) 证据附录 + linkedMemoryIds（接管旧记忆但不覆盖）
 // ══════════════════════════════════════════════════════════════
-const srcC = await saveMemory({ project: P, text: '配置写在 D:\\AI\\castalia\\config.json，端口 9090，版本 1.23.4。', source: 'conversation_log', importance: 0.4 });
+const srcC = await saveMemory({ project: P, text: '配置写在 C:\\bank\\config.json，端口 9090，版本 1.23.4。', source: 'conversation_log', importance: 0.4 });
 const resC = await applyReflectResult({
   summary: '', highlights: [], facts: [], insights: [],
   actions: [{ action: 'extract', sourceId: srcC.id, newText: '配置已完成', newMemType: 'project' }],
-}, 'airi', P, { allowedSourceIds: new Set([srcC.id]) });
+}, 'default', P, { allowedSourceIds: new Set([srcC.id]) });
 check((resC.warnings || []).some(w => w.includes('证据附录')), 'low hard-fact coverage emits an evidence-appendix warning');
 const appendixRow = DatabaseManager.queryAll(P, "SELECT text FROM memory WHERE project=? AND source='reflect_extract' AND text LIKE '%证据附录%'", [P])[0];
 check(!!appendixRow && appendixRow.text.includes('9090'), 'evidence appendix appends the missing original sentence');
@@ -251,7 +251,7 @@ const srcD = await saveMemory({ project: P, text: '源对话：端口已从 8080
 const resD = await applyReflectResult({
   summary: '', highlights: [], facts: [], insights: [],
   actions: [{ action: 'extract', sourceId: srcD.id, newText: '端口改为 9090', linkedMemoryIds: [oldMemory.id, lockedMemory.id] }],
-}, 'airi', P, { allowedSourceIds: new Set([srcD.id]) });
+}, 'default', P, { allowedSourceIds: new Set([srcD.id]) });
 check(resD.actionsApplied === 1, 'extract with linkedMemoryIds applied');
 const oldRow = memRow(oldMemory.id);
 check(oldRow.status === 'superseded', 'linked memory is superseded, not deleted');
@@ -276,7 +276,7 @@ for (let i = 0; i < 200; i++) {
   tailIds.push(m.id);
 }
 reply = '[]';
-const win = await runConsolidate('airi', P, undefined, undefined, { force: true });
+const win = await runConsolidate('default', P, undefined, undefined, { force: true });
 check(win.scanned === 500, 'window is capped at 500 (got ' + win.scanned + ')');
 check(tailIds.every(id => lastPrompt.includes(id)), 'all 200 oldest memories survive the 500 cap');
 check(headIds.filter(id => lastPrompt.includes(id)).length === 300, 'window head keeps exactly the top 300 by importance');
@@ -288,7 +288,7 @@ check(lastPrompt.includes('【现有事实'), 'consolidation prompt includes the
 const mergeA = tailIds[0];
 const mergeB = tailIds[1];
 reply = JSON.stringify([{ action: 'merge', sourceIds: [mergeA, mergeB], newText: '整合后的合并记忆：两条窗口最久记忆归并。', newMemType: 'feedback' }]);
-const consMerge = await runConsolidate('airi', P, undefined, undefined, { force: true });
+const consMerge = await runConsolidate('default', P, undefined, undefined, { force: true });
 check(consMerge.merged === 1, 'consolidation mode allows merge (merged=' + consMerge.merged + ', errors=' + JSON.stringify(consMerge.errors) + ')');
 check(memRow(mergeA).is_active === 0 && memRow(mergeB).is_active === 0, 'merge soft-deletes both sources (rows kept)');
 const mergedRow = DatabaseManager.queryAll(P, "SELECT id, text FROM memory WHERE project=? AND text LIKE '%整合后的合并记忆%'", [P])[0];
@@ -298,13 +298,13 @@ const countActive = () => DatabaseManager.queryAll(P, 'SELECT COUNT(*) c FROM me
   .reduce((n, r) => n + (Number(r.c) || 0), 0);
 const activeBeforeExtract = countActive();
 reply = JSON.stringify([{ action: 'extract', sourceId: tailIds[2], newText: '整合里不该出现的净增记忆。', newMemType: 'project' }]);
-const consExtract = await runConsolidate('airi', P, undefined, undefined, { force: true });
+const consExtract = await runConsolidate('default', P, undefined, undefined, { force: true });
 check((consExtract.errors || []).some(e => e.includes('extract')), 'extract is rejected as a consolidation action');
 check(consExtract.applied === 0 && consExtract.merged === 0, 'rejected extract applies nothing');
 check(countActive() === activeBeforeExtract, 'rejected extract writes no new memory');
 
 reply = JSON.stringify([{ action: 'delete', id: tailIds[3] }]);
-const consDelete = await runConsolidate('airi', P, undefined, undefined, { force: true });
+const consDelete = await runConsolidate('default', P, undefined, undefined, { force: true });
 check(consDelete.deleted === 0 && memRow(tailIds[3]).is_active === 1, 'delete is dropped by Anima fidelity (no deletion)');
 
 // ══════════════════════════════════════════════════════════════
@@ -315,7 +315,7 @@ check(!lastSystemPrompt.includes('不允许 merge/delete/split'), 'consolidation
 check(lastSystemPrompt.includes('整合只允许 merge'), 'consolidation fidelity block is appended');
 const refused = await applyReflectActions(
   [{ action: 'merge', sourceIds: [headIds[2], headIds[3]], newText: '反思段不该合并的记忆' }],
-  'airi', P, { automatic: true, allowedSourceIds: new Set([headIds[2], headIds[3]]) },
+  'default', P, { automatic: true, allowedSourceIds: new Set([headIds[2], headIds[3]]) },
 );
 check(refused.receipts[0]?.status === 'failed', 'reflection mode (no consolidation flag) still blocks merge');
 check((refused.errors || []).some(e => e.includes('emotional fidelity')), 'reflection merge refusal keeps the emotional-fidelity error');
@@ -324,16 +324,16 @@ check(memRow(headIds[2]).is_active === 1 && memRow(headIds[3]).is_active === 1, 
 // ══════════════════════════════════════════════════════════════
 // 11) 近期记忆 / 深反思扫描不再返回 superseded（深反思还排除 cold）
 // ══════════════════════════════════════════════════════════════
-const recentMem = await saveMemory({ project: P, text: '近期注入测试：这条应出现在近期记忆里。', characterId: 'airi', importance: 0.95 });
-check(getRecentMemories('airi', 10, 48, P).some(m => m.id === recentMem.id), 'getRecentMemories returns an active memory');
+const recentMem = await saveMemory({ project: P, text: '近期注入测试：这条应出现在近期记忆里。', characterId: 'default', importance: 0.95 });
+check(getRecentMemories('default', 10, 48, P).some(m => m.id === recentMem.id), 'getRecentMemories returns an active memory');
 setMem(recentMem.id, "UPDATE memory SET status = 'superseded' WHERE id = ?");
-check(!getRecentMemories('airi', 10, 48, P).some(m => m.id === recentMem.id), 'getRecentMemories drops superseded memories');
+check(!getRecentMemories('default', 10, 48, P).some(m => m.id === recentMem.id), 'getRecentMemories drops superseded memories');
 
 const coldScan = await saveMemory({ project: P, text: '深反思扫描测试：这条该被冷存排除。', importance: 0.2 });
 setMem(coldScan.id, 'UPDATE memory SET last_accessed_at = ? WHERE id = ?', new Date(Date.now() - 400 * 86400000).toISOString());
 markColdMemories(P);
 check(memRow(coldScan.id).status === 'cold', 'cold scan memory marked cold');
-const listed = listAllMemories('airi', 4000, P).map(m => m.id);
+const listed = listAllMemories('default', 4000, P).map(m => m.id);
 check(!listed.includes(coldScan.id), 'listAllMemories skips cold memories');
 check(!listed.includes(sup.id), 'listAllMemories skips superseded memories');
 
@@ -350,28 +350,28 @@ check(!listed.includes(sup.id), 'listAllMemories skips superseded memories');
     .prepare("UPDATE memory SET id=?, is_active=1, created_at='2026-01-01T00:00:00.000Z' WHERE id=?")
     .run(srcId, src.id);
   reply = '{"summary":"partial","actions":[';
-  const failed = await runAutoReflect('airi', 10, BP);
+  const failed = await runAutoReflect('default', 10, BP);
   check(!failed.ok, 'failed reflection is recorded as a failure');
-  const cond1 = shouldAutoReflect('airi', BP);
+  const cond1 = shouldAutoReflect('default', BP);
   check(cond1.should === false && /退避/.test(cond1.reason), 'auto reflection backs off after a failure: ' + JSON.stringify(cond1));
   reply = JSON.stringify({ processedSourceIds: [srcId], summary: '退避验证', facts: [], insights: [], actions: [{ action: 'extract', sourceId: srcId, newText: '退避验证提取 3318', newMemType: 'project', newCategory: 'context' }] });
-  const okRun = await runAutoReflect('airi', 10, BP);
+  const okRun = await runAutoReflect('default', 10, BP);
   check(okRun.ok, 'an explicit retry still runs (tool call bypasses backoff): ' + JSON.stringify(okRun));
-  const cond2 = shouldAutoReflect('airi', BP);
+  const cond2 = shouldAutoReflect('default', BP);
   check(!/退避/.test(cond2.reason), 'a successful run clears the backoff: ' + JSON.stringify(cond2));
 }
 
 // ══════════════════════════════════════════════════════════════
 // 13) 读侧只返回当前有效事实 + identity_locked 删除保护
 // ══════════════════════════════════════════════════════════════
-await saveFacts([{ subject: 'user', predicate: '居住地', object: '北京', confidence: 0.9 }], null, 'airi', P);
-await saveFacts([{ subject: 'user', predicate: '居住地', object: '上海', confidence: 0.9 }], null, 'airi', P);
+await saveFacts([{ subject: 'user', predicate: '居住地', object: '北京', confidence: 0.9 }], null, 'default', P);
+await saveFacts([{ subject: 'user', predicate: '居住地', object: '上海', confidence: 0.9 }], null, 'default', P);
 const currentHome = getFactsBySubject('user', undefined, P).filter(f => f.predicate === '居住地');
 check(currentHome.length === 1 && currentHome[0].object === '上海',
   'fact read path hides invalidated values: ' + JSON.stringify(currentHome.map(f => f.object)));
 const lockMem = await saveMemory({ project: P, text: '身份锁删除保护测试' });
 setMem(lockMem.id, 'UPDATE memory SET identity_locked = 1 WHERE id = ?');
-const delRes = await applyReflectActions([{ action: 'delete', targetId: lockMem.id }], 'airi', P,
+const delRes = await applyReflectActions([{ action: 'delete', targetId: lockMem.id }], 'default', P,
   { allowedSourceIds: new Set([lockMem.id]) });
 check(delRes.receipts[0]?.status === 'failed' && memRow(lockMem.id).is_active === 1,
   'identity-locked memory cannot be deleted by reflection');

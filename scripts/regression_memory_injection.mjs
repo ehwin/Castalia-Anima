@@ -12,7 +12,7 @@ const config = path.join(temp, 'config.json');
 fs.writeFileSync(config, JSON.stringify({}));
 Object.assign(process.env, {
   MEMORY_DB_DIR: temp, MEMORY_CONFIG: config,
-  CHAR_ID: 'airi', EMBED_MODE: 'api',
+  CHAR_ID: 'default', EMBED_MODE: 'api',
   OLLAMA_URL: 'https://fixture.invalid', EMBEDDING_API_KEY: 'fixture',
   REFLECT_LLM_API_KEY: 'fixture', REFLECT_LLM_URL: 'https://fixture.invalid', REFLECT_LLM_RETRIES: '1',
 });
@@ -156,19 +156,19 @@ eq(inj.text, '', '空查询 → 不注入');
 
 // ══ C. 作用域：owner 共享的一般记忆要能注入；别的角色的记忆不能 ═══════════
 const scope = 'anima-inject-scope';
-await saveMemory({ project: scope, text: '她说想去灯塔看日出', memType: 'general', importance: 0.6, characterId: 'airi' });
+await saveMemory({ project: scope, text: '她说想去灯塔看日出', memType: 'general', importance: 0.6, characterId: 'default' });
 // 一般记忆：owner 在设置页设为共享，character_id 为空
 await saveMemory({ project: scope, text: '灯塔是她和妈妈的约定', memType: 'general', importance: 0.8, characterId: '' });
 // 别的角色自己的记忆：哪怕字面更贴近，也不能出现在这个角色的注入里
 await saveMemory({ project: scope, text: '灯塔那边有家咖啡馆她说', memType: 'general', importance: 0.9, characterId: 'other-role' });
 
-const scoped = await recallForInjection('灯塔', { project: scope, characterId: 'airi', minSimilarity: 0.5 });
+const scoped = await recallForInjection('灯塔', { project: scope, characterId: 'default', minSimilarity: 0.5 });
 check(scoped.text.includes('妈妈'), 'owner 共享的一般记忆能被回忆起（与读取路径一致）');
 check(!scoped.text.includes('咖啡馆'), '别的角色的记忆不进注入（角色隔离不破）');
 eq(scoped.stats.count, 2, '两条命中：自己的 + 共享的');
 
 // 维护类调用（不传 characterId）不受影响，真库上 105 条主力行仍是严格角色作用域
-const strict = await searchMemory({ query: '灯塔', project: scope, characterId: 'airi', topK: 10, minScore: 0 });
+const strict = await searchMemory({ query: '灯塔', project: scope, characterId: 'default', topK: 10, minScore: 0 });
 check(strict.every(h => !h.text.includes('妈妈')), 'searchMemory 默认不开 includeGeneral（维护类调用保持严格隔离）');
 
 DatabaseManager.close();

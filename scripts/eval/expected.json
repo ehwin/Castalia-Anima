@@ -8,7 +8,7 @@
   "topK": 10,
   "协议": "检索以 accessChannel:'diagnostic' 调用 —— 访问计数与 last_accessed_at 都不刷新，69 条查询相互独立。",
   "实测": "2026-10-31T18:30+08:00",
-  "实测命令": "node scripts/eval/run_arms.mjs --db <快照>/airi --project airi --arms default,time015,constant --embed none",
+  "实测命令": "node scripts/eval/run_arms.mjs --db <快照>/default --project default --arms default,time015,constant --embed none",
   "与交接报告的差异": "报告记 default=76.8%（53/69）。那是在默认渠道下连跑 69 条测出来的：命中行被 +accessed_count 且 last_accessed_at 刷成现在，于是它们在**后续查询**里分数更高（accessBoost 最高 +8%、时间衰减接近 1.0）。按 diagnostic（不强化、查询相互独立）重测：default=72.5%（50/69），旧常量=55.1%（38/69）。差的 3 条是跨查询污染，不是参数效果。"
  },
  "hit1": 0.725,

@@ -16,7 +16,7 @@ Object.assign(process.env, {
   MEMORY_DB_DIR: temp,
   EMBED_MODE: 'none',
   CASTALIA_PROJECT: project,
-  CHAR_ID: 'airi',
+  CHAR_ID: 'default',
 });
 const { DatabaseManager } = await import(pathToFileURL(path.join(distRoot, 'db.js')).href);
 
@@ -52,9 +52,9 @@ db.exec(`
     evidence TEXT,
     FOREIGN KEY(source_memory_id) REFERENCES memory(id)
   );
-  INSERT INTO memory (id, text, project, character_id) VALUES ('legacy-source', 'legacy source', ?, 'airi');
+  INSERT INTO memory (id, text, project, character_id) VALUES ('legacy-source', 'legacy source', ?, 'default');
   INSERT INTO facts (id, subject, predicate, object, project, source_memory_id, character_id)
-    VALUES ('legacy-fact', 'user', 'likes', 'tea', ?, 'legacy-source', 'airi');
+    VALUES ('legacy-fact', 'user', 'likes', 'tea', ?, 'legacy-source', 'default');
 `, project, project);
 DatabaseManager.close();
 
@@ -68,7 +68,7 @@ assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name 
 // memory row exists in the general database.
 db.prepare(`INSERT INTO facts (id, subject, predicate, object, project, source_memory_id, source_memory_source, source_memory_mem_type, character_id)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
-  'cross-fact', 'user', 'likes', 'coffee', project, 'project-only-id', 'conversation_log', 'project', 'airi',
+  'cross-fact', 'user', 'likes', 'coffee', project, 'project-only-id', 'conversation_log', 'project', 'default',
 );
 assert.equal(db.prepare("SELECT COUNT(*) AS c FROM facts WHERE id IN ('legacy-fact', 'cross-fact')").get().c, 2, 'cross-partition provenance inserts');
 DatabaseManager.close();

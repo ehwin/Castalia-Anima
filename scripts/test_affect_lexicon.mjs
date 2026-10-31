@@ -1,7 +1,7 @@
 /**
  * 情感词表 + 离线兜底回归(Anima)
  *
- * 起因:实测 airi bank 262 条活跃记忆 0 条有 vad_valence —— 唯一来源 Ollama 没在跑。
+ * 起因:实测 default bank 262 条活跃记忆 0 条有 vad_valence —— 唯一来源 Ollama 没在跑。
  * 这组测试锁两件事:
  *   1) 词表能把"争吵"和"吃了面"在情感维度上分开(不问精度,只问方向);
  *   2) Ollama 不可用时 flushVadQueue 会走词表兜底并把 VAD 写进库(而不是静默空转)。
@@ -57,7 +57,7 @@ for (const t of [fight, happy, noodle]) {
 console.log('\n5) Ollama 不可用 → 词表兜底写库');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'castalia-affect-'));
 process.env.MEMORY_DB_DIR = tmp;
-process.env.CHAR_ID = 'airi';
+process.env.CHAR_ID = 'default';
 process.env.EMBED_MODE = 'none';
 process.env.OLLAMA_URL = 'http://127.0.0.1:1';   // 必然连不上
 const emo = await import(pathToFileURL(path.join(DIST, 'emotion.js')).href);
@@ -67,7 +67,7 @@ const ids = [];
 for (const text of ['她今天跟我说分手，我很难过', '我们下午去买了牛奶']) {
   const id = dbMod.generateId();
   db.prepare(`INSERT INTO memory (id, text, project, type, mem_type, character_id, source, is_active)
-              VALUES (?,?,?,?,?,?,?,1)`).run(id, text, 'default', 'episodic', 'general', 'airi', 'conversation_log');
+              VALUES (?,?,?,?,?,?,?,1)`).run(id, text, 'default', 'episodic', 'general', 'default', 'conversation_log');
   ids.push(id);
 }
 for (const [i, id] of ids.entries()) emo.queueForVad(i === 0 ? '她今天跟我说分手，我很难过' : '我们下午去买了牛奶', 'default', id);

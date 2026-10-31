@@ -1,7 +1,7 @@
 /**
  * 对照基准:覆盖率打分(Anima 现状口径) vs BM25+IDF(内存倒排)
  *
- * 语料 = 真实 airi bank 的活跃记忆(只读打开)。查询 = 从每条记忆里随机抽 3 个 bigram
+ * 语料 = 真实 default bank 的活跃记忆(只读打开)。查询 = 从每条记忆里随机抽 3 个 bigram
  * (自然包含高频词,不人为剔除 —— 剔除就变成"给 BM25 送分")。
  * 指标:recall@5 / MRR / 平均候选数。全部离线,零 API 调用。
  *
@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.resolve(HERE, '..', 'dist');
-const BANK = process.argv[2] || 'D:/castalia/memory-banks/airi';
+const BANK = process.argv[2] || 'D:/castalia/memory-banks/default';
 const SAMPLES = Number(process.argv[3] || 40);
 
 const { queryTerms } = await import(pathToFileURL(path.join(DIST, 'search.js')).href);
@@ -38,7 +38,7 @@ function walk(dir) {
   }
 }
 walk(BANK);
-console.log(`语料 ${docs.length} 条(airi bank,含所有 project)`);
+console.log(`语料 ${docs.length} 条(default bank,含所有 project)`);
 if (docs.length < 20) { console.log('语料太少,跳过'); process.exit(0); }
 
 const idx = idfMod.buildBm25Index(docs, (s) => queryTerms(s, 64));

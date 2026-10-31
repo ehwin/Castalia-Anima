@@ -3,7 +3,7 @@
  *
  * 背景:LivingMemory(AstrBot 插件)的检索链里有 MMR(λ=0.7)控制多样性;
  * castalia-Anima 没有。但"别人有"不等于"我们缺" —— 如果我们的 top-5 本来就彼此不像,
- * MMR 就只是加复杂度。这里用真实 airi bank + 真实嵌入,量一量。
+ * MMR 就只是加复杂度。这里用真实 default bank + 真实嵌入,量一量。
  *
  * 指标:
  *   maxSim   —— 每条结果与"块内其它结果"的最高余弦(近重复,越接近 1 越该去重)
@@ -18,12 +18,12 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.resolve(HERE, '..', 'dist');
-const BANK = process.argv[2] || 'D:/castalia/memory-banks/airi';
+const BANK = process.argv[2] || 'D:/castalia/memory-banks/default';
 const TOPK = Number(process.argv[3] || 5);
 
 process.env.MEMORY_DB_DIR = BANK;   // bank 根;项目目录是 <bank>/<project>/<memType>
 process.env.MEMORY_CONFIG = path.join(BANK, 'config.json');
-process.env.CHAR_ID = 'airi';
+process.env.CHAR_ID = 'default';
 if (!process.env.EMBED_MODE) process.env.EMBED_MODE = 'api';
 
 await import(pathToFileURL(path.join(DIST, 'configLoader.js')).href);
@@ -50,7 +50,7 @@ function loadVectors(file) {
 }
 const memTypeDirs = ['general', 'user', 'project', 'reference', 'feedback'];
 for (const mt of memTypeDirs) {
-  const f = path.join(BANK, 'airi', mt, 'memory.sqlite');
+  const f = path.join(BANK, 'default', mt, 'memory.sqlite');
   if (fs.existsSync(f)) vecByFile.set(mt, loadVectors(f));
 }
 
@@ -77,13 +77,13 @@ const QUERIES = [
 console.log(`bank=${BANK} topK=${TOPK} embed=${process.env.EMBED_MODE}`);
 let allMax = [], allPair = [], dup = 0, total = 0;
 for (const q of QUERIES) {
-  const hits = await searchMod.searchMemory({ query: q, project: 'airi', characterId: 'airi', topK: TOPK, minScore: 0 });
+  const hits = await searchMod.searchMemory({ query: q, project: 'default', characterId: 'default', topK: TOPK, minScore: 0 });
   const vecs = [];
   for (const h of hits) {
     const mt = h.memType || 'general';
     const map = vecByFile.get(mt);
     if (!map) continue;
-    const db = dbMod.DatabaseManager.getInstance('airi', mt);
+    const db = dbMod.DatabaseManager.getInstance('default', mt);
     const row = db.prepare('SELECT rowid FROM memory WHERE id = ?').get(h.id);
     const v = row && map.get(Number(row.rowid));
     if (v) vecs.push(v);

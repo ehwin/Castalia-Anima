@@ -12,7 +12,7 @@ const config = path.join(temp, 'config.json');
 fs.writeFileSync(config, JSON.stringify({}));
 Object.assign(process.env, {
   MEMORY_DB_DIR: temp, MEMORY_CONFIG: config,
-  CHAR_ID: 'airi', EMBED_MODE: 'none',
+  CHAR_ID: 'default', EMBED_MODE: 'none',
 });
 
 const load = name => import(pathToFileURL(path.join(root, 'dist', name + '.js')).href);
@@ -89,7 +89,7 @@ check(!!freshHit && !!staleHit, '两条都返回（同一文本、同一重要�
 // 已经能盖过时间项 ≈0.027 —— 这不是时间项坏了，是这条断言一直在借相似度做支撑。
 // 性质本身改成对着打分函数验：除 last_accessed_at 外**完全相同**的两行。
 const baseRow = {
-  id: 'probe', project, character_id: 'airi', importance: 0.8, emotional_impact: 0,
+  id: 'probe', project, character_id: 'default', importance: 0.8, emotional_impact: 0,
   accessed_count: 0, tier: 'standard', tags: '[]', source: 'conversation_log',
   text: '她昨天提到过灯塔与旧船票，说想去看看', created_at: ago(200),
 };

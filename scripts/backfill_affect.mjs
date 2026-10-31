@@ -1,13 +1,13 @@
 /**
  * 回填情感(VAD)到已有记忆 —— 用本地词表,只填空缺,不覆盖模型结果。
  *
- * 背景:airi bank 262 条活跃记忆 0 条有 vad_valence,原因是唯一来源 Ollama 没跑,
+ * 背景:default bank 262 条活跃记忆 0 条有 vad_valence,原因是唯一来源 Ollama 没跑,
  * 而失败路径把整批静默丢弃(见 emotion.ts 里的注释)。新写入已修;历史数据需要这次回填。
  *
  * 用法:
  *   node scripts/backfill_affect.mjs                       # 默认 dry-run,只统计
  *   node scripts/backfill_affect.mjs --apply               # 真写(只写 vad_valence IS NULL 的行)
- *   node scripts/backfill_affect.mjs --bank D:/castalia/memory-banks/airi --apply
+ *   node scripts/backfill_affect.mjs --bank D:/castalia/memory-banks/default --apply
  *
  * 安全:只更新 VAD 三列 + emotional_impact(=0 时)+ 空 tags;
  * 不碰 text/importance/tags 已有的值;--apply 前建议先在副本上跑一次。
@@ -24,7 +24,7 @@ const D = (await import('better-sqlite3')).default;
 const argv = process.argv.slice(2);
 const APPLY = argv.includes('--apply');
 const bankIdx = argv.indexOf('--bank');
-const BANK = bankIdx >= 0 ? argv[bankIdx + 1] : (process.env.CASTALIA_BANK_ROOT ? path.join(process.env.CASTALIA_BANK_ROOT, 'airi') : 'D:/castalia/memory-banks/airi');
+const BANK = bankIdx >= 0 ? argv[bankIdx + 1] : (process.env.CASTALIA_BANK_ROOT ? path.join(process.env.CASTALIA_BANK_ROOT, 'default') : 'D:/castalia/memory-banks/default');
 
 const files = [];
 (function walk(dir) {

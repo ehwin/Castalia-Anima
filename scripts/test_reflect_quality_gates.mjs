@@ -99,14 +99,14 @@ const port = server.address().port;
 process.env.MEMORY_DB_DIR = bank;
 process.env.REFLECT_DIR = bank;
 process.env.REFLECT_LEDGER_FILE = path.join(bank, 'ledger.json');
-process.env.CHAR_ID = 'airi';
+process.env.CHAR_ID = 'default';
 process.env.EMBED_MODE = 'none';
 process.env.REFLECT_LLM_URL = `http://127.0.0.1:${port}`;
 process.env.REFLECT_LLM_API_KEY = 'mock';
 process.env.REFLECT_LLM_MODEL = 'mock-model';
 
 const dbMod = await import(pathToFileURL(path.join(DIST, 'db.js')).href);
-const ra = await import(pathToFileURL(path.join(DIST, 'reflectAll.js')).href);
+const ra = await import(pathToFileURL(path.join(DIST, 'plugins', 'fullPipeline', 'reflectAll.js')).href);
 const iq = await import(pathToFileURL(path.join(DIST, 'insightQuality.js')).href);
 
 // 来源库:两条记录
@@ -115,7 +115,7 @@ const ids = [];
 for (const text of [SRC_A, SRC_B]) {
   const id = dbMod.generateId();
   srcDb.prepare('INSERT INTO memory (id, text, project, character_id, mem_type, importance) VALUES (?,?,?,?,?,?)')
-    .run(id, text, 'proj', 'airi', 'general', 0.7);
+    .run(id, text, 'proj', 'default', 'general', 0.7);
   ids.push(id);
 }
 

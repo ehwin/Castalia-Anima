@@ -12,7 +12,7 @@ const config = path.join(temp, 'config.json');
 fs.writeFileSync(config, JSON.stringify({}));
 Object.assign(process.env, {
   MEMORY_DB_DIR: temp, MEMORY_CONFIG: config,
-  CHAR_ID: 'airi', EMBED_MODE: 'none',
+  CHAR_ID: 'default', EMBED_MODE: 'none',
 });
 
 const load = name => import(pathToFileURL(path.join(root, 'dist', name + '.js')).href);
@@ -34,7 +34,7 @@ const near = (actual, expected, tolerance, message) => {
 
 const project = 'anima-temporal';
 const P = () => DatabaseManager.getInstance(project);
-const save = (rows, cid = 'airi') =>
+const save = (rows, cid = 'default') =>
   saveFacts(rows.map(r => ({ confidence: 0.9, ...r })), null, cid, project);
 const factRows = (subject, predicate) => P().prepare(
   "SELECT * FROM facts WHERE project=? AND subject=? AND predicate=? ORDER BY COALESCE(valid_from, created_at)"
@@ -113,7 +113,7 @@ check(needsEvidence('野生谓词') && !needsEvidence('居住地') && !needsEvid
 // ── 9. 角色隔离：另一个角色的事实不参与裁决 ────────────────────────────────
 await save([{ subject: 'u7', predicate: '当前项目', object: '甲', validFrom: '2026-01-01T00:00:00.000Z' }], 'cardB');
 await save([{ subject: 'u7', predicate: '当前项目', object: '乙', validFrom: '2026-02-01T00:00:00.000Z' }], 'cardB');
-await save([{ subject: 'u7', predicate: '当前项目', object: '丙', validFrom: '2026-03-01T00:00:00.000Z' }], 'airi');
+await save([{ subject: 'u7', predicate: '当前项目', object: '丙', validFrom: '2026-03-01T00:00:00.000Z' }], 'default');
 rows = P().prepare("SELECT * FROM facts WHERE project=? AND subject=? AND COALESCE(character_id,'')='cardB'").all(project, 'u7');
 check(rows.every(r => !r.valid_to), '别的角色的历史不算本角色的证据');
 
@@ -136,7 +136,7 @@ await save([
   { subject: 'u9', predicate: '当前主题', object: '乙', validFrom: '2026-05-01T00:00:00.000Z' },
   { subject: 'u9', predicate: '当前主题', object: '丙', validFrom: '2026-10-28T00:00:00.000Z' },
 ]);
-const ev = estimatePredicateVolatility(P(), project, 'u9', '当前主题', 'airi');
+const ev = estimatePredicateVolatility(P(), project, 'u9', '当前主题', 'default');
 eq(ev.samples, 3, '证据条数 = 3');
 eq(ev.distinctObjects, 3, '三个不同 object');
 near(ev.alphaPerDay, 2 / 300, 0.0005, 'α = 换值次数 / 观测跨度天数 = 2/300');
@@ -152,7 +152,7 @@ check(!!rows[0].valid_to && !!rows[1].valid_to && !rows[2].valid_to, '慢变链�
 // 混用格式时字典序会翻车：'2026-03-01 10:00:00' < '2026-03-01T09:00:00.000Z'（空格 < "T"）。
 P().prepare(`
   INSERT INTO facts (id, subject, predicate, object, project, confidence, character_id, is_active, created_at, updated_at, valid_from)
-  VALUES ('legacy-row', 'u10', '居住地', '旧值', ?, 0.9, 'airi', 1, '2026-03-01 10:00:00', '2026-03-01 10:00:00', NULL)
+  VALUES ('legacy-row', 'u10', '居住地', '旧值', ?, 0.9, 'default', 1, '2026-03-01 10:00:00', '2026-03-01 10:00:00', NULL)
 `).run(project);
 await save([{ subject: 'u10', predicate: '居住地', object: '新值', validFrom: '2026-03-01T09:00:00.000Z' }]);
 const legacy = P().prepare("SELECT * FROM facts WHERE id='legacy-row'").get();

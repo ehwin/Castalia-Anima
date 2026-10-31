@@ -12,7 +12,7 @@
  *
  * 不做断言的理由：当前真实基线 19~36%，钉一个阈值等于把现状当成正确。
  * 用法：
- *   MEMORY_DB_DIR=D:/castalia/memory-banks/airi CASTALIA_PROJECT=airi \
+ *   MEMORY_DB_DIR=D:/castalia/memory-banks/default CASTALIA_PROJECT=default \
  *   USE_VECTOR=1 node scripts/probe_injection_false_positive.mjs
  */
 import fs from 'node:fs';
@@ -23,7 +23,7 @@ import { createRequire } from 'node:module';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
 const DIST = process.env.DIST_DIR || path.join(ROOT, 'dist');
-const PROJECT = process.env.CASTALIA_PROJECT || 'airi';
+const PROJECT = process.env.CASTALIA_PROJECT || 'default';
 
 const requireFromRoot = createRequire(path.join(ROOT, 'package.json'));
 const Database = requireFromRoot('better-sqlite3');

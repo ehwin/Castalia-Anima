@@ -4,7 +4,7 @@
  *
  * 用法: CastaliaNode.exe scripts/build_chunk_index.mjs [bank] [project]
  * 幂等: 只重建"片段与当前正文不一致"的行(chunk_meta 存 sha1),重复跑很快。
- * 为什么需要: 整行向量在长记忆上被稀释 —— 实测 airi 库整行余弦 0.40~0.52 而最佳句
+ * 为什么需要: 整行向量在长记忆上被稀释 —— 实测 default 库整行余弦 0.40~0.52 而最佳句
  * 0.51~0.69,要点的记忆行因此排到 15~39 名、进不了注入。
  */
 import path from 'node:path';
@@ -13,8 +13,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
-const BANK = process.argv[2] || 'airi';
-const PROJ = process.argv[3] || 'airi';
+const BANK = process.argv[2] || 'default';
+const PROJ = process.argv[3] || 'default';
 const MTS = ['general', 'user', 'project', 'reference', 'feedback'];
 
 process.env.MEMORY_DB_DIR = `D:/AI/castalia/memory-banks/${BANK}`;

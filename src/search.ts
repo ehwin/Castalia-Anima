@@ -566,7 +566,7 @@ async function searchInDb(db: Database.Database, options: SearchOptions, memoryD
     // 于是嵌入服务明明健康却静默 0 命中。零命中同样要回退到文本检索。
     // 2026-10-28(2):有向量时也**始终**算一遍词法结果并合并。原来只在 KNN 抛错/零命中时
     // 才回退,而向量一旦返回任何一条(哪怕相似度只有 0.37),精确词法命中(0.5~1.0)就整条
-    // 被挤掉 —— 实测 airi 库:只用向量路时注入要点覆盖 70% → 30%(「你的生日是哪天」的
+    // 被挤掉 —— 实测 default 库:只用向量路时注入要点覆盖 70% → 30%(「你的生日是哪天」的
     // 「未知」、用户问身份时命中的原始叙事全丢)。合并后去重取 similarity 高者(下方 bestById)。
     vectorResults = [...vectorResults, ...textFallbackSearch(db, scoped, new Set(), topK, minScore)];
     if (vectorResults.length === 0 && !vecOk) vectorResults = textFallbackSearch(db, scoped, new Set(), topK, minScore);

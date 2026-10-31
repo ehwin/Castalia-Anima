@@ -218,7 +218,7 @@ async function main() {
   // ── 4. 实体分类:路径/URL/端口这类"顺手记下的字符串"不算知识实体 ──
   await storeMod.saveFacts([
     { subject: 'agent', predicate: '服务地址', object: 'http://localhost:11434', confidence: 0.6 },
-    { subject: 'agent', predicate: '记忆目录', object: 'D:\\AI\\castalia\\memory-banks', confidence: 0.6 },
+    { subject: 'agent', predicate: '记忆目录', object: 'C:\\memory-banks', confidence: 0.6 },
     { subject: 'agent', predicate: '端口', object: '11434', confidence: 0.5 },
   ], mem.id, CHAR, PROJECT);
   const kindStats = entMod.entityStats(db).byKind;
@@ -227,7 +227,7 @@ async function main() {
   check('实体分类:纯数字 → number', (kindStats.number ?? 0) >= 1, JSON.stringify(kindStats));
   check('实体分类:user/agent → role', (kindStats.role ?? 0) >= 2, JSON.stringify(kindStats));
   check('实体分类:知识实体 → topic(张三/乌龙茶)', (kindStats.topic ?? 0) >= 2, JSON.stringify(kindStats));
-  const pathHit = entMod.findEntities(db, 'D:\\AI\\castalia\\memory-banks');
+  const pathHit = entMod.findEntities(db, 'C:\\memory-banks');
   check('findEntities 能按路径原样命中(不被归一化拆碎)', pathHit.length > 0 && pathHit[0].kind === 'path', JSON.stringify(pathHit).slice(0, 200));
 
   // ── 5. 实体图扩散 ───────────────────────────────────────────

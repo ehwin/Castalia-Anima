@@ -34,7 +34,7 @@ Object.assign(process.env, {
   MEMORY_DB_DIR: temp,
   MEMORY_CONFIG: path.join(temp, 'missing-config.json'),
   CASTALIA_PROJECT: 'emotion-failure',
-  CHAR_ID: 'airi',
+  CHAR_ID: 'default',
   EMBED_MODE: 'none',
   OLLAMA_URL: 'http://127.0.0.1:1',
   VAD_MODEL: 'fixture',
@@ -61,7 +61,7 @@ const insertMemory = (project, text) => {
   const id = generateId();
   db.prepare(`INSERT INTO memory
     (id, text, project, type, mem_type, character_id, source, is_active)
-    VALUES (?, ?, ?, 'episodic', 'general', 'airi', 'conversation_log', 1)`)
+    VALUES (?, ?, ?, 'episodic', 'general', 'default', 'conversation_log', 1)`)
     .run(id, text, project);
   return { db, id };
 };

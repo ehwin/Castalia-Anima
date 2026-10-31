@@ -53,7 +53,7 @@ const configPath = process.argv[6] || '';
 const loaderEntry = process.argv[7] || '';
 process.env.MEMORY_DB_DIR = dir;
 process.env.EMBED_MODE = process.env.EMBED_MODE || 'none';   // 父进程给 api 才会走重建分支
-process.env.CHAR_ID = 'airi';
+process.env.CHAR_ID = 'default';
 if (dim) process.env.EMBEDDING_DIM = dim;
 else delete process.env.EMBEDDING_DIM;
 if (configPath) {
@@ -65,7 +65,7 @@ const m = await import(dbEntry);
 const db = m.DatabaseManager.getInstance('proj', 'general');
 if (seed) {
   const id = m.generateId();
-  db.prepare('INSERT INTO memory (id, text, project, character_id) VALUES (?,?,?,?)').run(id, 'hello', 'proj', 'airi');
+  db.prepare('INSERT INTO memory (id, text, project, character_id) VALUES (?,?,?,?)').run(id, 'hello', 'proj', 'default');
   const rowid = db.prepare('SELECT rowid FROM memory WHERE id = ?').get(id).rowid;
   db.prepare('INSERT INTO vec_memory (rowid, embedding) VALUES (?,?)').run(BigInt(rowid), new Float32Array(Number(dim || 1024)));
   db.prepare('INSERT INTO embedding_cache (text_hash, embedding) VALUES (?,?)').run('h1', new Float32Array(Number(dim || 1024)));

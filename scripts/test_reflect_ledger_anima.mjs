@@ -63,21 +63,21 @@ const port = server.address().port;
 process.env.MEMORY_DB_DIR = bank;
 process.env.REFLECT_DIR = bank;
 process.env.REFLECT_LEDGER_FILE = ledgerFile;
-process.env.CHAR_ID = 'airi';
+process.env.CHAR_ID = 'default';
 process.env.EMBED_MODE = 'none';
 process.env.REFLECT_LLM_URL = `http://127.0.0.1:${port}`;
 process.env.REFLECT_LLM_API_KEY = 'mock';
 process.env.REFLECT_LLM_MODEL = 'mock-model';
 
 const dbMod = await import(pathToFileURL(path.join(DIST, 'db.js')).href);
-const ra = await import(pathToFileURL(path.join(DIST, 'reflectAll.js')).href);
+const ra = await import(pathToFileURL(path.join(DIST, 'plugins', 'fullPipeline', 'reflectAll.js')).href);
 
 const db = dbMod.DatabaseManager.getInstance('proj', 'general');
 const ids = [];
-for (const text of ['第一条记忆:用户在做 AIRI 桌面应用', '第二条记忆:检索要用 bigram 切词']) {
+for (const text of ['第一条记忆:用户在做 示例应用 桌面应用', '第二条记忆:检索要用 bigram 切词']) {
   const id = dbMod.generateId();
   db.prepare('INSERT INTO memory (id, text, project, character_id, mem_type) VALUES (?,?,?,?,?)')
-    .run(id, text, 'proj', 'airi', 'general');
+    .run(id, text, 'proj', 'default', 'general');
   ids.push(id);
 }
 
@@ -103,7 +103,7 @@ check('没有新增 LLM 调用', calls === before, `calls ${before} → ${calls}
 
 console.log('\n3) 改正文 → 该条重新入列');
 db.prepare('UPDATE memory SET text = ? WHERE id = ?')
-  .run('第一条记忆(已修订):用户在做 AIRI 桌面应用 + 插件内嵌引擎', ids[0]);
+  .run('第一条记忆(已修订):用户在做 示例应用 桌面应用 + 插件内嵌引擎', ids[0]);
 const r3 = await ra.runReflectAll({ projects: ['proj'] });
 check('fresh = 1', r3.fresh === 1, `got ${r3.fresh}`);
 check('unchanged = 1', r3.unchanged === 1, `got ${r3.unchanged}`);

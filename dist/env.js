@@ -6,14 +6,14 @@
  */
 import { VERSION } from './version.js';
 /**
- * 角色/实例 ID:用于数据分区。默认 'airi'(Anima 血统,与旧版行为一致)。
+ * 角色/实例 ID:用于数据分区。默认 'default'(Anima 血统,与旧版行为一致)。
  *
  * v1.24: 角色身份 = 进程级 CHAR_ID(与 Castalia 普通版一致:一个实例一个角色),
  * 不再按 project 推导角色。project 只做记忆库维度(库/项目分区)。
  * 多角色 = 多实例(各自 CHAR_ID + 各自库目录),同一库里不同角色靠 character_id 列隔离。
  */
-export const CHAR_ID = String(process.env.CHAR_ID || 'airi').trim() || 'airi';
-/** 当前项目 ID(对齐 Hermes Project 概念):记忆按项目隔离。默认 'default' 保持向后兼容 */
+export const CHAR_ID = String(process.env.CHAR_ID || 'default').trim() || 'default';
+/** 当前项目 ID(对齐 Host Project 概念):记忆按项目隔离。默认 'default' 保持向后兼容 */
 export const PROJECT_ID = process.env.CASTALIA_PROJECT || 'default';
 /**
  * 共享层项目名(约定,2026-08-16):存进该库的记忆为"所有库共知"候选。

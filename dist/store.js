@@ -115,9 +115,6 @@ export async function saveMemory(params) {
             throw new Error('agent_diary memories must be written through saveSelfDiary()');
         }
     }
-    if (params.source === 'agent_state') {
-        throw new Error('agent_state memories are runtime snapshots and must use the AgentState writer');
-    }
     const now = new Date().toISOString();
     const skipEmbed = params.skipEmbed === true;
     const project = normalizeProject(params.project);
@@ -166,7 +163,7 @@ export async function saveMemory(params) {
         // must not make the local fallback overwrite the durable result.
         const affectStatus = String(exactDup.affect_status ?? '').trim();
         const needsVad = params.source === 'conversation_log'
-            && (['pending', 'pending_psyche'].includes(affectStatus)
+            && (affectStatus === 'pending'
                 || (!affectStatus
                     && exactDup.vad_valence == null
                     && exactDup.vad_arousal == null
@@ -252,7 +249,7 @@ export async function saveMemory(params) {
     };
     const metadata = serializeMetadata(params.metadata);
     // 写路径补情感(2026-10-29):嵌入形态下没有 autoProcess/digest 周期,VAD 的唯一来源
-    // Ollama 通常不在跑(实测 airi bank 262 条 0 条 VAD)。所以落库时用词表补一次:
+    // Ollama 通常不在跑(实测 default bank 262 条 0 条 VAD)。所以落库时用词表补一次:
     // 只补空缺(调用方给了 emotionalImpact 就尊重),只影响 vad_*/emotional_impact。
     // 放在 store 层而不是宿主层:bank.save、store-tools、MCP、直连引擎都走这里,只写一处。
     let writeVad = null;
@@ -442,9 +439,6 @@ export async function updateMemory(id, updates, characterId) {
             throw new Error('agent_diary memories are immutable; use the self-cycle writer');
         }
     }
-    if (existing.source === 'agent_state') {
-        throw new Error('agent_state memories are runtime snapshots; use the AgentState writer');
-    }
     // memdir 跨分类移动:memType 变更 → 复制到新分类库 + 软删原库
     const newMt = updates.memType !== undefined ? normalizeMemType(updates.memType) : found.memType;
     if (existing.source === 'conversation_log' && newMt !== 'general') {
@@ -553,21 +547,14 @@ export async function updateMemory(id, updates, characterId) {
  * 存储对话原文（轻量，不做分析，不做向量化）
  * v5.0: 对话原文永不 embed — digest 分拣后再由 reflect 统一向量化
  */
-export async function saveConversationTurn(userMsg, assistantMsg, characterId = CHAR_ID, moodValue, moodReason, project) {
+export async function saveConversationTurn(userMsg, assistantMsg, characterId = CHAR_ID, project) {
     characterId = normalizeCharacterId(characterId);
     const db = DatabaseManager.getInstance(project);
     const now = new Date().toISOString();
     const id = generateId();
     const proj = normalizeProject(project);
-    let moodPrefix = '';
-    if (moodValue !== undefined) {
-        moodPrefix = `[mood: ${moodValue}`;
-        if (moodReason)
-            moodPrefix += `, "${moodReason}"`;
-        moodPrefix += ']\n';
-    }
     const assistantName = (process.env.CASTALIA_ASSISTANT_NAME || '助手').trim() || '助手';
-    const text = `${moodPrefix}用户: ${userMsg}\n${assistantName}: ${assistantMsg}`;
+    const text = `用户: ${userMsg}\n${assistantName}: ${assistantMsg}`;
     db.prepare(`
     INSERT INTO memory (id, text, project, type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, affect_status, affect_source)
     VALUES (?, ?, ?, 'episodic', 'conversation', '[]', 0.5, ?, 'conversation_log', 'user', 'standard', 1, ?, ?, ?, 0, 0, 'pending', 'vad_queue')

@@ -32,14 +32,14 @@ const { consolidate } = await load('consolidate');
 const { orphanMemories } = await load('orphan');
 
 const project = 'raw-immutable';
-const characterId = 'airi';
+const characterId = 'default';
 const db = DatabaseManager.getInstance(project, 'general');
 let checks = 0;
 const check = (cond, msg) => { assert.ok(cond, msg); checks++; };
 const activeOf = id => db.prepare('SELECT is_active, source FROM memory WHERE id = ?').get(id);
 
-const turn1 = await saveConversationTurn('用户今天在改记忆体', '助手：改哪一段？', characterId, undefined, undefined, project);
-const turn2 = await saveConversationTurn('用户今天在改记忆体，顺便重装系统', '助手：重装前先备份。', characterId, undefined, undefined, project);
+const turn1 = await saveConversationTurn('用户今天在改记忆体', '助手：改哪一段？', characterId, project);
+const turn2 = await saveConversationTurn('用户今天在改记忆体，顺便重装系统', '助手：重装前先备份。', characterId, project);
 check(turn1?.id && turn2?.id, 'conversation turns are written');
 const conv1 = activeOf(turn1.id), conv2 = activeOf(turn2.id);
 check(conv1?.is_active === 1 && conv1?.source === 'conversation_log', 'turn 1 is active conversation_log');

@@ -12,7 +12,7 @@
  *
  * 用法:
  *   CastaliaNode.exe scripts/eval_injection.mjs [bank] [project] [characterId]
- * 默认 airi / airi / airi。输出:每条问句的注入条数/字数/要点命中/重复项，末尾汇总。
+ * 默认 default / default / default。输出:每条问句的注入条数/字数/要点命中/重复项，末尾汇总。
  */
 import path from 'node:path';
 import process from 'node:process';
@@ -21,9 +21,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
 
-const BANK = process.argv[2] || 'airi';
-const PROJ = process.argv[3] || 'airi';
-const CHAR = process.argv[4] || 'airi';
+const BANK = process.argv[2] || 'default';
+const PROJ = process.argv[3] || 'default';
+const CHAR = process.argv[4] || 'default';
 
 process.env.MEMORY_DB_DIR = `D:/AI/castalia/memory-banks/${BANK}`;
 process.env.MEMORY_CONFIG = `D:/AI/castalia/memory-banks/${BANK}/config.json`;

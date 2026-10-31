@@ -4,12 +4,11 @@
  * 分类逻辑：特别短 → 启发式默认 / 中等 → Ollama批量队列 / 重要 → reflect LLM 兜底
  * 消息管道不阻塞：所有 LLM 调用都是异步队列
  *
- * v6.3(第4轮融合):在 Anima 基底(observeUserMessage / VAD queue / moodValue)上,
+ * v6.3(第4轮融合):在 Anima 基底(observeUserMessage / VAD queue)上,
  * 叠加通用版 v1.11 Part2 的 sessionId 会话缓冲(渐进式临时反思) + project 参数。
  */
 import { saveConversationTurn } from './store.js';
 import { DatabaseManager } from './db.js';
-import { getAgentState } from './agentState.js';
 import { observeUserMessage } from './userLearning.js';
 import { queueForVad, fallbackClassify, formatVADForPrompt, formatInteractionForVad } from './emotion.js';
 import { getBuffer } from './buffer.js';
@@ -37,23 +36,16 @@ export async function autoProcess(args) {
     const proj = normalizeProject(args.project || PROJECT_ID);
     const results = {
         success: true,
-        moodProcessed: false,
         conversationSaved: false,
         vadAnalysis: null,
         details: [],
     };
-    if (args.moodValue !== undefined) {
-        const state = getAgentState(cid, proj);
-        state.addMood(args.moodValue, args.moodReason || '');
-        results.moodProcessed = true;
-        results.details.push('mood=' + args.moodValue + ' (' + args.moodReason + ')');
-    }
     observeUserMessage(cid, 'default', args.userMessage, proj);
     // v1.23.2 审计第 1 组：必须先落库拿到记录 id，再入 VAD 队列。
     // 旧顺序是先 queue 后 save，flush 只能靠“默认库 + created_at DESC”猜行，跨项目/并发会写错行。
     let memoryId;
     try {
-        const saved = await saveConversationTurn(args.userMessage, args.assistantMessage, cid, args.moodValue, args.moodReason, proj);
+        const saved = await saveConversationTurn(args.userMessage, args.assistantMessage, cid, proj);
         results.conversationSaved = true;
         results.details.push('conversation saved');
         memoryId = saved?.id;

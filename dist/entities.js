@@ -80,7 +80,7 @@ export function classifyEntityKey(key) {
         return 'number';
     return 'topic';
 }
-/** 路径/URL 这类键保留分隔符(否则 `D:\AI\x` 会变成 `d ai x`,再也匹配不回去) */
+/** 路径/URL 这类键保留分隔符(否则 `C:\path\x` 会变成 `d ai x`,再也匹配不回去) */
 export function entityKeyFor(raw, kind) {
     const s = String(raw ?? '').trim();
     return kind === 'path' || kind === 'url' ? s.toLowerCase() : normalizeEntityKey(s);
@@ -238,7 +238,7 @@ export function linkMemoryToEntities(db, memoryId, entityIds, role = 'fact') {
 /** 名字 → 实体:先精确 key,再前缀,再包含(都按 mention_count 排序) */
 export function findEntities(db, query, limit = 10) {
     const raw = String(query ?? '').trim();
-    // 同时试"归一化键"和"路径/URL 原样小写键",否则 D:\AI\x 这类查询永远匹配不到
+    // 同时试"归一化键"和"路径/URL 原样小写键",否则 C:\path\x 这类查询永远匹配不到
     const keys = [...new Set([normalizeEntityKey(raw), raw.toLowerCase()])].filter(Boolean);
     if (keys.length === 0)
         return [];
