@@ -1,0 +1,14 @@
+{
+  "spec_version": 1,
+  "engine": "castalia-anima",
+  "variant": "memory-only",
+  "engine_version": "2.0.0",
+  "generated_by": "Castalia Anima 单记忆版",
+  "notes": [
+    "单记忆版不带面板：引擎不声明任何可调项，宿主读到空 groups 应把「心智参数」整块隐藏。",
+    "空清单 ≠ 没有清单：没有清单（心智版）表示「按完整清单画」，空 groups 表示「一个都别画」。",
+    "要调检索权重/注入门槛，用 memory-panel 分支。"
+  ],
+  "groups": {},
+  "presets": {}
+}
