@@ -325,3 +325,43 @@ summarizeLocalAffect      -> {valence:0.85, arousal:0.70, dominance:0.30}
 ```
 
 复现：`node D:/AI/hermes-home/cache/scratch/formula-check.mjs`（脚本会自建 temp bank，不碰生产库）。
+
+---
+
+## 10. 状态增补（2026-11-01）：词表退出评分，状态机默认不由 VAD 驱动
+
+本文第 1–9 节记录的是 v1.28.8 的代码事实。2026-11-01 有两处行为变化，读数以本节为准。
+
+### 10.1 `tagWithLocalAffect` 只落 abstain
+
+词表兜底（`scoreAffect`）不再写 `vad_valence` / `vad_dominance` / `emotional_impact`，也不再置 `pending_psyche`，只写：
+
+```sql
+vad_valence = NULL, vad_arousal = ?, vad_dominance = NULL,
+affect_status = 'abstain', affect_source = 'local_lexicon'
+```
+
+`vad_arousal` 只在高唤醒命中（≥0.5）时留一个绝对值，用于"这批有没有强词"的观测，不参与评分。
+
+依据：CPED 中文分层 300 条上 `scoreAffect` 的三分类 **κ=0.015**（与"恒答负"不可分）、词表命中率 7.3%、命中处符号一致率 50%。它不构成任何可用判据，写进库只会污染后续一切读数。
+
+### 10.2 状态机默认不接 VAD
+
+`flushVadQueueInternal` 的两条路径（模型 / 词表）都在 `finalizeAffectPsyche` 与 `applyPsycheAppraisal` 前加了门：
+
+```ts
+if (process.env.PSYCHE_FROM_VAD === 'on') { ... }
+```
+
+默认不设即为关。理由见 README「情感层当前状态」：估计器不过线（κ=0.145 上限），下游效应只有 −0.041 且机制不可推广。
+
+### 10.3 由此产生的读数变化
+
+| 项 | 之前 | 现在 |
+|---|---|---|
+| 新写的 `affect_status` | `analyzed`（词表值） | **`abstain`** |
+| `vad_*` 覆盖 | 缓慢增长（实为噪声） | 停止增长 |
+| `psyche_state` | 每批词表结果推进一次 | 只有 `PSYCHE_FROM_VAD=on` 才推进 |
+| 状态寿命 | 一直有"新证据" | 72h（`PSYCHE_EVIDENCE_TTL_HOURS`）后回基线 |
+
+第 9 节那组 `scoreAffect` 读数仍然有效——变的是**它被用在哪里**，不是它算得对不对。

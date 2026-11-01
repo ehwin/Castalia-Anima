@@ -2,12 +2,43 @@
 
 **一句话**：给陪伴型 / 人格型 agent 用的本地记忆后端 —— Castalia 引擎核心 + 情绪层 + 人物层 + 实体层，SQLite 落盘、按角色隔离、存储零 API 成本。
 
-它要解决的不是"问什么能不能查到"，而是"该想起的时候想起、不该提的时候不提、重要的不会淡、次要的会淡"。2026-10-31 的全链路重构把这条口径固化成**三条互不越界的链路**：证据链、情感链、派生链。
+它要解决的不是"问什么能不能查到"，而是**"该想起的时候想起、不该提的时候不提、重要的不会淡、次要的会淡"**。这条口径被拆成三条互不越界的链路：证据链、派生链、隔离面。
 
 - `VERSION` = **1.28.8**（`package.json` 的 `version` 仍写 1.23.2，已落后，以 `VERSION` 为准；构建时 `scripts/gen_version.mjs` 生成 `src/version.ts`）
-- `src/` **54** 个 TypeScript 文件（约 17.4k 行）· **45** 个去重 MCP tool（分组挂载 46 次，`entity_lookup` 同属两组）· `scripts/` **50** 个 `.mjs` · **76** 个去重的 `process.env` 读取点
+- `src/` **49** 个 TypeScript 文件（约 17.9k 行）· **45** 个去重 MCP tool（分组挂载 46 次，`entity_lookup` 同属两组）· `scripts/` **59** 个 `.mjs` · **80** 个去重的 `process.env` 读取点
 - **没有 Web 控制台**：UI 由宿主应用提供，本仓只提供 stdio MCP 服务
 - 首次安装（含 npm 12 屏蔽原生模块编译的坑）见 [INSTALL.md](INSTALL.md)
+
+> **2026-11-01 的两处状态变化**（先读这两条，再读别的）：
+> 1. **情感层默认关闭估计器**：词表不再写 VAD、不再驱动 psyche，`affect_status` 落到 `abstain`。理由是实测，见下节。
+> 2. **注入层不再把同一句话说四遍**：按共用的引号片段判重，实测 4 条同义记忆 1208 → 349 字符。
+
+---
+
+## 情感层当前状态（2026-11-01，实测口径）
+
+这一节是本仓唯一一处"设计让位于测量"的地方。它记录的是**为什么默认值是现在这样**，不是"以后也不做"。
+
+| 问题 | 实测 | 结论 |
+|---|---|---|
+| 从文本读 VAD 准不准（中文陪伴语料，CPED n=300） | 三分类 **κ=0.145**（强 LLM）、**0.015**（本仓词表）；三类随机 κ≈0；可用线 κ≥0.4 | **两个估计器都不过线** |
+| 换更强的模型能不能救 | 同一模型在同一批 CPED 上 κ 0.145；英/西/法/意事件语料上 valence r=0.856，但对照的是上游按理论手工赋值的标签（上游自述 "not human-eval corpora"） | 任务与标签口径不同，不能混用 |
+| 状态注进去会不会改变生成 | 三模型、n=100/格：只有"负性状态→回复略更负"同号，**均值 −0.041**；机制（类别词 vs 数值）换模型就反向 | 效应小且不可推广 |
+| 连续数值本身有用吗 | 端点说明 −（词+数值）**+0.027 不可判定**；锚定−描述 **−0.001**；arousal 单独操纵三档 Δa 全部不可判定 | **数值不传导；arousal 维度惰性** |
+| 那还留着 VAD 干什么 | 线上覆盖 17/225 = 7.6%（2026-11-01 airi/general），且新写入不再产生 | 冻结 72h 后回落到人格基线 |
+
+据此定下的默认值：
+
+- `tagWithLocalAffect` **只写 `affect_status='abstain'`**，不写 `vad_*`、不写 `emotional_impact`、不置 `pending_psyche`；
+- `finalizeAffectPsyche` / `applyPsycheAppraisal` **默认不由 VAD 估计触发**，要接得显式 `PSYCHE_FROM_VAD=on`；
+- 没有新证据时，`psyche_state` 的证据在 `PSYCHE_EVIDENCE_TTL_HOURS`（默认 72h）后过期，`band` 回落到人格基线。
+
+**重开条件（两条同时满足，缺一条都只是把不兑现的指标做漂亮）**：
+
+1. 目标语言的独立标注集上估计器 **κ ≥ 0.4**（现在 0.145）；
+2. 同一个端到端效应在 **≥2 个家族**的模型上同号且区间不含 0（现在只有 −0.041 一条）。
+
+报告同时指出：真要恢复情感层，入口不是"更贵的文本 VAD"，而是**非文本通道**（说话人 / 言语行为 / 延迟 / 长度骤变 / 撤回）——同一批数据上 META 特征 AUC 0.6344 vs 文本 0.5578。
 
 ---
 
@@ -18,8 +49,9 @@
 用户/角色对话
   -> conversation_log（general 库，affect_status=pending）
   -> VAD 队列（只接受 conversation_log 且 active）
-  -> VAD 分析成功(analyzed) / 无可靠证据(abstain) / 失败(保留重试)
-  -> psyche_state（确定性状态转移，不是 memory）
+  -> 模型分析成功(analyzed) / 无可靠证据(abstain) / 失败(保留重试)
+  -> 词表兜底只写 abstain（2026-11-01 起不写 VAD，见上节）
+  -> psyche_state（确定性状态转移，不是 memory；默认不由 VAD 驱动）
   -> currentMood / context_get / 注入与检索的重排
   -> 回复
 
@@ -42,20 +74,21 @@ search / recall / 注入 / 反思 / 整合 / 冷存 / 事实来源 / 实体图
 4. psyche 的读—转移—写在 SQLite `BEGIN IMMEDIATE` 内完成，避免并发版本互相覆盖。
 5. 重放同一 `eventId` 不重复累加（幂等消费，最多记 128 个）。
 6. `agent_diary` 不重新进入 VAD、事实提取、实体来源、普通检索、上下文注入、反思、整合。日记是派生记录，不是用户事实，也不是下一轮自循环的输入。
-7. **原料行（`conversation_log` / `daily_event` / `agent_state` / `agent_diary`）不被任何自动路径标死**：反思 merge/split/delete、冷存、衰减、孤儿清扫都只写 `metadata` / `status` / `affect_status`，不改 `is_active`。一条对话被标死，`emotion.ts` 的 VAD 出队校验（要求 `is_active=1 AND source='conversation_log'`）就把它丢掉且永不重入队，情感证据从此缺失；`reflectionSources` 也不再把它当抽取来源。排除名单统一走 `memoryProvenance.excludeRawMaterialSql()`，不要在各文件里各写一份。人工遗忘（`memory_forget`）不受此限，但仍可 `restoreMemory` 取回。
+7. **原料行（`conversation_log` / `daily_event` / `agent_state` / `agent_diary`）不被任何自动路径标死**：反思 merge/split/delete、冷存、衰减、孤儿清扫都只写 `metadata` / `status` / `affect_status`，不改 `is_active`。一条对话被标死，`emotion.ts` 的 VAD 出队校验（要求 `is_active=1 AND source='conversation_log'`）就把它丢掉且永不重入队；`reflectionSources` 也不再把它当抽取来源。排除名单统一走 `memoryProvenance.excludeRawMaterialSql()`，不要在各文件里各写一份。人工遗忘（`memory_forget`）不受此限，但仍可 `restoreMemory` 取回。
 
 ## 模块地图
 
 | 文件 | 职责 |
 |---|---|
-| `psycheState.ts` | 短期 psyche 状态机：纯函数 `transition` + 事务化持久化 + 事件去重 |
-| `emotion.ts` | VAD 队列（去重入队 / 批次分析 / 失败回队 / abstain）、Ollama VAD 与词表兜底、`applyPsycheAppraisal` 接线 |
+| `psycheState.ts` | 短期 psyche 状态机：纯函数 `transition` + 事务化持久化 + 事件去重 + 证据有效期 |
+| `emotion.ts` | VAD 队列（去重入队 / 批次分析 / 失败回队 / abstain）、VAD 通道（Ollama）、词表兜底（2026-11-01 起只落 abstain） |
 | `selfCycle.ts` | 自循环：读证据 → claim → 写日记 → 完成 claim；单飞、过期 claim 回收 |
 | `selfCycleCursor.ts` | `(created_at,rowid)` 游标比较（兼容 ISO 与 SQLite 两种时间格式） |
 | `memoryProvenance.ts` | 派生来源常量与 SQL 谓词（`publicMemorySourceSql` / `memorySourceWithoutStateSql`）；原料行口径 `RAW_MATERIAL_SOURCES` / `excludeRawMaterialSql` |
 | `store.ts` | `saveMemory` / `saveSelfDiary` / `saveFacts`（来源硬校验）/ 存储桥 |
 | `db.ts` | schema v5：`psyche_state`、`self_cycle_runs`、日记 evidence 唯一索引、facts 来源列迁移 |
-| `search.ts` / `recallForInjection.ts` | 两段排序、门槛、注入；默认过滤派生来源 |
+| `search.ts` / `recallForInjection.ts` | 两段排序、门槛、注入、填充词门、同一句话去重 |
+| `temporalRecall.ts` | 「按日期直取」事件行；2026-11-01 起接受 `excludeIds`，不重讲主块给过的条目 |
 | `entities.ts` / `bitemporal.ts` | 实体图与双时态事实；派生来源过滤 |
 | `index.ts` | 45 个工具注册、`currentMood`（psyche 优先）、`context_get` 状态块、自循环定时器 |
 
@@ -63,11 +96,11 @@ search / recall / 注入 / 反思 / 整合 / 冷存 / 事实来源 / 实体图
 
 | 能力 | 实现 | 说明 |
 |---|---|---|
-| **VAD 情感标注** | `emotion.ts` + `affectLexicon.ts` | 写入时给记忆打 `vad_valence/arousal/dominance` + `emotional_impact`；VAD 模型不可用或置信度 ≤ 0.35 时回落本地情感词表（只写 VAD、不改正文），没有情感词就**不造情绪** |
-| **情绪加权检索** | `search.ts` | 情绪是"同等相关时的偏好"，不是主轴（见「打分与排序」） |
+| **VAD 情感标注** | `emotion.ts` + `affectLexicon.ts` | 写入时给记忆打 `vad_valence/arousal/dominance`。词表兜底已降级为**只写 `abstain`**（κ=0.015，不参与任何评分）；模型通道不可用时不再写默认值 |
+| **情绪加权检索** | `search.ts` | 情绪是"同等相关时的偏好"（`0.12 × intensity`）。**已知方向为负**：情感强度对检索相关性的 AUC 0.419、与相似度 ρ=−0.205。保留是因为有界（≤20% 分量），不是为了收益 |
 | **情感显著性排序** | `emotionalRanking.ts` + `search.ts` | ACT-R 基础激活 + 情绪一致性 + 扩散激活 + 锚点（`0.30 强度 + 0.20 重要度 + 0.20 激活 + 0.15 一致性 + 0.15 共振`，锚点直接 1.0），已在检索主链上；作用范围是 ±10% 的有界乘数。数学归 `test_emotional_ranking.mjs`，接线归 `test_emotion_wiring.mjs` |
 | **情感锚点** | `memory.pinned` + `memory_update {pinned:true}` + `recallForInjection` | 钉住「告白 / 转折 / 那句改变一切的话」：注入时**无条件在场**、不参与相似度门槛，仍服从项目与角色隔离；`recentIds` 去重照旧；注入返回 `stats.pinned` |
-| **短期 psyche 状态** | `psycheState.ts` + `psyche_state` 表 | 见下一节。有证据时它是**唯一 affect owner**；无证据才回退到 AgentState 的 `moodValue` |
+| **短期 psyche 状态** | `psycheState.ts` + `psyche_state` 表 | 见下一节。有证据时它是**唯一 affect owner**；无证据才回退到 AgentState 的 `moodValue`。证据 72h 过期 |
 | **情绪自状态** | `agentState.ts` | mood / desire / energy，指数衰减聚合，绝对值 ≥ 7 自动落库；`mood_journal` 读写 |
 | **偏差层** | `bias.ts` | 话题权重按 `(project, character)` 累积，影响检索优先级（`1 + min(0.5, weight×0.05)`）；是涌现偏好，不是显式设置 |
 | **用户学习** | `userLearning.ts` | `user_observe` 观察用户表达方式与关注点，进 `user` 类记忆与画像 |
@@ -84,7 +117,7 @@ final = score × (0.9 + 0.2 × salience)            # salience ∈ [0,1]，锚�
 ```
 
 - **为什么只有 ±10%**：显著度是"同样近时谁先"，不是新的主锚。早先版本把情绪 / tier / 访问次数当主乘数，实测让 6 个字的垃圾行在每个查询里排第一（score 4.3）；这次刻意把作用范围钉死在 0.9~1.1，相关性差一个档次时它翻不了盘。`SALIENCE_BLEND` 与 `salienceBlendFactor()` 都导出，测试直接断言这个上界。
-- **强度取存储强度**（`computeBaseIntensity`），不是衰减后的 retrieval：新鲜度已由 ACT-R 的 activation 项表达，"这件事本身刻得多深"不该被同一根时间轴重复惩罚。这也让显著度层与「衰减该按哪个时钟算」那个待修项**正交**——两者可分别改。
+- **强度取存储强度**（`computeBaseIntensity`），不是衰减后的 retrieval：新鲜度已由 ACT-R 的 activation 项表达，"这件事本身刻得多深"不该被同一根时间轴重复惩罚。
 - **ACT-R 需要多次访问的时间戳**：`memory_access_log(memory_id, project, accessed_at, channel)` 由检索路径写，注入路径不写（注入不算回忆）；没有日志表时退回 `last_accessed_at`。
 - **锚点**：`memory_update {id, pinned: true}` 钉住、`pinned: false` 取消。注入时锚点排在最前、不参与相似度门槛（`recallForInjection` 默认自动取 2 条，`maxAnchors` 可调），但仍受 `project` / `character_id` 隔离约束——钉住不等于跨角色泄漏。
 - **难过的当下不翻旧账**：调用方把当前心情（`-10..+10`）传进 `memory_search` / `memory_recall` 时，中显著且与心情同调的记忆降为背景、不进注入块（`stats.moodSuppressed`），锚点不受影响。心情值现在优先取 psyche（有证据时）。
@@ -106,6 +139,8 @@ next = transition(previous, appraisal, now, options)
 | 增益 | `target` 0.55（有界误差步，不累加到轨道）/ `event` 0.35（有符号增量） |
 | 滞回 | 进入 ±0.25，维持 ±0.10——边界来回抖不会每轮换标签 |
 | 事件去重 | `processed_event_ids` 保留最近 128 个；重复 `eventId` 不改版本、不改 VAD |
+| 证据有效期 | `PSYCHE_EVIDENCE_TTL_HOURS`（默认 72）：超过就当作没有证据，`band` 回基线 |
+| 输入源 | 默认**不由 VAD 估计驱动**；`PSYCHE_FROM_VAD=on` 才把 VAD 写回接进状态机 |
 | 并发 | `BEGIN IMMEDIATE` 内读—转移—写；跨进程只认库里的行 |
 | 读路径 | 只做衰减、**不写库**（context_get/search/reply 一轮可能读多次）；`updated_at` 只在有事件时前进，旧时间戳不能回拨 |
 | 失败 | 持久化失败时保留进程内状态继续服务并 `console.warn`；`requirePersistence` 时抛错，让调用方把队列项留在可重试状态 |
@@ -114,24 +149,26 @@ next = transition(previous, appraisal, now, options)
 
 `context_get` 同时返回 JSON 的 `psyche` 块和给人读的状态块（`unifiedStatePrompt`）：有传感器证据时，AgentState 那条独立 mood 行被省略，避免提示词里出现两个互相矛盾的 affect 值；能量 / 倾向 / 近期经历仍由 AgentState 提供。
 
+> **提示词形态**：`agentState.toPromptString()` 的一行是 `互动状态：{band}（v= a= d=）`——即"类别词 + 三个裸数值"。实测这一形态有系统性代价：裸 band+数值在 deepseek 上 −0.072 可判定；改成**具体处境描写**相对等长中性 +0.100（单模型）。在第二个模型上补到 n=100 后归零（+0.018 不可判定），所以**没改成默认**。改法保留在实验记录里，等条件满足再动。
+
 ### VAD 队列的三态
 
 | affect_status | 含义 | 会不会推进 psyche |
 |---|---|---|
 | `pending` / `pending_psyche` | 已入队；模型调用进行中（`pending_psyche` = VAD 已写、psyche 未落盘） | 否 |
-| `analyzed` | VAD 写回 + psyche 持久化都成功 | 是（一次） |
-| `abstain` | 有分析但**无可靠 VAD**（格式错、越界、数量不匹配、低置信） | 否，且不会被后来的重放改成 `analyzed` |
+| `analyzed` | VAD 写回 + psyche 持久化都成功 | 仅当 `PSYCHE_FROM_VAD=on` |
+| `abstain` | 有分析但**无可靠 VAD**（格式错、越界、数量不匹配、低置信、或走了词表兜底） | 否，且不会被后来的重放改成 `analyzed` |
 
 队列参数：`MAX_SIZE=15`、`MIN_BATCH=5`、`MAX_AGE=10min`、单条正文截断 2400 字符；按 durable memory id 去重，所以底层保存器和上层适配器重复入队不会分析两遍。flush 前重新校验来源、`is_active`、项目与角色：指针失效丢弃，数据库预检异常保留重试。
 
-### 两条 VAD 来源，共用一个状态机
+### VAD 通道现状
 
-| 来源 | 位置 | 契约 |
+| 来源 | 位置 | 状态 |
 |---|---|---|
-| 仓内 Ollama | `emotion.ts` → `OLLAMA_URL/api/chat`，`VAD_MODEL` 默认 `qwen3.5:2b`，`temperature 0.1`、`num_predict 256`、超时 15s | JSON `{vad:{v,a,d}, tsundere_level, confidence, tags}`；越界 / 缺维按 `INVALID_VAD_RESPONSE` 处理，不写 neutral |
-| NPU 传感器（仓外进程） | `D:\castalia\run\Castalia\scripts\psyche_npu.mjs`，HTTP `3352`，`POST /appraise` | 一行 `VAL=-2..2`（`VAL=?` = abstain），`promptMaxTokens 24`，qwen3.5-0.8B + 12 shot，默认关、空闲 600s 卸模型 |
+| 仓内 Ollama | `emotion.ts` → `OLLAMA_URL/api/chat`，`VAD_MODEL` 默认 `qwen3.5:2b`，`temperature 0.1`、`num_predict 256`、超时 15s | 唯一在代码里的通道；不可用/低置信 → 词表兜底 → **只写 abstain** |
+| NPU 传感器（仓外进程） | `D:\castalia\run\Castalia\scripts\psyche_npu.mjs`，HTTP `3352`，`POST /appraise` | 能跑，但**本仓没有调用它的代码**（见「已知缺口」） |
 
-两条都必须走 `targetAppraisalFromVAD()` → `applyPsycheAppraisal()`，不能各写一套 mood。**注意：本仓目前没有任何代码调用 `3352/appraise`**（见「已知缺口」），仓内实际生效的 VAD 是 Ollama 或词表兜底。
+两条都必须走 `targetAppraisalFromVAD()` → `applyPsycheAppraisal()`，不能各写一套 mood。
 
 ## 自循环与日记
 
@@ -177,15 +214,15 @@ next = transition(previous, appraisal, now, options)
 第一段：候选与门槛（`computeScore`）。
 
 ```text
-score = (1.00 × consistency + 0.12 × emotion + 0.15 × time_decay + 0.10 × deviation)
+score = (1.00 × consistency + 0.12 × emotion + 0.03 × time_decay + 0.10 × deviation)
         × source × density × importance × bias × tier × access
 ```
 
 | 项 | 取值 |
 |---|---|
-| `consistency` | `min(similarity, 0.7)`——上限 0.7 避免过度拟合人设；相似度是主轴 |
-| `emotion` | VAD 三维衰减后的强度（无 VAD 回落 `abs(emotional_impact)/10`） |
-| `time_decay` | `computeRecency(last_accessed_at ?? created_at)`——**回忆一次刷新时钟** |
+| `consistency` | `min(similarity, 0.95)`——上限 0.95（0.7 → 0.95 时金标 R@1 53.6% → 68.1%，10:0，p=1.95e-3） |
+| `emotion` | VAD 三维衰减后的强度（无 VAD 回落 `abs(emotional_impact)/10`）。**已知方向为负**（AUC 0.419、ρ=−0.205），保留在 ≤20% 的有界分量里 |
+| `time_decay` | `computeRecency(last_accessed_at ?? created_at)`——**回忆一次刷新时钟**；权重 0.15 → 0.03（金标 R@1 68.1% → 76.8%，6:0，p=0.031） |
 | `deviation` | `similarity < 0.3` 且 `baseIntensity ≥ 0.7` 时 +0.8——"不像她的珍贵瞬间" |
 | `source` | `reflect_summary` / `reflect_reasoning` ×0.85，其它 `reflect_*` ×0.93 |
 | `density` | `clamp(len/24, 0.75, 1)`，6 字残片轻微降权 |
@@ -195,6 +232,8 @@ score = (1.00 × consistency + 0.12 × emotion + 0.15 × time_decay + 0.10 × de
 | `access` | `1 + min(0.08, log2(1 + accessedCount) × 0.02)` |
 
 权重可用 `WEIGHT_CONSISTENCY` / `WEIGHT_EMOTION` / `WEIGHT_TIME` / `WEIGHT_DEVIATION` 覆盖。元数据只做**有界加成 / 弱乘数**：早先版本把情绪、tier、访问次数当主乘数，实测导致 6 字垃圾行在每个查询里排第一，且"被注入 → 访问数 +1 → 下次更容易被注入"形成正反馈——这就是注入路径不再计数的由来。
+
+> **两个常量的证据边界**：0.95 与 0.03 都是在同一批 69 条金标查询上得到的，**这批查询参与了调参**，没有冻结验证集。换语料/换库时要重测，不能当普适最优。
 
 检索档位：`quick` 3 / 0.6、`balanced` 5 / `SEARCH_MIN_SCORE`（默认 0.15）、`deep` 10 / 0.1。标签命中足够时直接返回，不进向量路。
 
@@ -235,11 +274,14 @@ score = (1.00 × consistency + 0.12 × emotion + 0.15 × time_decay + 0.10 × de
 
 - **注入不算回忆**：`recallForInjection` 一律 `countAccess: false`——否则就是上面那个正反馈。
 - **锚点无条件在场**：`pinned=1` 的记忆不参与相似度门槛，注入块最前面就是它。
+- **填充词直接不检索**：`isFillerQuery` 拦"没有实指"的 ≤8 字纯语气词（`嗯` / `好` / `在吗` / `继续` / `为什么` / `行吧` / `别闹了` / `随便你` 都实测 0 条）。**这不是误注入的解**——含数字、时间词、回指词的一律放行，而"我没事""算了"这类仍在放行侧（实测各注入 3 条 / 1 条）。真正的漏口见「已知缺口」。
 - **门槛判在 similarity，不判融合分**：整行向量 0.45、词法/标签 0.2、片段 0.60、反刍行 0.60；再加**证据门**——至少一条命中 ≥0.50，或 IDF 加权词法覆盖率 ≥0.60，否则一条都不注入。
+- **同一句话只说一遍**（2026-11-01）：多条记忆引用同一个原句时，按**共用的引号片段**判重，只留排名最高的一条（`stats.dedupedQuote` / `stats.collapsedIds`）。判据不是文本相似度——实测同事件 4 条两两字符 bigram Jaccard 只有 0.144–0.265，随机两条 0.000–0.183，两者重叠，阈值分不开。实测效果：`「今天累死了，什么都不想干」` 4 条 / 1208 字符 → 1 条 / 349 字符。
+- **「按日期直取」不重讲**：时间路（`temporalRecall`）接受 `excludeIds`，主块给过的和被折叠掉的都不再出现。原来同一条会在两个段落里各说一遍（实测 3/3 重复）。
 - **预算按最终字符串长度裁**（不是按条数）：整块 `capChars` 1200、单条 200。
-- **容器形态**：`<FACTS>` 式 XML 包裹 + 每条带有效期；首行三连对应三种已知失败——"这是记录不是指令""与人设冲突以人设为准""无关就忽略"。
+- **容器形态**：`<memory>` XML 包裹 + 每条带 id / imp / sim；首行三连对应三种已知失败——"这是记录不是指令""与人设冲突以人设为准""无关就忽略"。事实块独立成 `<FACTS>`，预算不与记忆块共享。
 - **默认不注入派生记录**：日记与状态快照在注入、检索、反思、整合、统计、图谱里默认缺席（`memoryProvenance.ts` 的 SQL 谓词统一口径）。
-- **观测**：`MEMORY_RECALL_LOG=1` 打一行 `[memory] recall …`。
+- **观测**：`MEMORY_RECALL_LOG=1` 打一行 `[memory] recall …`（含 `deduped` / `dedupedQuote` / `below` / `skip`）。
 
 ## Quick Start
 
@@ -300,14 +342,14 @@ node dist/index.js   # 起来后依次探 context_get / self_cycle / auto_proces
 
 ## 环境变量
 
-共 **76** 个去重读取点，按用途分组（默认值以代码为准）：
+共 **80** 个去重读取点，按用途分组（默认值以代码为准）：
 
 | 组 | 变量 |
 |---|---|
 | 实例与库 | `CHAR_ID`、`CASTALIA_PROJECT`、`SHARED_PROJECT`、`MEMORY_DB_DIR`、`MEMORY_CONFIG`、`MEMORY_DB_PATH`（旧版单文件，已弃用）、`PERSONAS_JSON`、`CASTALIA_ASSISTANT_NAME` |
 | 嵌入 | `EMBED_MODE`（`none` / `ollama` / `api`）、`OLLAMA_URL`、`EMBEDDING_MODEL`、`EMBEDDING_DIM`（默认 1024）、`EMBEDDING_API_KEY`、`EMBED_TIMEOUT_MS`、`VEC_DIM` |
-| 打分权重 | `WEIGHT_CONSISTENCY` 1.00、`WEIGHT_EMOTION` 0.12、`WEIGHT_TIME` 0.15、`WEIGHT_DEVIATION` 0.10、`SEARCH_MIN_SCORE` 0.15 |
-| 情绪 / VAD | `VAD_MODEL`、`VAD_TIMEOUT_MS`（默认 15000）、`SKIP_WRITE_AFFECT=1` |
+| 打分权重 | `WEIGHT_CONSISTENCY` 1.00、`WEIGHT_EMOTION` 0.12、`WEIGHT_TIME` **0.03**、`WEIGHT_DEVIATION` 0.10、`SEARCH_MIN_SCORE` 0.15 |
+| 情绪 / VAD | `VAD_MODEL`、`VAD_TIMEOUT_MS`（默认 15000）、`VAD_APPRAISAL_CHUNK`、`PSYCHE_FROM_VAD`（默认关）、`PSYCHE_EVIDENCE_TTL_HOURS`（默认 72）、`SKIP_WRITE_AFFECT=1` |
 | 自循环 | `SELF_CYCLE_INTERVAL_MINUTES`（默认 `0` = 关；正数才自动跑，最小粒度 1 分钟） |
 | 注入门槛 | `MEMORY_INJECT_MIN_SIM` 0.5、`MEMORY_INJECT_MIN_SIM_VECTOR` 0.45、`MEMORY_INJECT_MIN_SIM_LEXICAL` 0.2、`MEMORY_INJECT_MIN_SIM_CHUNK` 0.6、`MEMORY_INJECT_MIN_SIM_REFLECT` 0.6、`MEMORY_INJECT_STRONG` 0.5、`MEMORY_INJECT_STRONG_LEXICAL` 0.6、`MEMORY_INJECT_MARGIN`、`MEMORY_RECALL_LOG` |
 | 会话缓冲 | `BUFFER_SIZE`、`BUFFER_TOKENS`、`SESSION_MEMORY_TTL_DAYS` |
@@ -357,62 +399,52 @@ node scripts/memory_maintenance.mjs eval            [bank] [project]   # 小样�
 
 | 类别 | 数量 | 例子 |
 |---|---|---|
-| `regression_*.mjs` | 22 | `role_isolation`、`entities`、`facts_provenance`、`facts_migration`、`diary_isolation`、`raw_conversation_immutable`、`self_cycle_process`、`psyche_parse`、`emotion_failure`、`emotion_status_source`、`duplicate_enqueue`、`restart_recovery`、`anima_audit`、`memory_injection`、`store_bridge`、`loop_closure` |
-| `test_*.mjs` | 12 | `psyche_state`（状态机数学）、`self_cycle_cursor`（游标序）、`emotional_ranking`、`emotion_wiring`、`affect_lexicon` |
+| `regression_*.mjs` | 23 | `role_isolation`、`entities`、`facts_provenance`、`facts_migration`、`diary_isolation`、`raw_conversation_immutable`、`self_cycle_process`、`psyche_parse`、`emotion_failure`、`emotion_status_source`、`duplicate_enqueue`、`restart_recovery`、`anima_audit`、`memory_injection`、`store_bridge`、`loop_closure` |
+| `test_*.mjs` | 17 | `psyche_state`（状态机数学）、`self_cycle_cursor`（游标序）、`emotional_ranking`、`emotion_wiring`、`affect_lexicon`、**`filler_query`**、**`injection_dedup`**（同一句话只注入一次） |
 | `audit_*.mjs` | 3 | `scale`（只读盘点所有 bank 并给结论）、`orphans`、`vector_space` |
 | `bench_*.mjs` + `eval_*.mjs` | 8 | `reflect_quality`、`insight_gates`、`insight_semantics`、`anima_idf`、`anima_redundancy`、`injection` |
 
-回归脚本贴着实现写断言（不是抽样）。**动 psyche / VAD / 日记 / 事实来源 / 原料行软删路径时**至少跑：`test_psyche_state`、`regression_psyche_parse`、`test_self_cycle_cursor`、`regression_self_cycle_process`、`regression_diary_isolation`、`regression_raw_conversation_immutable`、`regression_emotion_failure`、`regression_emotion_status_source`、`regression_duplicate_enqueue`、`regression_restart_recovery`、`regression_facts_provenance`、`regression_entities`、`regression_anima_audit`。
+回归脚本贴着实现写断言（不是抽样）。**动 psyche / VAD / 日记 / 事实来源 / 原料行软删路径时**至少跑：`test_psyche_state`、`regression_psyche_parse`、`test_self_cycle_cursor`、`regression_self_cycle_process`、`regression_diary_isolation`、`regression_raw_conversation_immutable`、`regression_emotion_failure`、`regression_emotion_status_source`、`regression_duplicate_enqueue`、`regression_restart_recovery`、`regression_facts_provenance`、`regression_entities`、`regression_anima_audit`。**动注入路径时**跑 `regression_memory_injection`、`test_injection_enrich`、`test_filler_query`、`test_injection_dedup`。
 
-### 2026-10-31 实跑记录（本次复核）
+### 2026-11-01 实跑记录
 
 ```text
-tsc -p tsconfig.build.json --noEmit     → 0 error
-npm run build                           → ok（[version] 1.28.8 → src/version.ts）
-test_psyche_state                       → PASS
-regression_psyche_parse                 → 12 cases passed
-test_self_cycle_cursor                  → PASS
-regression_self_cycle_process           → 10 checks
-regression_diary_isolation              → PASS
-regression_raw_conversation_immutable   → 27 checks（merge/split/delete/冷存/衰减/孤儿/人工遗忘/普通合并）
-regression_emotion_failure              → 13 / 0
-regression_emotion_status_source        → PASS
-regression_duplicate_enqueue            → PASS
-regression_restart_recovery             → PASS
-regression_facts_migration              → 8 checks
-regression_facts_provenance             → 10 checks
-regression_entities                     → 48 / 0
-regression_anima_audit                  → 51 checks, ok, productionWrites=0, liveLlmCalls=0, embedCalls=0
-regression_loop_closure                 → 11 checks
-regression_memory_injection             → 44 checks
-regression_store_bridge                 → 29 / 0
-regression_role_isolation               → 39 checks
-regression_facts                        → 5 checks
-regression_cjk_recall                   → 17 / 0
-regression_superseded_recall            → 19 checks
-regression_embed_dim                    → 39 / 0
-test_emotion_wiring                     → 35 / 0
-test_emotional_ranking                  → 40 / 0
-test_affect_lexicon                     → 17 / 0
+npx tsc -p tsconfig.build.json          → 0 error
+test_injection_dedup                    → 14 / 0（新增）
+test_filler_query                       → 52 / 0
+regression_memory_injection             → 44 checks, ok, liveLlmCalls=0, liveEmbedCalls=0, productionWrites=0
+test_injection_enrich                   → 13 / 0
 ```
 
-全部使用临时库，`productionWrites=0` / `liveLlmCalls=0` / `embedCalls=0`，不启动常驻服务。
+注入去重在真实库副本（airi/general，268 活跃行）上的实测：
+
+```text
+查询「今天累死了，什么都不想干」
+  改前 count=4 chars=1208 temporal=3   （同事件 3 条 daily_event + 1 条 reflect_extract，且时间路再复读一遍）
+  改后 count=1 chars=349  temporal=0   dedupedQuote=4
+未受影响的查询（回归）：「我没事」3 条 /「算了」1 条 /「你今天怎么了」5 条 /「像素小人」5 条
+```
+
+全部使用临时库或库副本，`productionWrites=0` / `liveLlmCalls=0`，不启动常驻服务。
 
 ### 部署状态（别把构建当上线）
 
-`D:\castalia\run\Castalia-Anima\dist` 与仓库 `dist` **已对齐**（2026-10-31 12:58 全量同步，同步前备份 `dist.bak-20261031-125817-rawconv`）：两份目录都是 50 个 `.js`，`reflect.js` / `store.js` / `orphan.js` / `reflectionSources.js` / `memoryProvenance.js` / `index.js` 的 md5 一致；`regression_raw_conversation_immutable` 直接对部署目录跑过（27 checks PASS）。
+仓库 `dist/` 与运行时 `D:\castalia\run\Castalia-Anima\dist` 在 2026-11-01 重新编译对齐（`npx tsc -p tsconfig.build.json`）。两份都应是同一份源码的产物；差异只应出现在"源码改了但没重建"时。
 
-> 2026-10-31 12:58 之前的说法（runtime dist 缺 `psycheState.js` / `selfCycle.js` / `selfCycleCursor.js` / `memoryProvenance.js`、`index.js` md5 不同）**已作废** —— 那些文件当时就在，差异只是缺 10-31 的那次编译。
+上线仍然要停宿主、整目录替换、校验 hash、启动后 smoke `context_get` / `self_cycle` / `auto_process`，并保留旧 dist 回滚。**改完 dist 必须重启常驻桥进程**：已建立的 MCP 桥不会热加载新代码，重启前它们是旧行为。
 
-上线仍然要停宿主、整目录替换、校验 hash、启动后 smoke `context_get` / `self_cycle` / `auto_process`，并保留旧 dist 回滚。**改完 dist 必须重启常驻 `CastaliaNode` 桥**：已建立的 MCP 桥进程不会热加载新代码（本机当前有 14 个），重启前它们是旧行为。
+> **宿主内嵌镜像**：有的宿主把引擎源码 copy 进自己的仓（`vendor/engine/`）并在进程内跑，不 spawn 本仓 `dist`。那种场景下**改这里不会自动生效**，要跑宿主的 `sync-engine` 再重建。这是本仓被踩过最多次的一个坑。
 
 ## 已知缺口（写在这里，避免被当成已完成）
 
-- **`/appraise` 没有 Anima 侧消费者**：NPU 传感器（3352）能跑，但仓内没有代码调用它；psyche 现在靠 Ollama VAD 或词表兜底喂。要接就得在 VAD 队列加一条 sensor 分支，并保证它和 Ollama 路径共用 `applyPsycheAppraisal`。
-- **中性覆盖为 0**：0.8B VAL 契约在同一批 36 条探针上从不输出中性；不能用"问句/短句/无情绪词"启发式代替，必须用独立标注集验证规则精确率与覆盖率。
-- **样本量不足**：36 条探针拟合不了阈值、衰减半衰期、API 路由或 conformal 错误率。正式校准要按用户/会话分组、按时间留出，防止同一对话与同义改写泄漏。
+- **情感层没有可用传感器**：词表已降级为 abstain（κ=0.015），Ollama 通道要求本机跑 `11434`，NPU 传感器（3352）没有仓内消费者。**当前默认是"不产生情感证据"**，不是"情感层在工作"。
+- **VAD 数值不传导**：类别词 / 数值 / 端点的拆解显示数值无独立作用、arousal 完全不传导。任何"精确 VAD 数值"的工程在没有新证据前都不该开工。
+- **注入的漏口仍在开放侧**：填充词门只覆盖 ≤8 字纯语气词。"我没事""算了""随便你"这类**无实指但不是语气词**的短句仍会注入（实测 3 / 1 / 0 条）。这类是开放集，加词表解决不了；正确方向是查询侧"有没有实指"的判据，不是继续抬阈值。
+- **同一事件仍可能多渠道并存**：按引号片段判重只能处理"引用了同一原句"的情况；同一件事被抽成措辞完全不同、又不带引号的多条记忆时，仍会各占一条预算。
+- **反思产出仍多于原料**：某真实库活跃 226 行里 `reflect_*` 86 行、`conversation_log` 62 行（1.39×）；合并 / 清理链在宿主侧停摆时，同事件会积累多份抽取。
+- **`/appraise` 没有 Anima 侧消费者**：NPU 传感器（3352）能跑，但仓内没有代码调用它。
+- **样本量不足**：36 条探针拟合不了阈值、衰减半衰期、API 路由或 conformal 错误率。正式校准要按用户 / 会话分组、按时间留出，防止同一对话与同义改写泄漏。
 - **情感衰减仍按 `created_at` 算**（`search.ts` 的 `hoursSinceCreated`）：高唤醒记忆 3 天后情感维度归零，而时间项已改按 `last_accessed_at` 刷新，两者不一致。
-- **情感数据依赖写入时的 VAD 来源**：没有本地 Ollama 就只剩词表兜底；`backfill_affect.mjs` 默认 dry-run——词表会把叙事里的强词判成强情绪。
 - **idle unload 未做真实环境 smoke**：传感器卸模型的路径目前只有语法与回归验证，没在部署环境实测。
 - **老 facts 的来源无法回填判断**：没有 `source_memory_source` 的历史行只能离线扫描各 memType 后补。
 

@@ -10,7 +10,7 @@
  * 情感提取不再用正则 → 全部走 Ollama 本地模型
  */
 import { normalizeCharacterId, normalizeProject, CHAR_ID } from './env.js';
-import { scoreAffect, affectImpact } from './affectLexicon.js';
+import { scoreAffect } from './affectLexicon.js';
 import { DatabaseManager } from './db.js';
 import { serializeTags } from './tags.js';
 import { applyPsycheAppraisal, targetAppraisalFromVAD } from './psycheState.js';
@@ -586,10 +586,13 @@ export function tagWithLocalAffect(entries, project, characterId = CHAR_ID) {
     const proj = normalizeProject(project);
     const db = DatabaseManager.getInstance(proj);
     let updated = 0;
-    const stmt = db.prepare(`UPDATE memory SET character_id = ?, vad_valence = ?, vad_arousal = ?, vad_dominance = ?,
-      emotional_impact = CASE WHEN COALESCE(emotional_impact, 0) = 0 THEN ? ELSE emotional_impact END,
+    // NOTICE: 2026-11-01 降级。CPED 分层 300 条实测：scoreAffect() 的 κ=0.015（与「恒答负」不可分）、
+    // 命中率 7.3%、命中处符号一致率 50%。它不参与任何评分：不写 vad_valence/dominance/emotional_impact，
+    // 也不置 pending_psyche，只留一个「高唤醒命中」标记。要接回评分，先拿 κ≥0.4 的估计器。
+    const stmt = db.prepare(`UPDATE memory SET character_id = ?,
+      vad_valence = NULL, vad_arousal = ?, vad_dominance = NULL,
       tags = CASE WHEN tags IS NULL OR tags = '[]' THEN ? ELSE tags END,
-      affect_status = 'pending_psyche', affect_analyzed_at = ?, affect_source = 'local_lexicon'
+      affect_status = 'abstain', affect_analyzed_at = ?, affect_source = 'local_lexicon'
       WHERE id = ? AND project = ? AND character_id = ?
         AND source = 'conversation_log' AND is_active = 1`);
     const abstain = db.prepare(`UPDATE memory SET character_id = ?, affect_status = 'abstain', affect_analyzed_at = ?, affect_source = 'local_lexicon'
@@ -612,9 +615,10 @@ export function tagWithLocalAffect(entries, project, characterId = CHAR_ID) {
                 }
                 continue;
             }
-            const tags = JSON.stringify(sc.matched.slice(0, 3));
+            // 只有强唤醒才留标记；低唤醒命中等于没信息。
+            const tags = sc.arousal >= 0.5 ? JSON.stringify(['high_arousal']) : '[]';
             try {
-                const r = stmt.run(characterId, sc.valence, sc.arousal, sc.dominance, affectImpact(sc), tags, new Date().toISOString(), e.memoryId, proj, characterId);
+                const r = stmt.run(characterId, Math.abs(sc.arousal), tags, new Date().toISOString(), e.memoryId, proj, characterId);
                 if (r.changes > 0)
                     updated++;
             }
@@ -939,7 +943,9 @@ async function flushVadQueueInternal(project, opts = {}) {
                         // 重要性随证据进来，让「重要的事持续更久」在生产上真正生效。
                         salience: batchSalience(batch.entries, batch.project, batch.characterId),
                     });
-                    finalizeAffectPsyche(eventIds.map(memoryId => ({ memoryId })), batch.project, batch.characterId);
+                    // 状态机默认不由 VAD 估计驱动（两个估计器都没过 κ≥0.4）。需要时显式 PSYCHE_FROM_VAD=on。
+                    if (process.env.PSYCHE_FROM_VAD === 'on')
+                        finalizeAffectPsyche(eventIds.map(memoryId => ({ memoryId })), batch.project, batch.characterId);
                 }
                 continue;
             }
@@ -970,7 +976,8 @@ async function flushVadQueueInternal(project, opts = {}) {
             // been written. A retry then cannot create a second state transition.
             // Keep retries/restarts idempotent even when queue ordering changes.
             const eventIds = pendingPsycheIds(batch.entries, batch.project, batch.characterId);
-            if (updatedForBatch > 0 && eventIds.length > 0) {
+            // 模型通道同样默认不接状态机。
+            if (process.env.PSYCHE_FROM_VAD === 'on' && updatedForBatch > 0 && eventIds.length > 0) {
                 applyPsycheAppraisal(batch.characterId, batch.project, 
                 // The Ollama prompt asks for the batch's absolute current VAD. Move
                 // the psyche toward that target; do not accumulate it as an event

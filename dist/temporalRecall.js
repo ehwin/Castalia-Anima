@@ -151,9 +151,13 @@ export function recallTemporalForQuery(query, options = {}) {
         return { text: '', hits: [], days };
     // 同一天同一标题只留一条（事件行可能被重跑更新过）
     const seen = new Set();
+    const exclude = new Set([...(options.excludeIds ?? [])].map(String));
     const picked = [];
     let chars = 0;
     for (const hit of found.sort((a, b) => b.importance - a.importance)) {
+        // 主注入块已经给过这条，就不要在「按日期直取」段再念一遍（2026-11-01）。
+        if (exclude.has(String(hit.id)))
+            continue;
         const key = `${hit.day}\u0000${hit.title}`;
         if (seen.has(key))
             continue;

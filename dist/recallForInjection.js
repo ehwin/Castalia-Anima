@@ -240,6 +240,20 @@ export function renderInjectionBlock(hits, options = {}) {
             stats.moodSuppressed = (Number(stats.moodSuppressed) || 0) + moodSuppressed;
     }
     // 锚点无条件排在最前;它们不占 topK 的名额(钉了两条就当两条都在),但共用字符预算。
+    // 2026-11-01:同一件事被抽成多条(3 条 daily_event + 1 条 reflect_extract)时只留排名最高的
+    // 一条 —— 实测这 4 条把 1208 字符预算吃满，且整块讲的是同一句话。
+    let collapsedIds = [];
+    {
+        const before = kept;
+        const collapsed = collapseSameUtterance(kept);
+        if (collapsed.collapsed > 0) {
+            stats.dedupedQuote = collapsed.collapsed;
+            const survived = new Set(collapsed.kept.map(h => String(h.id)));
+            collapsedIds = before.filter(h => !survived.has(String(h.id))).map(h => String(h.id));
+            stats.collapsedIds = collapsedIds;
+        }
+        kept = collapsed.kept;
+    }
     const keptIdSet = new Set(kept.map(h => String(h.id)));
     const finalHits = [...anchors.filter(a => !keptIdSet.has(String(a.id))), ...kept];
     // 2026-10-28:先算 belowThreshold 再返回 —— 证据门提前返回时也得留下"挡掉几条"的诊断数字
@@ -321,6 +335,46 @@ export function isFillerQuery(q) {
     return s.length <= 8 && /^[嗯啊哦好行对是的在了吗呢吧哈嘿嘻唉呀喂继续然后为什么你好测试一下不还啦呗喔噢呃额诶哎呦咯咧嗷么嘛要别]+$/.test(s);
 }
 /**
+ * 取出文本里被引用的原句（「…」与 【原文引用】> 行），归一化后按长度过滤。
+ *
+ * 为什么用引号片段而不是文本相似度判重（2026-11-01，实测）：
+ * 同一件事被抽成 3 条 daily_event + 1 条 reflect_extract 注入时，两两字符 bigram
+ * Jaccard 只有 0.144–0.265，而随机两条记忆是 0.000–0.183 —— 两者重叠，任何阈值
+ * 要么全漏要么误杀。但它们引用的是**同一个用户原句**（「今天累死了，什么都不想干。」），
+ * 这不是相似度，是共同证据。所以判重看引号片段，不看整体措辞。
+ */
+export function quoteKeysOf(text) {
+    const t = String(text ?? '');
+    const out = [];
+    for (const m of t.matchAll(/「([^」]{8,120})」/g)) {
+        const key = m[1].replace(/[\s\p{P}\p{S}]/gu, '');
+        if (key.length >= 8)
+            out.push(key);
+    }
+    return out;
+}
+/** 保留排名最高的一条，丢掉引用同一原句的其余条。无引号的行一律保留（无判据就不猜）。 */
+function collapseSameUtterance(hits) {
+    const seen = new Set();
+    const kept = [];
+    let collapsed = 0;
+    for (const hit of hits) {
+        const keys = quoteKeysOf(hit?.text);
+        if (keys.length === 0) {
+            kept.push(hit);
+            continue;
+        }
+        if (keys.some(k => seen.has(k))) {
+            collapsed++;
+            continue;
+        }
+        for (const k of keys)
+            seen.add(k);
+        kept.push(hit);
+    }
+    return { kept, collapsed };
+}
+/**
  * 召回 + 渲染。检索失败或没有过门槛的记忆时返回空文本（宁可没记忆，不可阻塞对话）。
  * 调用方负责超时与兜底。
  */
@@ -393,6 +447,10 @@ export async function recallForInjection(query, options = {}) {
             const temporal = recallTemporalForQuery(trimmed, {
                 project: options.project,
                 characterId: options.characterId,
+                // 2026-11-01:时间路会把主块刚注入过的同一条再讲一遍（实测 3/3 重复）。
+                // 除了已渲染的 id，还要排掉被"同一句话"折叠掉的那几条 —— 否则它们会从
+                // 「按日期直取」那条路绕回来，同一个事件在提示词里仍是 3 份。
+                excludeIds: [...(out.stats.ids ?? []), ...(out.stats.collapsedIds ?? [])],
             });
             if (temporal.text) {
                 out.text = out.text ? `${out.text}\n${temporal.text}` : temporal.text;

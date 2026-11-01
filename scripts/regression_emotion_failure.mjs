@@ -88,9 +88,14 @@ check('local write failure requeues entry', emotion.vadQueueStatus(localProject)
   JSON.stringify(emotion.vadQueueStatus(localProject)));
 local.db.pragma('query_only = OFF');
 await emotion.flushVadQueue(localProject, { force: true });
-const localRow = local.db.prepare('SELECT vad_valence, emotional_impact FROM memory WHERE id = ?').get(local.id);
-check('retry writes local VAD', localRow?.vad_valence != null && localRow.vad_valence < 0, JSON.stringify(localRow));
-check('successful retry consumes entry', emotion.vadQueueStatus(localProject).size === 0);
+// 2026-11-01 契约变更：词表兜底不再写 VAD（CPED κ=0.015，不构成判据），只落 abstain。
+// 这条原来断言 vad_valence < 0 且 emotional_impact ≠ 0 —— 那正是被撤掉的写入。
+const localRow = local.db.prepare('SELECT vad_valence, vad_arousal, emotional_impact, affect_status, affect_source FROM memory WHERE id = ?').get(local.id);
+check('retry 落 abstain，不写 VAD',
+  localRow?.affect_status === 'abstain' && localRow?.vad_valence == null && localRow?.vad_dominance == null,
+  JSON.stringify(localRow));
+check('词表不产生 emotional_impact', Number(localRow?.emotional_impact || 0) === 0, JSON.stringify(localRow));
+check('成功的 retry 消费掉队列项', emotion.vadQueueStatus(localProject).size === 0);
 
 // 2) A malformed batch response must not partially consume the queue. The
 // next response is valid and proves that requeued entries remain usable.
