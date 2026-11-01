@@ -233,8 +233,12 @@ export async function applyReflectActions(actions, characterId = CHAR_ID, projec
             const ids = action.action === 'merge' ? action.sourceIds :
                 [action.targetId, action.sourceId, action.targetIdRelate].filter((id) => !!id);
             if (ids) {
-                if (options.allowedSourceIds && ids.some(id => !options.allowedSourceIds.has(id)))
-                    throw new Error('target is outside current reflection input');
+                if (options.allowedSourceIds && ids.some(id => !options.allowedSourceIds.has(id))) {
+                    // 2026-11-01: 把越界的 id 带进错误串 —— 否则只看到 "outside current reflection input"，
+                    // 无法判断是模型编了 id、拿了事实 id、还是截断了 uuid。
+                    const outside = ids.filter(id => !options.allowedSourceIds.has(id)).slice(0, 3);
+                    throw new Error(`target is outside current reflection input: ${outside.join(', ')}`);
+                }
                 const resolved = ids.map(id => resolveReflectTarget(id, project, action.action === 'extract', characterId));
                 if (resolved.some(target => !target))
                     throw new Error('target missing, inactive or ambiguous');

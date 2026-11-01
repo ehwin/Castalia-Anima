@@ -40,6 +40,12 @@
 
 报告同时指出：真要恢复情感层，入口不是"更贵的文本 VAD"，而是**非文本通道**（说话人 / 言语行为 / 延迟 / 长度骤变 / 撤回）——同一批数据上 META 特征 AUC 0.6344 vs 文本 0.5578。
 
+**位置在哪一层**（[docs/affect-placement-2026-11-01.md](docs/affect-placement-2026-11-01.md)）：
+
+- 检索打分（现状）：`WEIGHT_EMOTION 0` vs `0.12` 在 69 条金标上 p=1（只多中 1 条），**零效应**；加到 `1.0` 则 17:0 显著变差；
+- 注入决策：`0.12` 与 `0` 在 300 条外部中文闲聊上的误注入率**逐位相同**（24.3%），因为门槛判在 similarity 上，排序项改不了"过不过门"；
+- 所以情感项现在被放在唯一不产生可测效果的位置：**只重排、不决策**。
+
 ---
 
 ## 三条链路与硬边界
@@ -414,6 +420,20 @@ test_injection_dedup                    → 14 / 0（新增）
 test_filler_query                       → 52 / 0
 regression_memory_injection             → 44 checks, ok, liveLlmCalls=0, liveEmbedCalls=0, productionWrites=0
 test_injection_enrich                   → 13 / 0
+regression_anima_audit                  → 51 checks, ok, productionWrites=0
+regression_loop_closure                 → 11 checks, ok
+test_reflect_ledger_anima               → 19 / 0
+test_derived_evidence                   → PASS
+regression_raw_conversation_immutable   → 27 checks PASS
+regression_emotion_failure              → 14 / 0
+```
+
+整合链在库副本上的复现（真模型，一次调用）：
+
+```text
+修前：scanned 67 candidates 8 merged 0  → 全部 merge 失败 "raw-material"（候选是 daily_event）
+修后：scanned 67 candidates 0 merged 13 applied 13 errors 0 → ok
+库副本变化：general 活跃 225 → 136、project 30 → 19（合并结果落库后软删源，内容可回查）
 ```
 
 注入去重在真实库副本（airi/general，268 活跃行）上的实测：
@@ -441,7 +461,7 @@ test_injection_enrich                   → 13 / 0
 - **VAD 数值不传导**：类别词 / 数值 / 端点的拆解显示数值无独立作用、arousal 完全不传导。任何"精确 VAD 数值"的工程在没有新证据前都不该开工。
 - **注入的漏口仍在开放侧**：填充词门只覆盖 ≤8 字纯语气词。"我没事""算了""随便你"这类**无实指但不是语气词**的短句仍会注入（实测 3 / 1 / 0 条）。这类是开放集，加词表解决不了；正确方向是查询侧"有没有实指"的判据，不是继续抬阈值。
 - **同一事件仍可能多渠道并存**：按引号片段判重只能处理"引用了同一原句"的情况；同一件事被抽成措辞完全不同、又不带引号的多条记忆时，仍会各占一条预算。
-- **反思产出仍多于原料**：某真实库活跃 226 行里 `reflect_*` 86 行、`conversation_log` 62 行（1.39×）；合并 / 清理链在宿主侧停摆时，同事件会积累多份抽取。
+- **反思产出仍多于原料**：清理探针残留后某真实库活跃 207 行里 `reflect_*` **86** 行、`conversation_log` **43** 行、`daily_event` 7 行（**2.0×**，残留清掉后比例反而更差，因为删的全是原料）。合并链此前**每轮都失败**：整合窗口只排除了 `agent_diary`/`agent_state`，而 `applyReflectActions` 拒绝动全部原料行，于是模型对 `daily_event` 提的每一条合成都返回 `raw-material`、`merged` 恒 0（2026-11-01 已修：窗口改用 `excludeRawMaterialSql()`，副本上 13 条合并成功）。仍有一条**未修**：LLM 偶发给出不在输入集里的 id，整批因此 `ok=false`（已把越界 id 写进错误串，便于定位）。
 - **`/appraise` 没有 Anima 侧消费者**：NPU 传感器（3352）能跑，但仓内没有代码调用它。
 - **样本量不足**：36 条探针拟合不了阈值、衰减半衰期、API 路由或 conformal 错误率。正式校准要按用户 / 会话分组、按时间留出，防止同一对话与同义改写泄漏。
 - **情感衰减仍按 `created_at` 算**（`search.ts` 的 `hoursSinceCreated`）：高唤醒记忆 3 天后情感维度归零，而时间项已改按 `last_accessed_at` 刷新，两者不一致。

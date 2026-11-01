@@ -28,6 +28,7 @@ import { callLlm, makeLlmChannel, parseJsonRobust, REFLECT_DEEP_MAX_TOKENS } fro
 export { callLlm, makeLlmChannel, REFLECT_DEEP_MAX_TOKENS } from './reflectionLlm.js';
 export type { LlmChannel, LlmResponse } from './reflectionLlm.js';
 import { wholeRecordBatches, emotionalReflectPrompt, CONSOLIDATION_FIDELITY } from './reflectionFidelity.js';
+import { excludeRawMaterialSql } from './memoryProvenance.js';
 import { markConversationsReflected, deepReflectionCursor } from './reflectionSources.js';
 
 const FACT_EXTRACTION = (process.env.REFLECT_FACT_EXTRACTION || 'auto').trim().toLowerCase();
@@ -478,9 +479,14 @@ export async function runConsolidate(
   // 只取重要度会让低分老记忆永远轮不到；若先合并再按重要度截断到 500，最久那 200 条会被整片丢掉
   // （Full 现网实现的缺陷），所以这里先定 head=top300，再从最久片补满 200，合计 ≤500。
   // v1.24: 角色隔离 — 整合窗口只含本实例角色(charId='any' 关闭过滤)。
+  // 2026-11-01: 原料行不再进入整合窗口。`applyReflectActions` 一直拒绝动原料行
+  // （conversation_log / daily_event / agent_state / agent_diary），但窗口只排除了后两个，
+  // 于是模型每轮都在给 daily_event 提合并、每一条都 `status: failed → raw-material`，
+  // merged 恒为 0、结果恒 ok=false（实测 airi 库：candidates 8 / merged 0 / 多条 failed）。
+  // 白烧一次整合 token，还让"合并没跑"看起来像没调度。排除口径与软删共用同一个函数。
   const cid = charId || CHAR_ID;
   const windowWhere = `is_active = 1 AND project = ? AND (? = 'any' OR character_id = ?) AND (locked IS NULL OR locked = 0)
-        AND COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')
+        AND ${excludeRawMaterialSql()}
         AND COALESCE(tier, 'standard') <> 'critical'
         AND COALESCE(status, '') <> 'cold'`;
   const headRows: any[] = [];
