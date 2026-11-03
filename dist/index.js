@@ -44,6 +44,7 @@ import { syncTavernChat } from './tavern.js';
 import { getBiasPrompt, loadBiasesFromDb } from './bias.js';
 import { getUserProfilePrompt, loadUserProfilesFromDb, observeUserMessage } from './userLearning.js';
 import { queueForVad, formatInteractionForVad } from './emotion.js';
+import { toIsoOrNull } from './time.js';
 console.log = console.error;
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 function ok(data) {
@@ -870,7 +871,7 @@ register('memory_list', 'admin', 'List active memories, optionally filtered. Adm
                 memType: m.memType || 'general',
                 category: m.category,
                 importance: m.importance,
-                createdAt: m.createdAt,
+                createdAt: toIsoOrNull(m.createdAt),
             })),
             hint: '用 memory_get(id) 取完整内容',
         });
@@ -932,8 +933,8 @@ register('memory_get', 'agent', 'Get one memory by ID with full text. Use to exp
                 tier: row.tier,
                 source: row.source,
                 subject: row.subject,
-                createdAt: row.created_at,
-                updatedAt: row.updated_at,
+                createdAt: toIsoOrNull(row.created_at),
+                updatedAt: toIsoOrNull(row.updated_at),
                 metadata: {
                     accessedCount: row.accessed_count + 1,
                     referenceCount: row.reference_count,
@@ -1204,7 +1205,7 @@ register('memory_index', 'agent', 'Lightweight memory index (corresponds to Clau
                 memType: row.mem_type || 'general',
                 summary: row.summary,
                 summaryTruncated: row.full_len > 150,
-                updatedAt: row.updated_at,
+                updatedAt: toIsoOrNull(row.updated_at),
             })),
             hint: '摘要层只含标题+150字。用 memory_get(id) 拉全文。',
         });
@@ -1608,6 +1609,7 @@ function readStoreRows(project, characterId, includeGeneral, limit, opts = {}) {
         conditions.push("COALESCE(source, '') NOT IN ('agent_diary', 'agent_state')");
     }
     const rows = [];
+    let total = 0;
     for (const mt of listMemTypeDirs(proj)) {
         try {
             const db = DatabaseManager.getInstance(proj, mt);
@@ -1618,13 +1620,16 @@ function readStoreRows(project, characterId, includeGeneral, limit, opts = {}) {
       `).all(...params, cap);
             for (const r of found)
                 rows.push({ ...r, mem_type: r.mem_type || mt });
+            // 总数单独数一次：客户端要能判断“拿到的是不是全部”，不能只靠 count 猜
+            const counted = db.prepare(`SELECT COUNT(*) AS c FROM memory WHERE ${conditions.join(' AND ')}`).get(...params);
+            total += Number(counted?.c ?? 0);
         }
         catch { /* 单个分类库损坏不阻断 */ }
     }
     rows.sort((a, b) => String(b.updated_at || b.created_at).localeCompare(String(a.updated_at || a.created_at)));
-    return { project: proj, rows: rows.slice(0, cap) };
+    return { project: proj, rows: rows.slice(0, cap), total };
 }
-/** 把一行 memory 变成前端能直接用的结构。 */
+/** 把一行 memory 变成前端能直接用的结构。时间字段一律 ISO 字符串或 null。 */
 function toStoreRecord(row) {
     const parsed = parseStoreText(String(row.text ?? ''));
     const charId = row.character_id ?? null;
@@ -1639,8 +1644,8 @@ function toStoreRecord(row) {
         source: row.source ?? '',
         tags: parseTagsSafe(row.tags),
         importance: row.importance,
-        createdAt: row.created_at,
-        updatedAt: row.updated_at ?? row.created_at,
+        createdAt: toIsoOrNull(row.created_at),
+        updatedAt: toIsoOrNull(row.updated_at ?? row.created_at),
     };
 }
 register('fact_as_of', 'agent', 'Answer what the facts were at one instant, on one of two axes. axis=valid = what was true in the world then; axis=transaction = what we already knew then (a fact backfilled today is not known for a past date). Returns rows that were true then, including ones since superseded.', {
@@ -1759,7 +1764,7 @@ register('memory_recall', 'store', 'Recall for one query and render a ready-to-i
         return err(e.message, 'RECALL_FAILED');
     }
 });
-register('memory_store_list', 'store', 'List a frontend store with full text: rows owned by characterId, plus shared rows when includeGeneral. No truncation, so a client can rebuild its whole index.', {
+register('memory_store_list', 'store', 'List a frontend store with full text: rows owned by characterId, plus shared rows when includeGeneral. Row text is never truncated, but the row count is capped by `limit` (default 500, hard cap 2000) — the response carries `total` and `truncated` so a client can tell whether it rebuilt the whole index.', {
     characterId: z.string().optional().describe('Character/role id owning the memories (default: process CHAR_ID)'),
     project: z.string().optional().describe('Project namespace (default: CASTALIA_PROJECT env or "default")'),
     includeGeneral: z.boolean().optional().describe('Also return memories shared by every role (default true)'),
@@ -1769,13 +1774,16 @@ register('memory_store_list', 'store', 'List a frontend store with full text: ro
 }, async (args) => {
     try {
         const charId = storeCharacterId(args);
-        const { project, rows } = readStoreRows(args.project, charId, args.includeGeneral !== false, args.limit ?? 500, { allCharacters: args.allCharacters, source: args.source });
+        const { project, rows, total } = readStoreRows(args.project, charId, args.includeGeneral !== false, args.limit ?? 500, { allCharacters: args.allCharacters, source: args.source });
         return ok({
             op: 'store_list',
             project,
             characterId: charId,
             allCharacters: Boolean(args.allCharacters),
             count: rows.length,
+            listed: rows.length,
+            total,
+            truncated: total > rows.length,
             results: rows.map(toStoreRecord),
         });
     }
