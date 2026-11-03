@@ -52,6 +52,13 @@ class AgentState {
    * 任何改变 energy 的操作先结算到当前时刻。
    */
   private energyUpdatedAt: number = Date.now();
+  /**
+   * Host-owned gauge. `setEnergy()` means "this is the value", not "start a
+   * decay from here": the mind pushes 100 − fatigue every tick and is the only
+   * thing that knows when she rests. Decaying between pushes made the diary
+   * read 59/100 after six quiet hours even though nothing had happened.
+   */
+  private energyMirror: boolean = false;
 
   // Mood events are signed impacts around a neutral baseline (0). A seven
   // hour half-life makes an isolated event return to baseline over time.
@@ -153,6 +160,7 @@ class AgentState {
    * 恢复只来自显式的 boostEnergy（合意活动/休息）。修改 mood/desire 不再影响这个读数。
    */
   getCurrentEnergy(): number {
+    if (this.energyMirror) return Math.round(Math.max(0, Math.min(100, this.energy)));
     const hoursSinceUpdate = (Date.now() - this.energyUpdatedAt) / (1000 * 60 * 60);
     const decayed = this.energy * Math.exp(-0.05 * hoursSinceUpdate);
     return Math.round(Math.max(0, Math.min(100, decayed)));
@@ -160,9 +168,25 @@ class AgentState {
 
   /** 把衰减结算进 this.energy，并把精力时钟拨到当前时刻。 */
   private settleEnergy(now: number = Date.now()): void {
+    if (this.energyMirror) { this.energyUpdatedAt = now; return; }
     const hours = Math.max(0, now - this.energyUpdatedAt) / (1000 * 60 * 60);
     this.energy = Math.max(0, Math.min(100, this.energy * Math.exp(-0.05 * hours)));
     this.energyUpdatedAt = now;
+  }
+
+  /**
+   * Mirror a gauge owned by the host (the mind's fatigue).
+   *
+   * The engine still needs a number for prompts it builds itself (the six-hour
+   * diary), but it must not invent its own: the mind is the only place that
+   * knows how tired she is. Set, do not add.
+   */
+  setEnergy(value: number): void {
+    const now = Date.now();
+    this.energy = Math.max(0, Math.min(100, Number.isFinite(value) ? Number(value) : 0));
+    this.energyMirror = true;
+    this.energyUpdatedAt = now;
+    this.lastUpdated = now;
   }
 
   /**

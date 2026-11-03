@@ -928,7 +928,12 @@ async function flushVadQueueInternal(project, opts = {}) {
                 // SQLite ordering, which may differ from the original enqueue order;
                 // the same durable evidence must therefore produce the same event ID.
                 const eventIds = pendingPsycheIds(batch.entries, batch.project, batch.characterId);
-                if (updatedForBatch > 0 && localVad && eventIds.length > 0) {
+                // With the switch off, the lexicon still tags the rows (they become
+                // `analyzed`), but it must not move the state machine: two estimators
+                // both failed the kappa gate. Previously the guard sat on
+                // finalizeAffectPsyche only, so the appraisal ran and the row stayed
+                // `pending_psyche`, which recovery re-enqueued for another analysis.
+                if (process.env.PSYCHE_FROM_VAD === 'on' && updatedForBatch > 0 && localVad && eventIds.length > 0) {
                     applyPsycheAppraisal(batch.characterId, batch.project, 
                     // The lexicon summarizes the current batch observation. Treating it
                     // as a delta would accumulate the same repeated wording toward a
@@ -944,8 +949,7 @@ async function flushVadQueueInternal(project, opts = {}) {
                         salience: batchSalience(batch.entries, batch.project, batch.characterId),
                     });
                     // 状态机默认不由 VAD 估计驱动（两个估计器都没过 κ≥0.4）。需要时显式 PSYCHE_FROM_VAD=on。
-                    if (process.env.PSYCHE_FROM_VAD === 'on')
-                        finalizeAffectPsyche(eventIds.map(memoryId => ({ memoryId })), batch.project, batch.characterId);
+                    finalizeAffectPsyche(eventIds.map(memoryId => ({ memoryId })), batch.project, batch.characterId);
                 }
                 continue;
             }
@@ -961,7 +965,7 @@ async function flushVadQueueInternal(project, opts = {}) {
             };
             smoothed.tsundere = smoothed.tsundere + EMOTION_SMOOTH_ALPHA * (result.tsundereLevel - smoothed.tsundere);
             // 批量分类 + 回写标签/VAD 到每条消息。必须 await：调用方 flush 完就能读到更新。
-            const updatedForBatch = await batchClassifyAndTag(batch.entries, batch.project, batch.characterId, true, result.vad);
+            const updatedForBatch = await batchClassifyAndTag(batch.entries, batch.project, batch.characterId, process.env.PSYCHE_FROM_VAD === 'on', result.vad);
             processed += updatedForBatch;
             if (updatedForBatch === 0) {
                 // A row can change between preflight validation and the SQLite UPDATE.

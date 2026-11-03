@@ -13,16 +13,24 @@
  * 门槛（宁缺勿滥）：问句必须同时(a)提到我/你, (b)命中谓词词表；然后只取
  * valid_to IS NULL 且未被推翻(superseded_by IS NULL) 的事实，按 confidence 取前 N 条。
  * 8 条噪音问句因此一条都进不来（它们不含这类谓词），实测见 eval_injection。
+ *
+ * 类型（2026-11-02）：来源过滤 ≠ 类型判断。排除日记/心力快照只回答"这条从哪来"，
+ * 回答不了"这条是现实陈述、角色设定，还是模型归纳"。旧实现把三类一起写成
+ * "以下是已经确认过的稳定事实"，等于给虚构设定与推测发事实证书。现在每条按
+ * factType.ts 的确定性规则打标（写入时落 `facts.fact_type`，老行读取时现算），
+ * 抬头只承诺"记忆库既有记录"，并对三类分别给出使用约束。
  */
 import { DatabaseManager, listMemTypeDirs } from './db.js';
 import { CHAR_ID, normalizeProject } from './env.js';
+import { FACT_BLOCK_LEGEND, FACT_TYPE_TAG, classifyFactType, isFactType, isPreferredFactType } from './factType.js';
+import type { FactType } from './factType.js';
 
 /** 问句 -> 谓词族。命中任一即认为"在问关于人/关系的稳定事实" */
 const PREDICATE_TRIGGERS: Array<{ family: string[]; hit: RegExp }> = [
   { family: ['习惯', '作息', '规律'], hit: /习惯|作息|规律|一般几点|每天都/ },
   { family: ['喜好', '偏好', '喜欢'], hit: /喜欢|偏好|爱好|爱吃|讨厌|不喜欢/ },
   { family: ['关系', '感情'], hit: /关系|我们|感情|对我|亲近|疏远/ },
-  { family: ['姓名', '名字', '称呼'], hit: /名字|叫什么|怎么称呼|生日|是谁/ },
+  { family: ['姓名', '名字', '称呼'], hit: /名字|叫什么|怎么称呼|生日/ },
   { family: ['职业', '工作', '技能'], hit: /工作|职业|做什么的|会什么|擅长|技能/ },
   { family: ['目标', '计划'], hit: /目标|计划|打算|想要什么|愿望/ },
   { family: ['承诺', '约定'], hit: /答应|承诺|约定|说好|保证/ },
@@ -40,6 +48,10 @@ export interface FactHit {
   object: string;
   confidence: number;
   updatedAt: string;
+  /** 现实陈述 / 角色设定 / 行为归纳 / 未分类 */
+  type: FactType;
+  /** 类型来自库里的 fact_type（写入时判定）还是读取时现算（老行） */
+  typeStored: boolean;
 }
 
 export interface FactRecallResult {
@@ -82,6 +94,7 @@ export function recallFactsForQuery(
     try {
       const rows = db.prepare(`
         SELECT f.id, f.subject, f.predicate, f.object, f.confidence,
+               f.fact_type, f.source_memory_source AS source,
                COALESCE(f.updated_at, f.created_at) AS updated_at
         FROM facts f
         LEFT JOIN memory source_memory ON source_memory.id = f.source_memory_id
@@ -98,6 +111,10 @@ export function recallFactsForQuery(
       for (const row of rows) {
         const text = String(row.object || '').trim();
         if (!text) continue;
+        const stored = String(row.fact_type ?? '').trim();
+        const type: FactType = isFactType(stored)
+          ? stored
+          : classifyFactType({ subject: row.subject, predicate: row.predicate, source: row.source });
         collected.push({
           id: String(row.id),
           subject: String(row.subject || ''),
@@ -105,6 +122,8 @@ export function recallFactsForQuery(
           object: text,
           confidence: Number(row.confidence) || 0,
           updatedAt: String(row.updated_at || ''),
+          type,
+          typeStored: isFactType(stored),
         });
       }
     }
@@ -113,11 +132,18 @@ export function recallFactsForQuery(
 
   if (collected.length === 0) return { ...empty, families };
 
-  // 去重（同一 subject+predicate+object 只会出现一次），再按置信度取前 N，最后守字数预算。
+  // 去重（同一 subject+predicate+object 只会出现一次），再取前 N，最后守字数预算。
+  // 排序 = confidence + 问句侧优先：设定类事实的置信度普遍更高（身份 0.95 / 态度 0.9
+  // 高于用户习惯 0.7），纯按 confidence 取前 N 时，"我有什么习惯"会先被角色设定占满。
+  // 偏移 0.3 只影响取哪几条，不改变取数上限，也不剔除任何类型：它表达的判断是
+  // "问句问的那一侧"比"置信度差 0.3 以内"更值得占一个槽位。
+  const FAMILY_MATCH_BONUS = 0.3;
+  const score = (fact: FactHit) =>
+    fact.confidence + (families.some(f => isPreferredFactType(f, fact.type)) ? FAMILY_MATCH_BONUS : 0);
   const seen = new Set<string>();
   const picked: FactHit[] = [];
   let chars = 0;
-  for (const fact of collected.sort((a, b) => b.confidence - a.confidence)) {
+  for (const fact of [...collected].sort((a, b) => score(b) - score(a))) {
     const key = `${fact.subject}\u0000${fact.predicate}\u0000${fact.object}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -130,11 +156,12 @@ export function recallFactsForQuery(
   if (picked.length === 0) return { ...empty, families };
 
   const body = picked.map(renderLine).join('\n');
-  const text = `以下是已经确认过的稳定事实（不是本轮对话内容，与你的人设冲突时以人设为准）：\n${body}`;
+  const text = `${FACT_BLOCK_LEGEND}\n${body}`;
   return { text, facts: picked, chars: text.length, families };
 }
 
 function renderLine(fact: FactHit): string {
   const who = fact.subject === 'agent' ? '她' : fact.subject === 'user' ? '用户' : fact.subject;
-  return `- ${who}·${fact.predicate}：${fact.object}（conf ${fact.confidence.toFixed(2)}）`;
+  const tag = FACT_TYPE_TAG[fact.type] ?? FACT_TYPE_TAG.unknown;
+  return `- [${tag}] ${who}·${fact.predicate}：${fact.object}（conf ${fact.confidence.toFixed(2)}）`;
 }

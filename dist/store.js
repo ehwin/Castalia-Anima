@@ -15,6 +15,7 @@ import { isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.
 import { parseTagsSafe, normalizeTagsForWrite, serializeTags } from './tags.js';
 import { estimatePredicateVolatility, needsEvidence, shouldSupersede } from './volatility.js';
 import { isDerivedMemorySource, isGeneratedSource, excludeRawMaterialSql } from './memoryProvenance.js';
+import { classifyFactType } from './factType.js';
 let saveCount = 0;
 const CONSOLIDATE_INTERVAL = 50;
 function serializeMetadata(value) {
@@ -809,16 +810,20 @@ export async function saveFacts(facts, sourceMemoryId = null, characterId = CHAR
       evidence = COALESCE(NULLIF(?, ''), evidence),
       valid_from = COALESCE(?, valid_from), valid_to = ?,
       source_memory_source = COALESCE(source_memory_source, ?),
-      source_memory_mem_type = COALESCE(source_memory_mem_type, ?)
+      source_memory_mem_type = COALESCE(source_memory_mem_type, ?),
+      fact_type = COALESCE(NULLIF(?, ''), fact_type)
     WHERE id = ?
   `);
     const insertFact = db.prepare(`
     INSERT INTO facts (id, subject, predicate, object, project, confidence, source_memory_id,
       source_memory_source, source_memory_mem_type, character_id, is_active, created_at,
-      updated_at, evidence, valid_from, valid_to)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+      updated_at, evidence, valid_from, valid_to, fact_type)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
   `);
     for (const f of facts) {
+        // 类型在写入点判定一次：来源只能说明"这条从哪来"，谓词/主语才说明"这是哪一类断言"。
+        const factType = f.factType
+            ?? classifyFactType({ subject: f.subject, predicate: f.predicate, source: sourceMemorySource });
         const existing = selectFact.get(f.subject, f.predicate, f.object, proj, cid);
         const factId = existing ? existing.id : generateId();
         if (existing) {
@@ -826,7 +831,7 @@ export async function saveFacts(facts, sourceMemoryId = null, characterId = CHAR
             // valid_from 排序的时间线上它仍排在接管它的那个值之前，会被立刻重新闭合 —— v1.23 的
             // "复写清空 valid_to" 就失效了（regression_v123_anima 7b）。显式给了 validFrom 时以调用方为准。
             const wasInvalidated = !!(existing.valid_to && String(existing.valid_to).length > 0) && !f.validFrom;
-            updateFact.run(f.confidence, now, f.evidence ?? '', f.validFrom ?? null, f.validTo ?? null, sourceMemorySource, sourceMemoryMemType, factId);
+            updateFact.run(f.confidence, now, f.evidence ?? '', f.validFrom ?? null, f.validTo ?? null, sourceMemorySource, sourceMemoryMemType, factType, factId);
             updated++;
             if (wasInvalidated) {
                 try {
@@ -842,7 +847,7 @@ export async function saveFacts(facts, sourceMemoryId = null, characterId = CHAR
             catch { /* 列未迁移 */ }
         }
         else {
-            insertFact.run(factId, f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId, sourceMemorySource, sourceMemoryMemType, cid, now, now, f.evidence ?? null, f.validFrom ?? now, f.validTo ?? null);
+            insertFact.run(factId, f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId, sourceMemorySource, sourceMemoryMemType, cid, now, now, f.evidence ?? null, f.validFrom ?? now, f.validTo ?? null, factType);
             inserted++;
         }
         // v1.27 实体层:事实一落库就登记实体 + 建立 fact/memory ↔ entity 关联,

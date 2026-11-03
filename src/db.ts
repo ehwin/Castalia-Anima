@@ -19,6 +19,7 @@ import * as sqliteVec from 'sqlite-vec';
 import { normalizeProject, CHAR_ID, isEmbedEnabled } from './env.js';
 import { normalizeMemType } from './memType.js';
 import { backfillEntities, reclassifyEntities } from './entities.js';
+import { classifyFactType } from './factType.js';
 
 /** memdir 分类文件夹名(memType → 目录名,general 为默认/元数据) */
 export function memTypeDir(memType?: string): string {
@@ -667,6 +668,10 @@ export function initProjectSchema(db: Database.Database) {
   // evidence after the split.
   try { db.exec(`ALTER TABLE facts ADD COLUMN source_memory_source TEXT`); } catch (_e) { /* already exists */ }
   try { db.exec(`ALTER TABLE facts ADD COLUMN source_memory_mem_type TEXT`); } catch (_e) { /* already exists */ }
+  // v1.31 事实类型：来源过滤只能挡住"这条是从日记来的"，挡不住"这条是模型猜的"。
+  // fact_type ∈ user_fact/canon/hypothesis/unknown，由 factType.ts 的确定性规则写入；
+  // 老行为 NULL 时读取侧现算（同一套规则），所以这条迁移不需要回填也不阻塞启动。
+  try { db.exec(`ALTER TABLE facts ADD COLUMN fact_type TEXT`); } catch (_e) { /* already exists */ }
   try { db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_source_memory_source ON facts(source_memory_source, is_active)`); } catch (_e) {}
 
   // v1.30: facts may live in the general partition while their source memory
@@ -700,18 +705,19 @@ export function initProjectSchema(db: Database.Database) {
         valid_to DATETIME,
         superseded_by TEXT,
         expired_at DATETIME,
-        evidence TEXT
+        evidence TEXT,
+        fact_type TEXT
       )`);
       db.exec(`INSERT INTO facts_without_memory_fk (
         id, subject, predicate, object, project, confidence, source_memory_id,
         source_memory_source, source_memory_mem_type, character_id, is_active,
         accessed_count, created_at, updated_at, valid_from, valid_to,
-        superseded_by, expired_at, evidence
+        superseded_by, expired_at, evidence, fact_type
       ) SELECT
         id, subject, predicate, object, project, confidence, source_memory_id,
         source_memory_source, source_memory_mem_type, character_id, is_active,
         accessed_count, created_at, updated_at, valid_from, valid_to,
-        superseded_by, expired_at, evidence
+        superseded_by, expired_at, evidence, fact_type
       FROM facts`);
       db.exec('DROP TABLE facts');
       db.exec('ALTER TABLE facts_without_memory_fk RENAME TO facts');
@@ -719,6 +725,34 @@ export function initProjectSchema(db: Database.Database) {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_facts_source_memory_source ON facts(source_memory_source, is_active)`);
   } catch (e: any) {
     console.error(`[db] facts 跨 memType 外键迁移失败: ${e.message}`);
+  }
+
+  // fact_type 回填：新列默认 NULL，读取侧能现算，但让库里的值成为唯一事实更可靠
+  // （面板、MCP 工具、导出都读这一列，不都走事实路）。规则与写入/读取同一套，
+  // 幂等：没有 NULL 行时只做一次 COUNT，不写库。不调 LLM、不算向量。
+  try {
+    const pending = db.prepare(
+      "SELECT COUNT(*) c FROM facts WHERE fact_type IS NULL OR fact_type = ''",
+    ).get() as any;
+    if (Number(pending?.c || 0) > 0) {
+      const rows = db.prepare(
+        "SELECT id, subject, predicate, source_memory_source FROM facts WHERE fact_type IS NULL OR fact_type = ''",
+      ).all() as any[];
+      const update = db.prepare('UPDATE facts SET fact_type = ? WHERE id = ?');
+      const backfill = db.transaction((list: any[]) => {
+        for (const row of list) {
+          update.run(classifyFactType({
+            subject: row.subject,
+            predicate: row.predicate,
+            source: row.source_memory_source,
+          }), row.id);
+        }
+      });
+      backfill(rows);
+    }
+  } catch (e: any) {
+    // 回填失败不阻塞启动：读取侧仍会现算，只是库里这一列为空。
+    console.error(`[db] fact_type 回填失败: ${e.message}`);
   }
 
   // v1.29 情感锚点 + 访问日志(2026-10-30)
@@ -959,11 +993,12 @@ export class DatabaseManager {
       return DatabaseManager.open('__legacy__', legacyDbPath()!, initProjectSchema);
     }
     const mt = normalizeMemType(memType);
-    const db = DatabaseManager.open(
-      `project:${proj}:${mt}`,
-      path.join(memDir(), safeFilePart(proj), memTypeDir(mt), 'memory.sqlite'),
-      initProjectSchema,
-    );
+    // v1.32: 连接缓存按**绝对路径**做键。MEMORY_DB_DIR 会在运行期被宿主改写
+    // （castalia-plugin 的 openBank 换 bank 只改环境变量，不重启进程），
+    // 旧键 `project:<项目>:<分类>` 不含目录 —— 换库后键不变，getInstance 会把
+    // 上一个 bank 的连接原样返回，写入静默落到旧库（回归：scripts/regression_multibank.mjs）。
+    const dbPath = path.join(memDir(), safeFilePart(proj), memTypeDir(mt), 'memory.sqlite');
+    const db = DatabaseManager.open(dbPath, dbPath, initProjectSchema);
     // 项目注册表(global.sqlite):懒加载登记
     try {
       const g = DatabaseManager.getGlobal();
@@ -1004,7 +1039,9 @@ export class DatabaseManager {
   /** 全局库(global.sqlite):L1/L2 指令 + rule 规则组 + 项目注册表。兼容模式下返回单库。 */
   public static getGlobal(): Database.Database {
     if (isLegacyMode()) return DatabaseManager.getInstance();
-    return DatabaseManager.open('global', path.join(memDir(), 'global.sqlite'), initGlobalSchema);
+    // 与项目库同理：global.sqlite 也跟着 MEMORY_DB_DIR 走，键必须是解析后的路径。
+    const globalPath = path.join(memDir(), 'global.sqlite');
+    return DatabaseManager.open(globalPath, globalPath, initGlobalSchema);
   }
 
   private static open(key: string, dbPath: string, init: (db: Database.Database) => void): Database.Database {

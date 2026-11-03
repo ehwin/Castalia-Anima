@@ -228,8 +228,19 @@ function latestDiary(project, characterId) {
         return null;
     }
 }
-function formatDiary(state, psyche, conversations) {
-    const ownMood = state.currentMood >= 0 ? `+${state.currentMood.toFixed(1)}` : state.currentMood.toFixed(1);
+export function formatDiary(state, psyche, conversations, energyOverride) {
+    const energy = Number.isFinite(energyOverride)
+        ? Math.max(0, Math.min(100, Number(energyOverride)))
+        : state.energy;
+    // One number, one source. When the interaction sensor has evidence, its
+    // band is the mood; the legacy -10..10 scalar is the fallback only. Before
+    // this the diary printed the legacy value even when the sensor disagreed,
+    // so one entry could say "neutral" and "+8" at the same time.
+    const sensed = psyche.hasEvidence
+        ? (psyche.band === 'neutral' ? 0 : psyche.vad.valence * 10)
+        : state.currentMood;
+    const moodSource = psyche.hasEvidence ? '互动传感器' : '旧量表';
+    const ownMood = sensed >= 0 ? `+${sensed.toFixed(1)}` : sensed.toFixed(1);
     const interaction = psyche.hasEvidence
         ? `v=${psyche.vad.valence.toFixed(2)} a=${psyche.vad.arousal.toFixed(2)} d=${psyche.vad.dominance.toFixed(2)}`
         : 'unknown（暂无已分析的互动证据）';
@@ -241,7 +252,7 @@ function formatDiary(state, psyche, conversations) {
         .filter(Boolean);
     const lines = [
         '[自循环日记]',
-        `角色自我状态：情绪指数 ${ownMood}；精力：${state.energy}/100。`,
+        `角色自我状态：情绪指数 ${ownMood}（${moodSource}）；精力：${energy}/100。`,
         `本轮互动状态估计：${psyche.hasEvidence ? psyche.band : 'unknown'}（${interaction}）。这是互动传感器估计，不是用户事实。`,
     ];
     if (state.currentDesire)
@@ -312,7 +323,7 @@ async function runSelfCycleOnce(options = {}) {
     let diary;
     try {
         diary = await saveSelfDiary({
-            text: formatDiary(state, psyche, evidence),
+            text: formatDiary(state, psyche, evidence, options.energy),
             project,
             characterId,
             evidenceIds,

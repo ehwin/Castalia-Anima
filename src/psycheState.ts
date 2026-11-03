@@ -49,6 +49,14 @@ export interface PsycheState {
   band: AffectBand;
   updatedAt: number;
   processedEventIds: string[];
+  /**
+   * 负性偏向倍率，冻结在最近一次被采纳的事件上（1 = 不减速）。
+   *
+   * 倍率原本按「此刻 valence 是否低于基线」逐次选择；轨迹一旦在一步中间穿过
+   * 基线，长步与分段读取就会选到不同的系数，读的次数又会改变结果。把倍率
+   * 记成事件属性后，两次事件之间系数恒定，任意切分严格等价。
+   */
+  valenceBias?: number;
 }
 
 export interface PsycheTransitionOptions {
@@ -185,11 +193,16 @@ const DEFAULT_HALF_LIFE: PsycheVAD = {
 /**
  * 慢层心境半衰期（同样是 H，不是 τ）。valence 来自 E2 两层拟合的 τs≈66h
  * → H = 66 × ln2 = **45.75h**；其余两维没有数据，按快层的 ~4 倍取整，等有数据再标定。
+ *
+ * **默认关闭（0 = 退回单层）**，这是产品决定，不是拟合结论：
+ * 留出预测上两层相对单层没有明确改善，短间隔的收益只是探索性结果
+ * （见 2026-10-31 代码落地评估）。要复现论文里的慢层，显式设
+ * `PSYCHE_MOOD_HALF_LIFE_VALENCE_HOURS=45.75`（arousal 16 / dominance 144）。
  */
 const DEFAULT_MOOD_HALF_LIFE: PsycheVAD = {
-  valence: 45.75,
-  arousal: 16,
-  dominance: 144,
+  valence: 0,
+  arousal: 0,
+  dominance: 0,
 };
 
 function clamp(value: number, min = -1, max = 1): number {
@@ -300,11 +313,55 @@ function stepTwoLayer(
     const next = decay(current, baseline, elapsedHours, halfLifeFast);
     return { vad: next, mood: next };
   }
-  const integrate = 1 - Math.pow(0.5, elapsedHours / tau);
-  const integrated = mood + (current - mood) * integrate;
-  const moodNext = relaxToward(integrated, baseline, elapsedHours, tau * Math.max(1, relaxRatio));
-  const vadNext = relaxToward(current, moodNext, elapsedHours, halfLifeFast);
-  return { vad: vadNext, mood: moodNext };
+  // Closed form of the two-layer system, not a per-call relaxation.
+  //
+  //   x' = -kf (x - m)              fast layer returns to the mood
+  //   m' =  ks (x - m) - kl (m - b) mood integrates the feeling and relaxes to the baseline
+  //
+  // The previous implementation composed three exponential relaxations per
+  // call. That is a first-order splitting of this system: accurate for one
+  // small step, but not a semigroup, so 288 five-minute reads and one
+  // twenty-four-hour read ended in different places. Reading the state is a
+  // side effect here (getPsycheState advances it), so the panel's polling
+  // changed the mood it was polling. Solving the linear system exactly makes
+  // every partition of the same interval land on the same value.
+  const kf = halfLifeFast > 0 ? Math.LN2 / halfLifeFast : 0;
+  const ks = Math.LN2 / tau;
+  const kl = ks / Math.max(1, relaxRatio);
+  const u0 = current - baseline;
+  const v0 = mood - baseline;
+
+  if (kf <= 1e-12) {
+    // No fast decay: x stands still, m relaxes toward it and the baseline.
+    const eq = ks * u0 / (ks + kl);
+    const v = eq + (v0 - eq) * Math.exp(-(ks + kl) * elapsedHours);
+    return { vad: current, mood: baseline + v };
+  }
+
+  const s = kf + ks + kl;
+  const d = Math.sqrt(Math.max(0, s * s - 4 * kf * kl));
+  const l1 = (-s + d) / 2;
+  const l2 = (-s - d) / 2;
+
+  if (d < 1e-12) {
+    // Repeated eigenvalue: (c1 + c2 t) e^(lt).
+    const l = -s / 2;
+    const c2 = kf * v0 - (l + kf) * u0;
+    const e = Math.exp(l * elapsedHours);
+    const u = (u0 + c2 * elapsedHours) * e;
+    const v = (v0 + ((l + kf) / kf) * c2 * elapsedHours) * e;
+    return { vad: baseline + u, mood: baseline + v };
+  }
+
+  const a1 = (kf + l1) / kf;
+  const a2 = (kf + l2) / kf;
+  const c1 = (v0 - a2 * u0) / (a1 - a2);
+  const c2 = u0 - c1;
+  const e1 = Math.exp(l1 * elapsedHours);
+  const e2 = Math.exp(l2 * elapsedHours);
+  const u = c1 * e1 + c2 * e2;
+  const v = c1 * a1 * e1 + c2 * a2 * e2;
+  return { vad: baseline + u, mood: baseline + v };
 }
 
 /**
@@ -363,6 +420,7 @@ export function createPsycheState(
     band: 'neutral',
     updatedAt: now,
     processedEventIds: [],
+    valenceBias: 1,
   };
 }
 
@@ -386,9 +444,10 @@ export function transitionPsycheState(
   const salience = clamp(finite(options.salience) ?? previous.salience, 0, 1);
   const persistence = clamp(1 + Math.max(0, tuning.saliencePersistence) * salience, 1, 4);
   // 负向偏离退得更慢（负性偏向）。只作用在 valence：它才有明确的好坏方向。
-  const valencePersistence = previous.vad.valence < previous.baseline.valence
-    ? Math.max(1, tuning.negativePersistence)
-    : 1;
+  const frozenBias = finite(previous.valenceBias);
+  const valencePersistence = frozenBias !== undefined
+    ? Math.max(1, frozenBias)
+    : (previous.vad.valence < previous.baseline.valence ? Math.max(1, tuning.negativePersistence) : 1);
   const decayed: PsycheVAD = {
     valence: 0,
     arousal: 0,
@@ -483,6 +542,13 @@ export function transitionPsycheState(
     }
   }
 
+  // With the slow layer off, mood *is* the emotion. The event updated `next`
+  // after `moodNext` was solved, so without this the same instant reported two
+  // states (vad 0.06, mood 0.40) until the next read caught up.
+  if (!(tuning.moodHalfLife.valence > 0)) moodNext.valence = next.valence;
+  if (!(tuning.moodHalfLife.arousal > 0)) moodNext.arousal = next.arousal;
+  if (!(tuning.moodHalfLife.dominance > 0)) moodNext.dominance = next.dominance;
+
   const processedEventIds = [...seen];
   // An absolute target is still observed evidence. Without this branch the
   // Ollama path could move `vad` while callers kept treating the state as
@@ -532,6 +598,9 @@ export function transitionPsycheState(
       : 'neutral',
     updatedAt: effectiveNow,
     processedEventIds,
+    valenceBias: shouldApply
+      ? (next.valence < previous.baseline.valence ? Math.max(1, tuning.negativePersistence) : 1)
+      : valencePersistence,
   };
 }
 

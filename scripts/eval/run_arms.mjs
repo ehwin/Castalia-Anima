@@ -26,8 +26,11 @@
  *   --out <file>      把完整结果（含逐条排名）写进 JSON。
  *   --keep            保留臂副本（排障用），默认跑完即删。
  *   --json            只打 JSON（供别的脚本消费）。
+ *   --pin-baseline    把当前库指纹写进 expected.json（只在冻结快照上做一次）。
+ *   --allow-unpinned-baseline  基线没有库指纹时仍按 hit1 判定（本地排障用）。
  *
- * 退出码：0 = default 臂不低于 expected.json 的命中@1 − 2pp；
+ * 退出码：0 = default 臂不低于 expected.json 的命中@1 − 2pp（跳闸线，不是等价检验；
+ *         69 条上 2pp 落在 ±10.5pp 的噪声里，配对判据见 scripts/eval/paired_recall.mjs）；
  *         1 = 低于；2 = 环境/参数错误（缺 dist、缺查询集、库不存在）。
  *
  * 纪律（README 里也写了，因为这是踩出来的）：
@@ -37,12 +40,82 @@
  *   3) 金标是「查询=原文片段」，词法通道天然容易命中；它测的是「权重会不会把正确的
  *      行挤下去」，不是绝对检索难度。别拿它当线上效果。
  */
+import crypto from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
+
+
+function sha256File(file) {
+  try {
+    return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex').slice(0, 16);
+  }
+  catch { return null; }
+}
+
+/** Content hash of the build under test: names + bytes, not mtimes. */
+function hashBuild(dir) {
+  try {
+    const files = fs.readdirSync(dir, { recursive: true })
+      .filter(f => /\.(mjs|js|cjs|json)$/.test(f))
+      .sort();
+    const h = crypto.createHash('sha256');
+    for (const f of files) {
+      h.update(f);
+      h.update(fs.readFileSync(path.join(dir, f)));
+    }
+    return { hash: h.digest('hex').slice(0, 16), files: files.length };
+  }
+  catch { return null; }
+}
+
+/**
+ * Identity of the library actually evaluated.
+ *
+ * Build + query-set hashes are not enough: two different banks (a frozen copy
+ * and the live one) produce the same report fingerprint, and their scores are
+ * not comparable. This covers <root>/<project>/<character>/*.sqlite (+ -wal).
+ * -shm is volatile and excluded.
+ */
+function dbIdentity(root, project, character) {
+  // Libraries live at <root>/<project>/<memtype>.sqlite; some deployments add a
+  // character directory. Use whichever exists, and always seed the character.
+  const withCharacter = path.join(root, project, character);
+  const dir = fs.existsSync(withCharacter) ? withCharacter : path.join(root, project);
+  try {
+    const files = fs.readdirSync(dir, { recursive: true })
+      .filter(f => /\.sqlite$|\.sqlite-wal$/.test(String(f)))
+      .sort();
+    const h = crypto.createHash('sha256');
+    h.update(`${project}|${character}`);
+    let bytes = 0;
+    for (const f of files) {
+      const full = path.join(dir, String(f));
+      const stat = fs.statSync(full);
+      bytes += stat.size;
+      h.update(String(f));
+      h.update(String(stat.size));
+      h.update(fs.readFileSync(full));
+    }
+    return { dir, project, character, files: files.length, bytes, hash: h.digest('hex').slice(0, 16) };
+  }
+  catch (e) {
+    return { dir, project, character, error: String(e?.message || e) };
+  }
+}
+
+function gitInfo() {
+  try {
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const dirty = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim().length > 0;
+    return { head: head.slice(0, 12), dirty };
+  }
+  catch { return null; }
+}
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..', '..');
@@ -64,7 +137,7 @@ function parseArgs(argv) {
   const out = {
     db: '', project: 'airi', character: '', arms: 'default', dist: path.join(REPO, 'dist'),
     topk: 10, embed: 'none', out: '', keep: false, json: false,
-    child: '', childOut: '',
+    child: '', childOut: '', allowUnpinned: false, pinBaseline: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -79,6 +152,8 @@ function parseArgs(argv) {
     else if (a === '--out') out.out = next();
     else if (a === '--keep') out.keep = true;
     else if (a === '--json') out.json = true;
+    else if (a === '--allow-unpinned-baseline') out.allowUnpinned = true;
+    else if (a === '--pin-baseline') out.pinBaseline = true;
     // 内部：子进程模式
     else if (a === '--_child') out.child = next();
     else if (a === '--_child-out') out.childOut = next();
@@ -236,6 +311,16 @@ async function main() {
   }
 
   const expected = fs.existsSync(EXP_PATH) ? JSON.parse(fs.readFileSync(EXP_PATH, 'utf8')) : null;
+  const db = dbIdentity(opts.db, opts.project, opts.character);
+  if (!expected) { console.error('缺少 expected.json，无法判定门禁'); process.exit(2); }
+  if (opts.pinBaseline) {
+    if (!db.hash) { console.error('库指纹计算失败，拒绝 pin 基线'); process.exit(2); }
+    fs.writeFileSync(EXP_PATH, JSON.stringify({ ...expected, dbHash: db.hash, dbProject: opts.project, dbCharacter: opts.character, pinnedAt: new Date().toISOString() }, null, 2) + '\n');
+    console.log(`已把当前库指纹写进 expected.json: ${db.hash}（${opts.project}/${opts.character}）`);
+    process.exit(0);
+  }
+  const baselineHash = expected.dbHash;
+  const comparable = Boolean(baselineHash) && baselineHash === db.hash;
   let gate = null;
   if (expected && base && !base.failed) {
     const floor = expected.hit1 - 0.02;
@@ -243,12 +328,23 @@ async function main() {
     // expected.json 里写了这条，但代码原来只是打印（评审 P3-5）。
     const constArm = byArm.get('constant');
     const constLimit = 0.05;
+    const floorOk = base.hit1 >= floor && (!constArm || constArm.failed || constArm.hit1 <= constLimit);
     gate = {
       期望命中1: expected.hit1, 下限: +floor.toFixed(3), 实测命中1: base.hit1,
       常数臂命中1: constArm && !constArm.failed ? constArm.hit1 : null,
       常数臂上限: constLimit,
-      ok: base.hit1 >= floor && (!constArm || constArm.failed || constArm.hit1 <= constLimit),
+      可比: comparable,
+      基线库指纹: baselineHash ?? null,
+      当前库指纹: db.hash ?? null,
+      ok: floorOk && (comparable || opts.allowUnpinned),
     };
+    if (!comparable) {
+      gate.原因 = baselineHash
+        ? `库指纹不同（基线 ${baselineHash} vs 当前 ${db.hash}）—— 两组分数不可比`
+        : '基线未记录库指纹：先跑一次 --pin-baseline（冻结快照上）或显式传 --allow-unpinned-baseline';
+      if (opts.allowUnpinned)
+        gate.原因 += '（本次已忽略，结果不得当作基线成绩）';
+    }
     if (constArm && !constArm.failed && constArm.hit1 > constLimit) {
       gate.原因 = `常数基线臂命中@1=${constArm.hit1} > ${constLimit} —— 金标太宽，先修查询集`;
     }
@@ -258,9 +354,21 @@ async function main() {
     _meta: {
       脚本: 'scripts/eval/run_arms.mjs',
       构建: opts.dist,
+      // A path is not an identity: the same path can be rebuilt from different
+      // sources. The hash is what makes two score lines comparable.
+      构建哈希: hashBuild(opts.dist),
+      受测库: db,
+      git: gitInfo(),
       查询集: `queries.gold.json（${QS.总数} 条）`,
+      查询集哈希: sha256File(path.join(HERE, 'queries.gold.json')),
+      期望哈希: sha256File(EXP_PATH),
       嵌入: opts.embed,
       topK: opts.topk,
+      分母: { 查询数: QS.总数, 命中口径: 'Hit@1：正确 id 出现在第 1 位' },
+      适用范围: '原文片段检索；拦截权重/常量回归，不代表用户改写查询的线上效果',
+      判据: '门禁 = 命中@1 ≥ expected.hit1 − 2pp，只作大幅回归的跳闸；69 条上 2pp 不可分辨，配对显著性见 scripts/eval/paired_recall.mjs',
+      批次敏感: '换库/换卡后不得与旧分数直接比较',
+      撤回: false,
       生成时间: new Date().toISOString(),
     },
     各臂: results.map(({ perQuery, ...rest }) => ({ ...rest, 逐条: perQuery ?? [] })),
@@ -287,7 +395,7 @@ async function main() {
       console.log('\n（没有 expected.json，跳过门禁）');
     }
   }
-  process.exit(gate && !gate.ok ? 1 : 0);
+  process.exit(!gate ? 0 : gate.ok ? 0 : (gate.可比 === false && !opts.allowUnpinned) ? 3 : 1);
 }
 
 main().catch(e => { console.error(e?.stack || String(e)); process.exit(2); });

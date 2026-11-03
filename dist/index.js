@@ -252,7 +252,27 @@ const TOOL_GROUP_OF = {};
 for (const [g, tools] of Object.entries(TOOL_GROUPS))
     for (const t of tools)
         TOOL_GROUP_OF[t] = g;
+// 联邦工具（跨库检索 / 跨库总反思）只在真的有成员时挂出来。
+// 目的：让 full 独占联邦管线，std/anima 不靠删代码来"阉割"——删掉的代码下次合并就丢了。
+//   CASTALIA_FEDERATION=0 强制关；=1 强制开；不设 → 看 FEDERATION_MEMBERS/DIRS 是否配置。
+const FEDERATION_TOOLS = new Set(['memory_search_all', 'reflect_all']);
+function federationEnabled() {
+    if (process.env.CASTALIA_FEDERATION === '0')
+        return false;
+    if (process.env.CASTALIA_FEDERATION === '1')
+        return true;
+    const configured = (v) => {
+        const s = (v ?? '').trim();
+        return s.length > 0 && s !== '[]' && s !== '""';
+    };
+    return configured(process.env.FEDERATION_MEMBERS) || configured(process.env.FEDERATION_DIRS);
+}
 function shouldRegister(name) {
+    if (FEDERATION_TOOLS.has(name) && !federationEnabled()) {
+        if (process.env.MCP_LOG_TOOLS === '1')
+            console.error(`[tools] skipped: ${name} (federation not configured)`);
+        return false;
+    }
     if (TOOL_ALLOWLIST === null)
         return true;
     if (TOOL_ALLOWLIST.has(name))

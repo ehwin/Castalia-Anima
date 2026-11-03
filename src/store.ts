@@ -16,6 +16,8 @@ import { MemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from '.
 import { parseTagsSafe, normalizeTagsForWrite, serializeTags } from './tags.js';
 import { estimatePredicateVolatility, needsEvidence, shouldSupersede } from './volatility.js';
 import { isDerivedMemorySource, isGeneratedSource, excludeRawMaterialSql } from './memoryProvenance.js';
+import { classifyFactType } from './factType.js';
+import type { FactType } from './factType.js';
 
 let saveCount = 0;
 const CONSOLIDATE_INTERVAL = 50;
@@ -865,7 +867,7 @@ export interface FactRecord {
  *   - 不同 S-P-O → 正常插入
  */
 export async function saveFacts(
-  facts: { subject: string; predicate: string; object: string; confidence: number; evidence?: string; validFrom?: string; validTo?: string }[],
+  facts: { subject: string; predicate: string; object: string; confidence: number; evidence?: string; validFrom?: string; validTo?: string; factType?: FactType }[],
   sourceMemoryId: string | null = null,
   characterId: string = CHAR_ID,
   project?: string,  // v1.5: 项目隔离
@@ -931,17 +933,21 @@ export async function saveFacts(
       evidence = COALESCE(NULLIF(?, ''), evidence),
       valid_from = COALESCE(?, valid_from), valid_to = ?,
       source_memory_source = COALESCE(source_memory_source, ?),
-      source_memory_mem_type = COALESCE(source_memory_mem_type, ?)
+      source_memory_mem_type = COALESCE(source_memory_mem_type, ?),
+      fact_type = COALESCE(NULLIF(?, ''), fact_type)
     WHERE id = ?
   `);
   const insertFact = db.prepare(`
     INSERT INTO facts (id, subject, predicate, object, project, confidence, source_memory_id,
       source_memory_source, source_memory_mem_type, character_id, is_active, created_at,
-      updated_at, evidence, valid_from, valid_to)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+      updated_at, evidence, valid_from, valid_to, fact_type)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
   `);
 
   for (const f of facts) {
+    // 类型在写入点判定一次：来源只能说明"这条从哪来"，谓词/主语才说明"这是哪一类断言"。
+    const factType: FactType = f.factType
+      ?? classifyFactType({ subject: f.subject, predicate: f.predicate, source: sourceMemorySource });
     const existing = selectFact.get(f.subject, f.predicate, f.object, proj, cid) as any;
     const factId = existing ? existing.id : generateId();
     if (existing) {
@@ -951,7 +957,7 @@ export async function saveFacts(
       const wasInvalidated = !!(existing.valid_to && String(existing.valid_to).length > 0) && !f.validFrom;
       updateFact.run(
         f.confidence, now, f.evidence ?? '', f.validFrom ?? null, f.validTo ?? null,
-        sourceMemorySource, sourceMemoryMemType, factId,
+        sourceMemorySource, sourceMemoryMemType, factType, factId,
       );
       updated++;
       if (wasInvalidated) {
@@ -964,7 +970,7 @@ export async function saveFacts(
       insertFact.run(
         factId, f.subject, f.predicate, f.object, proj, f.confidence, sourceMemoryId,
         sourceMemorySource, sourceMemoryMemType, cid, now, now,
-        f.evidence ?? null, f.validFrom ?? now, f.validTo ?? null,
+        f.evidence ?? null, f.validFrom ?? now, f.validTo ?? null, factType,
       );
       inserted++;
     }
