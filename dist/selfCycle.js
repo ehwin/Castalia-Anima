@@ -236,11 +236,15 @@ export function formatDiary(state, psyche, conversations, energyOverride) {
     // band is the mood; the legacy -10..10 scalar is the fallback only. Before
     // this the diary printed the legacy value even when the sensor disagreed,
     // so one entry could say "neutral" and "+8" at the same time.
+    // Absence is not zero. The legacy scalar is only written by `autoProcess(moodValue)`, and this
+    // app never passes one, so the fallback printed "+0.0（旧量表）" on every entry as if it were a
+    // measurement (2026-10-31 report §2.3: unknown, abstain and neutral are different states).
+    const hasMood = psyche.hasEvidence || (state.moodHistory?.length ?? 0) > 0;
     const sensed = psyche.hasEvidence
         ? (psyche.band === 'neutral' ? 0 : psyche.vad.valence * 10)
         : state.currentMood;
-    const moodSource = psyche.hasEvidence ? '互动传感器' : '旧量表';
-    const ownMood = sensed >= 0 ? `+${sensed.toFixed(1)}` : sensed.toFixed(1);
+    const moodSource = psyche.hasEvidence ? '互动传感器' : hasMood ? '旧量表' : '暂无评估';
+    const ownMood = hasMood ? (sensed >= 0 ? `+${sensed.toFixed(1)}` : sensed.toFixed(1)) : 'unknown';
     const interaction = psyche.hasEvidence
         ? `v=${psyche.vad.valence.toFixed(2)} a=${psyche.vad.arousal.toFixed(2)} d=${psyche.vad.dominance.toFixed(2)}`
         : 'unknown（暂无已分析的互动证据）';

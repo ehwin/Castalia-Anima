@@ -289,8 +289,11 @@ export function transitionPsycheState(previous, appraisal, now = Date.now(), opt
     // 重要性延长持续时间（rumination）：Verduyn & Lavrijsen 2014 的实测结论是
     // 「持续时间由事件重要性与反刍决定」，不是由情绪维度决定。这里把 importance
     // 直接接到半衰期上，而不是给 V/A/D 各配一个固定常数。
-    const salience = clamp(finite(options.salience) ?? previous.salience, 0, 1);
-    const persistence = clamp(1 + Math.max(0, tuning.saliencePersistence) * salience, 1, 4);
+    // 过去这段时间由「上一条证据的重要性」统治：新事件的重要性不能回头改写它没有参与过的衰减，
+    // 否则同一初始状态「等四小时再应用事件」和「先读一次再应用同一事件」会得到两条轨迹。
+    const previousSalience = clamp(finite(previous.salience) ?? 0, 0, 1);
+    const salience = clamp(finite(options.salience) ?? previousSalience, 0, 1);
+    const persistence = clamp(1 + Math.max(0, tuning.saliencePersistence) * previousSalience, 1, 4);
     // 负向偏离退得更慢（负性偏向）。只作用在 valence：它才有明确的好坏方向。
     const frozenBias = finite(previous.valenceBias);
     const valencePersistence = frozenBias !== undefined
@@ -410,8 +413,10 @@ export function transitionPsycheState(previous, appraisal, now = Date.now(), opt
         ? (effectiveNow - previous.lastEvidenceAt) / 3600000
         : Number.POSITIVE_INFINITY;
     const evidenceFresh = previous.hasEvidence && evidenceAgeHours <= evidenceTtlHours;
-    const observedNow = statusAccepted
-        && (effectiveKind === 'event' || effectiveKind === 'target' || effectiveKind === 'neutral');
+    // 重放同一条事件不算「此刻观测到情绪」：它没有更新 last_evidence_at，却会把已经过期的证据
+    // 重新点亮（hasEvidence 变 true，而证据时间还是旧的）。
+    const observedNow = statusAccepted && !duplicate
+        && (effectiveKind === 'event' || effectiveKind === 'target' || effectiveKind === 'neutral' || effectiveKind === 'state_neutral');
     const hasEvidence = observedNow || evidenceFresh;
     const lastEvidenceAt = shouldApply ? effectiveNow : previous.lastEvidenceAt;
     const holdNeutralBand = previous.hasEvidence
@@ -499,6 +504,8 @@ function parsePersistedStateRow(row) {
     const hasEvidence = Number(row.has_evidence) === 1;
     const storedEvidenceAt = Number(row.last_evidence_at);
     const storedSalience = Number(row.salience);
+    // 冻结的负性衰减倍率。旧行没有这一列：1 就是「没有冻结」，与内存初值一致。
+    const storedBias = Number(row.valence_bias);
     return {
         version: Math.max(1, Number(row.version) || 1),
         hasEvidence,
@@ -515,6 +522,7 @@ function parsePersistedStateRow(row) {
         band: row.band === 'positive' || row.band === 'negative' ? row.band : 'neutral',
         updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
         processedEventIds: processed,
+        valenceBias: Number.isFinite(storedBias) && storedBias >= 1 ? storedBias : 1,
     };
 }
 function readPersistedStateFromDb(db, characterId, project) {
@@ -522,7 +530,7 @@ function readPersistedStateFromDb(db, characterId, project) {
     SELECT version, has_evidence, baseline_valence, baseline_arousal, baseline_dominance,
            vad_valence, vad_arousal, vad_dominance,
            mood_valence, mood_arousal, mood_dominance,
-           band, updated_at, last_evidence_at, processed_event_ids, salience
+           band, updated_at, last_evidence_at, processed_event_ids, salience, valence_bias
     FROM psyche_state WHERE project = ? AND character_id = ?
   `).get(project, characterId);
     return parsePersistedStateRow(row);
@@ -552,8 +560,8 @@ function persistState(characterId, project, state) {
         baseline_valence, baseline_arousal, baseline_dominance,
         vad_valence, vad_arousal, vad_dominance,
         mood_valence, mood_arousal, mood_dominance,
-        band, updated_at, last_evidence_at, processed_event_ids, salience
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        band, updated_at, last_evidence_at, processed_event_ids, salience, valence_bias
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(project, character_id) DO UPDATE SET
         version = excluded.version,
         has_evidence = excluded.has_evidence,
@@ -570,8 +578,9 @@ function persistState(characterId, project, state) {
         updated_at = excluded.updated_at,
         last_evidence_at = excluded.last_evidence_at,
         processed_event_ids = excluded.processed_event_ids,
-        salience = excluded.salience
-    `).run(proj, characterId, state.version, state.hasEvidence ? 1 : 0, state.baseline.valence, state.baseline.arousal, state.baseline.dominance, state.vad.valence, state.vad.arousal, state.vad.dominance, state.mood.valence, state.mood.arousal, state.mood.dominance, state.band, state.updatedAt, state.lastEvidenceAt, JSON.stringify(state.processedEventIds), state.salience);
+        salience = excluded.salience,
+        valence_bias = excluded.valence_bias
+    `).run(proj, characterId, state.version, state.hasEvidence ? 1 : 0, state.baseline.valence, state.baseline.arousal, state.baseline.dominance, state.vad.valence, state.vad.arousal, state.vad.dominance, state.mood.valence, state.mood.arousal, state.mood.dominance, state.band, state.updatedAt, state.lastEvidenceAt, JSON.stringify(state.processedEventIds), state.salience, Math.max(1, finite(state.valenceBias) ?? 1));
         persistWarnings.delete(stateKey(characterId, project));
         return true;
     }
@@ -673,8 +682,8 @@ export function applyPsycheAppraisal(characterId, project, appraisal, now = Date
           baseline_valence, baseline_arousal, baseline_dominance,
           vad_valence, vad_arousal, vad_dominance,
           mood_valence, mood_arousal, mood_dominance,
-          band, updated_at, last_evidence_at, processed_event_ids, salience
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          band, updated_at, last_evidence_at, processed_event_ids, salience, valence_bias
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(project, character_id) DO UPDATE SET
           version = excluded.version,
           has_evidence = excluded.has_evidence,
@@ -691,8 +700,9 @@ export function applyPsycheAppraisal(characterId, project, appraisal, now = Date
           updated_at = excluded.updated_at,
           last_evidence_at = excluded.last_evidence_at,
           processed_event_ids = excluded.processed_event_ids,
-          salience = excluded.salience
-      `).run(proj, characterId, next.version, next.hasEvidence ? 1 : 0, next.baseline.valence, next.baseline.arousal, next.baseline.dominance, next.vad.valence, next.vad.arousal, next.vad.dominance, next.mood.valence, next.mood.arousal, next.mood.dominance, next.band, next.updatedAt, next.lastEvidenceAt, JSON.stringify(next.processedEventIds), next.salience);
+          salience = excluded.salience,
+          valence_bias = excluded.valence_bias
+      `).run(proj, characterId, next.version, next.hasEvidence ? 1 : 0, next.baseline.valence, next.baseline.arousal, next.baseline.dominance, next.vad.valence, next.vad.arousal, next.vad.dominance, next.mood.valence, next.mood.arousal, next.mood.dominance, next.band, next.updatedAt, next.lastEvidenceAt, JSON.stringify(next.processedEventIds), next.salience, Math.max(1, finite(next.valenceBias) ?? 1));
             if (next.version > base.version)
                 recordPsycheEvent(db, proj, characterId, base, next, appraisal);
             db.exec('COMMIT');

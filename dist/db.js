@@ -542,6 +542,9 @@ export function initProjectSchema(db) {
       mood_valence REAL,
       mood_arousal REAL,
       mood_dominance REAL,
+      -- 冻结的负性衰减倍率：负向偏离时锁住的 negativePersistence，下一次读必须拿到同一个值，
+      -- 否则「落库后读一次」的轨迹会偏离内存轨迹。
+      valence_bias REAL,
       PRIMARY KEY (project, character_id)
     );
 
@@ -588,6 +591,7 @@ export function initProjectSchema(db) {
         `ALTER TABLE psyche_state ADD COLUMN mood_valence REAL`,
         `ALTER TABLE psyche_state ADD COLUMN mood_arousal REAL`,
         `ALTER TABLE psyche_state ADD COLUMN mood_dominance REAL`,
+        `ALTER TABLE psyche_state ADD COLUMN valence_bias REAL`,
         `ALTER TABLE memory ADD COLUMN tier TEXT DEFAULT 'standard'`,
         `ALTER TABLE memory ADD COLUMN expires_at DATETIME`,
         `ALTER TABLE memory ADD COLUMN agent_mood TEXT`,
@@ -604,6 +608,11 @@ export function initProjectSchema(db) {
         }
         catch (_e) { /* already exists */ }
     }
+    // 旧行补初值：没有这一列时倍率是 1（「没有冻结任何负性偏离」），与内存初值一致。
+    try {
+        db.exec(`UPDATE psyche_state SET valence_bias = 1 WHERE valence_bias IS NULL`);
+    }
+    catch (_e) { }
     // v5.3: locked column for permanent memory protection
     try {
         db.exec(`ALTER TABLE memory ADD COLUMN locked INTEGER DEFAULT 0`);

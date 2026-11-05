@@ -648,6 +648,17 @@ export async function saveConversationTurn(
   moodValue?: number,
   moodReason?: string,
   project?: string,  // v1.5: 项目隔离
+  /**
+   * 这一轮在写库前已经有情感结论（模型显式判定）。
+   *
+   * 行直接落成 analyzed 并带上 VAD，同时不进 VAD 队列：同一轮只允许一个估计器写 psyche，
+   * 否则显式判定和两分钟后的自动扫描会把同一句话算两次。留空时行为不变（pending + 入队）。
+   */
+  initialAffect?: {
+    status: 'analyzed'
+    source: string
+    vad?: { valence: number, arousal: number, dominance: number }
+  },
 ): Promise<any> {
   characterId = normalizeCharacterId(characterId);
   const db = DatabaseManager.getInstance(project);
@@ -665,15 +676,33 @@ export async function saveConversationTurn(
   const assistantName = (process.env.CASTALIA_ASSISTANT_NAME || '助手').trim() || '助手';
   const text = `${moodPrefix}用户: ${userMsg}\n${assistantName}: ${assistantMsg}`;
 
+  const analyzed = initialAffect?.status === 'analyzed';
   db.prepare(`
-    INSERT INTO memory (id, text, project, type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, affect_status, affect_source)
-    VALUES (?, ?, ?, 'episodic', 'conversation', '[]', 0.5, ?, 'conversation_log', 'user', 'standard', 1, ?, ?, ?, 0, 0, 'pending', 'vad_queue')
-  `).run(id, text, proj, characterId, now, now, now);
+    INSERT INTO memory (id, text, project, type, category, tags, importance, character_id, source, subject, tier, is_active, created_at, updated_at, last_accessed_at, accessed_count, reference_count, affect_status, affect_source, affect_analyzed_at, vad_valence, vad_arousal, vad_dominance)
+    VALUES (?, ?, ?, 'episodic', 'conversation', '[]', 0.5, ?, 'conversation_log', 'user', 'standard', 1, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    text,
+    proj,
+    characterId,
+    now,
+    now,
+    now,
+    analyzed ? 'analyzed' : 'pending',
+    analyzed ? (initialAffect?.source ?? 'model') : 'vad_queue',
+    analyzed ? now : null,
+    initialAffect?.vad?.valence ?? null,
+    initialAffect?.vad?.arousal ?? null,
+    initialAffect?.vad?.dominance ?? null,
+  );
 
   // Keep the low-level conversation writer safe for direct callers too. The
   // higher-level auto_process/conversation_save adapters may enqueue the same
   // id again; queueForVad deduplicates by durable id.
-  await enqueueConversationEvidence(text, proj, id, characterId, userMsg, assistantMsg);
+  // A turn that already carries a model verdict must not enter the queue at all:
+  // the auto estimator would appraise the same words a second time.
+  if (!analyzed)
+    await enqueueConversationEvidence(text, proj, id, characterId, userMsg, assistantMsg);
 
   return { id, ok: true };
 }
