@@ -24,6 +24,14 @@ export const MEM_TYPES: readonly MemType[] = ['user', 'feedback', 'project', 're
  */
 export const DIARY_MEM_TYPE = 'diary';
 
+/**
+ * 念头分区(2026-11-06):脑内每一行念头落一条,和日记同一个 bank、另一个文件。
+ *
+ * 同样**不进 MEM_TYPES**:这不是要被召回的东西,而是「需要的时候翻出来看」的存档。
+ * 写入时显式 skipEmbed —— 没有向量,也就不占 KNN 候选、不花钱。
+ */
+export const THOUGHTS_MEM_TYPE = 'thoughts';
+
 /** 仅 4 种封闭类型(写记忆时强制 Markdown 结构) */
 export const CLOSED_MEM_TYPES: readonly MemType[] = ['user', 'feedback', 'project', 'reference'];
 
@@ -44,8 +52,8 @@ export function isClosedMemType(v: any): v is Exclude<MemType, 'general'> {
 }
 
 export function normalizeMemType(v: any): MemType {
-  // 日记分区走同一个 schema,但不在 MEM_TYPES 里,按普通类型名归一化。
-  if (v === DIARY_MEM_TYPE) return DIARY_MEM_TYPE as MemType;
+  // 日记/念头分区走同一个 schema,但不在 MEM_TYPES 里,按普通类型名归一化。
+  if (v === DIARY_MEM_TYPE || v === THOUGHTS_MEM_TYPE) return v as MemType;
   return isMemType(v) ? v : 'general';
 }
 
