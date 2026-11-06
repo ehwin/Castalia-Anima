@@ -4,7 +4,9 @@
  * v5.0: skipEmbed 参数 — digest 暂不向量化，reflect 后统一 embed
  * v4.0: 去重不再丢弃，SQLite 持久化 embedding 缓存
  */
-import { DatabaseManager, generateId, listMemTypeDirs } from './db.js';
+import { DatabaseManager, generateId, listMemTypeDirs, currentMemDir, safeFilePart } from './db.js';
+import fs from 'node:fs';
+import path from 'node:path';
 import { linkFactEntities, linkMemoryToEntities } from './entities.js';
 import type Database from 'better-sqlite3';
 import { embed, getEmbeddingCached } from './ollama.js';
@@ -12,7 +14,7 @@ import { ensureChunksForRow } from './chunkIndex.js';
 import { recordTopics } from './bias.js';
 import { PROJECT_ID, CHAR_ID, normalizeCharacterId, normalizeProject, isEmbedEnabled } from './env.js';
 import { scoreAffect, affectImpact } from './affectLexicon.js';
-import { MemType, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
+import { MemType, DIARY_MEM_TYPE, isClosedMemType, normalizeMarkdown, normalizeMemType } from './memType.js';
 import { parseTagsSafe, normalizeTagsForWrite, serializeTags } from './tags.js';
 import { estimatePredicateVolatility, needsEvidence, shouldSupersede } from './volatility.js';
 import { isDerivedMemorySource, isGeneratedSource, excludeRawMaterialSql } from './memoryProvenance.js';
@@ -825,8 +827,13 @@ export async function batchEmbedPending(characterId: string = CHAR_ID, project?:
   const proj = normalizeProject(project);
   let embedded = 0;
   const errors: string[] = [];
-  // memdir:遍历项目全部分类库补嵌入
-  for (const mt of listMemTypeDirs(proj)) {
+  // memdir:遍历项目全部分类库补嵌入。日记分区不在 MEM_TYPES 里(索引/反刍/衰减都看不到它),
+  // 但它同样要靠向量才能被 searchDiary 翻到:换嵌入模型会清空派生索引,别的分区在这一步补回来,
+  // 日记不补就永远翻不到。只在库文件已存在时补,避免给没用过日记的项目建空库。
+  const embedDirs = listMemTypeDirs(proj);
+  const diaryDbFile = path.join(currentMemDir(), safeFilePart(proj), DIARY_MEM_TYPE, 'memory.sqlite');
+  if (fs.existsSync(diaryDbFile) && !embedDirs.includes(DIARY_MEM_TYPE)) embedDirs.push(DIARY_MEM_TYPE);
+  for (const mt of embedDirs) {
     const db = DatabaseManager.getInstance(proj, mt);
 
   // 找所有有记忆但无向量的记录(source 为 NULL 也算,修复 NULL != 'x' 恒假的坑)
